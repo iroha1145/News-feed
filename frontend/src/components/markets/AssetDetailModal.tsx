@@ -195,6 +195,8 @@ export default function AssetDetailModal({ quote, symbol: symbolProp, symbolName
       >
         {/* Close */}
         <button
+          type="button"
+          aria-label="Close"
           onClick={handleClose}
           className="absolute top-5 right-6 text-on-surface-variant hover:text-primary dark:text-slate-400 dark:hover:text-violet-400 transition-colors p-2 z-50"
         >

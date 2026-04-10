@@ -13,7 +13,7 @@ interface NewsCardProps {
 export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
   const analysis = item.analysis
   const classification = analysis?.classification
-  const rawImageUrl = item.image_url || (item as any).urlToImage
+  const rawImageUrl = item.image_url || item.urlToImage
   const imageUrl = getRealImageUrl(rawImageUrl)
   const hasAnalysis = item.analysis_status === 'completed' && analysis
   const isPinned = item.is_pinned

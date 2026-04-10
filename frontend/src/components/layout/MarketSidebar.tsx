@@ -8,7 +8,7 @@ interface MarketSidebarProps {
 }
 
 export default function MarketSidebar({ stats, onQuoteClick }: MarketSidebarProps) {
-  const quotesApi = useApi(getMarketQuotes, [])
+  const quotesApi = useApi((signal) => getMarketQuotes(signal), [])
   const quotes = quotesApi.data?.quotes ?? []
 
   const indices = quotes.filter(q => q.type === 'index')
@@ -50,7 +50,7 @@ export default function MarketSidebar({ stats, onQuoteClick }: MarketSidebarProp
               if (price === 0) return null
 
               return (
-                <div key={quote.symbol} className="bg-surface-container-lowest dark:bg-slate-800 p-4 rounded-xl space-y-3 cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => onQuoteClick?.(quote)}>
+                <button type="button" key={quote.symbol} className="w-full text-left bg-surface-container-lowest dark:bg-slate-800 p-4 rounded-xl space-y-3 cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => onQuoteClick?.(quote)}>
                   <div className="flex justify-between items-center">
                     <div>
                       <span className="font-bold text-sm dark:text-slate-100">{quote.label || quote.name}</span>
@@ -83,7 +83,7 @@ export default function MarketSidebar({ stats, onQuoteClick }: MarketSidebarProp
                       />
                     </div>
                   </div>
-                </div>
+                </button>
               )
             })}
           </div>
@@ -132,7 +132,7 @@ export default function MarketSidebar({ stats, onQuoteClick }: MarketSidebarProp
                 const isNeg = pct < 0
                 if (price === 0) return null
                 return (
-                  <div key={q.symbol} className="flex items-center gap-4 p-4 rounded-xl bg-surface-container-lowest dark:bg-slate-800 cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => onQuoteClick?.(q)}>
+                  <button type="button" key={q.symbol} className="w-full flex items-center gap-4 p-4 rounded-xl bg-surface-container-lowest dark:bg-slate-800 cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => onQuoteClick?.(q)}>
                     <div className="w-10 h-10 rounded-xl bg-surface-container dark:bg-slate-700 flex items-center justify-center">
                       <span className="material-symbols-outlined text-amber-500">
                         {q.name.includes('Gold') ? 'diamond' : q.name.includes('Oil') ? 'oil_barrel' : 'toll'}
@@ -147,7 +147,7 @@ export default function MarketSidebar({ stats, onQuoteClick }: MarketSidebarProp
                     <span className={`text-sm font-bold ${isPos ? 'text-tertiary dark:text-emerald-400' : isNeg ? 'text-error dark:text-red-400' : 'text-slate-400'}`}>
                       {isPos ? '+' : ''}{pct.toFixed(2)}%
                     </span>
-                  </div>
+                  </button>
                 )
               })}
             </div>

@@ -4,17 +4,29 @@ import { getMarketQuotes, getCalendar, getAnalysisStats, getNews, getXSentiment,
 import type { AnalysisStats, CalendarEvent, XSentiment, NewsItem } from '../../types'
 import FearGreedGauge from '../sentiment/FearGreedGauge'
 import LoadingSpinner from '../common/LoadingSpinner'
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { toLocalTime } from '../../utils/time'
 import AssetDetailModal from './AssetDetailModal'
 
+function seededBars(seed: string, count = 7, min = 30, spread = 70) {
+  let hash = 0
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  }
+
+  return Array.from({ length: count }, (_, index) => {
+    hash = (hash * 1664525 + 1013904223 + index) >>> 0
+    return min + (hash % spread)
+  })
+}
+
 export default function Markets() {
-  const quotesApi = useApi<{ quotes: MarketQuote[] }>(() => getMarketQuotes(), [])
-  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>(() => getCalendar(), [])
-  const statsApi = useApi<AnalysisStats>(() => getAnalysisStats(), [])
-  const newsApi = useApi<{ items: NewsItem[]; total: number }>(() => getNews({ page_size: 5 }), [])
-  const xApi = useApi<XSentiment | null>(() => getXSentiment(), [])
+  const quotesApi = useApi<{ quotes: MarketQuote[] }>((signal) => getMarketQuotes(signal), [])
+  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>((signal) => getCalendar(signal), [])
+  const statsApi = useApi<AnalysisStats>((signal) => getAnalysisStats(signal), [])
+  const newsApi = useApi<{ items: NewsItem[]; total: number }>((signal) => getNews({ page_size: 5 }, signal), [])
+  const xApi = useApi<XSentiment | null>((signal) => getXSentiment(signal), [])
 
   const [selectedQuote, setSelectedQuote] = useState<MarketQuote | null>(null)
 
@@ -32,6 +44,11 @@ export default function Markets() {
   const stats = statsApi.data
   const news = newsApi.data?.items?.slice(0, 3) ?? []
   const xData = xApi.data
+
+  const indexSparkBars = useMemo(
+    () => Object.fromEntries(indices.map((quote) => [quote.symbol, seededBars(quote.symbol)])),
+    [indices],
+  )
 
   const fearGreed = xData?.fear_greed_estimate ?? (stats ? Math.round(50 + (stats.avg_sentiment ?? 0) * 5) : 50)
 
@@ -59,7 +76,7 @@ export default function Markets() {
               const isNeg = pct < 0
               if (price === 0) return null
               return (
-                <div key={q.symbol} className="bg-surface-container-lowest dark:bg-slate-800 rounded-2xl p-5 space-y-3 cursor-pointer hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => setSelectedQuote(q)}>
+                <button type="button" key={q.symbol} className="w-full text-left bg-surface-container-lowest dark:bg-slate-800 rounded-2xl p-5 space-y-3 cursor-pointer hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => setSelectedQuote(q)}>
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-on-surface-variant dark:text-slate-400 uppercase tracking-wider">{q.label}</span>
                     <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
@@ -75,8 +92,7 @@ export default function Markets() {
                   </p>
                   {/* Mini bar chart visualization */}
                   <div className="flex items-end gap-0.5 h-8">
-                    {Array.from({ length: 7 }, (_, i) => {
-                      const h = 30 + Math.random() * 70
+                    {(indexSparkBars[q.symbol] ?? seededBars(q.symbol)).map((h, i) => {
                       const last = i === 6
                       return (
                         <div
@@ -91,7 +107,7 @@ export default function Markets() {
                       )
                     })}
                   </div>
-                </div>
+                </button>
               )
             })}
           </div>
@@ -189,7 +205,7 @@ export default function Markets() {
                 const isNeg = pct < 0
                 if (price === 0) return null
                 return (
-                  <div key={q.symbol} className="bg-surface-container-lowest dark:bg-slate-800 rounded-2xl p-5 space-y-2 cursor-pointer hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => setSelectedQuote(q)}>
+                  <button type="button" key={q.symbol} className="w-full text-left bg-surface-container-lowest dark:bg-slate-800 rounded-2xl p-5 space-y-2 cursor-pointer hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.98]" onClick={() => setSelectedQuote(q)}>
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 rounded-xl bg-surface-container dark:bg-slate-700 flex items-center justify-center">
                         <span className="material-symbols-outlined text-amber-500">
@@ -209,7 +225,7 @@ export default function Markets() {
                         {isPos ? '+' : ''}{pct.toFixed(2)}%
                       </span>
                     </div>
-                  </div>
+                  </button>
                 )
               })}
             </div>

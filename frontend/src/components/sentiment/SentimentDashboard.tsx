@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useApi } from '../../hooks/useApi'
 import { usePolling } from '../../hooks/usePolling'
 import { getAnalysisStats, getXSentiment, getCalendar, getMarketQuotes, getLatestAnalyses, getNews, analyzeCalendar, type MarketQuote } from '../../services/api'
@@ -8,13 +8,25 @@ import LoadingSpinner from '../common/LoadingSpinner'
 import { Link } from 'react-router-dom'
 import { toLocalTime } from '../../utils/time'
 
+function seededBars(seed: string, count = 7, min = 25, spread = 75) {
+  let hash = 0
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  }
+
+  return Array.from({ length: count }, (_, index) => {
+    hash = (hash * 1664525 + 1013904223 + index) >>> 0
+    return min + (hash % spread)
+  })
+}
+
 export default function SentimentDashboard() {
-  const statsApi = useApi<AnalysisStats>(() => getAnalysisStats(), [])
-  const xApi = useApi<XSentiment | null>(() => getXSentiment(), [])
-  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>(() => getCalendar(), [])
-  const quotesApi = useApi<{ quotes: MarketQuote[] }>(() => getMarketQuotes(), [])
-  const analysesApi = useApi<Analysis[]>(() => getLatestAnalyses(1), [])
-  const newsApi = useApi<{ items: NewsItem[]; total: number }>(() => getNews({ page_size: 4 }), [])
+  const statsApi = useApi<AnalysisStats>((signal) => getAnalysisStats(signal), [])
+  const xApi = useApi<XSentiment | null>((signal) => getXSentiment(signal), [])
+  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>((signal) => getCalendar(signal), [])
+  const quotesApi = useApi<{ quotes: MarketQuote[] }>((signal) => getMarketQuotes(signal), [])
+  const analysesApi = useApi<Analysis[]>((signal) => getLatestAnalyses(1, signal), [])
+  const newsApi = useApi<{ items: NewsItem[]; total: number }>((signal) => getNews({ page_size: 4 }, signal), [])
 
   const [calendarExpanded, setCalendarExpanded] = useState(false)
   const [calendarAnalyzing, setCalendarAnalyzing] = useState(false)
@@ -30,6 +42,10 @@ export default function SentimentDashboard() {
   const events = calendarExpanded ? allEvents : allEvents.slice(0, 3)
   const latestAnalysis = analysesApi.data?.[0]
   const news = newsApi.data?.items ?? []
+  const indexSparkBars = useMemo(
+    () => Object.fromEntries(indices.map((quote) => [quote.symbol, seededBars(quote.symbol)])),
+    [indices],
+  )
   const fearGreed = xData?.fear_greed_estimate ?? (stats ? Math.round(50 + (stats.avg_sentiment ?? 0) * 5) : 50)
 
   const handleAnalyzeCalendar = async () => {
@@ -81,8 +97,7 @@ export default function SentimentDashboard() {
                   </span>
                 </div>
                 <div className="h-10 w-full flex items-end gap-0.5">
-                  {Array.from({ length: 7 }, (_, i) => {
-                    const h = 25 + Math.random() * 75
+                  {(indexSparkBars[q.symbol] ?? seededBars(q.symbol)).map((h, i) => {
                     const last = i === 6
                     return (
                       <div key={i}
@@ -163,7 +178,7 @@ export default function SentimentDashboard() {
                     {affectedStocks.slice(0, 4).map((stock) => {
                       const isPos = stock.impact_score > 0
                       return (
-                        <div key={stock.ticker} className="bg-surface-container-low dark:bg-slate-700 p-4 rounded-2xl hover:bg-white dark:hover:bg-slate-600 transition-colors cursor-pointer group">
+                        <button type="button" key={stock.ticker} className="w-full text-left bg-surface-container-low dark:bg-slate-700 p-4 rounded-2xl hover:bg-white dark:hover:bg-slate-600 transition-colors cursor-pointer group">
                           <div className="flex justify-between items-center mb-1">
                             <span className="font-bold text-sm dark:text-white">{stock.ticker}</span>
                             <span className={`material-symbols-outlined text-lg material-symbols-filled ${isPos ? 'text-tertiary dark:text-emerald-400' : 'text-error dark:text-red-400'}`}>
@@ -177,7 +192,7 @@ export default function SentimentDashboard() {
                             <div className={`h-full ${isPos ? 'bg-tertiary dark:bg-emerald-500' : 'bg-error dark:bg-red-500'}`}
                               style={{ width: `${Math.min(Math.abs(stock.impact_score), 100)}%` }} />
                           </div>
-                        </div>
+                        </button>
                       )
                     })}
                     {affectedStocks.length === 0 && (

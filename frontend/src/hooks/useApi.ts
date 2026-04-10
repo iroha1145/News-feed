@@ -8,7 +8,7 @@ export interface UseApiState<T> {
 }
 
 export function useApi<T>(
-  fetcher: () => Promise<T>,
+  fetcher: (signal: AbortSignal) => Promise<T>,
   deps: unknown[] = []
 ): UseApiState<T> {
   const [data, setData] = useState<T | null>(null);
@@ -27,6 +27,7 @@ export function useApi<T>(
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     // Deps actually changed (not just a refetch) → clear stale data
     const depsChanged = deps.some((d, i) => d !== prevDepsRef.current[i])
@@ -43,7 +44,7 @@ export function useApi<T>(
     setLoading(true);
     setError(null);
 
-    fetcher()
+    fetcher(controller.signal)
       .then(result => {
         if (!cancelled) {
           setData(result);
@@ -51,6 +52,10 @@ export function useApi<T>(
         }
       })
       .catch(err => {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
+
         if (!cancelled) {
           // Only clear data on deps change (route navigation);
           // on refetch/poll failure, keep showing previous data
@@ -60,7 +65,10 @@ export function useApi<T>(
         }
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [revision, ...deps]);
 

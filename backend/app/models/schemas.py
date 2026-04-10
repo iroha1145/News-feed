@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class NewsItemBase(BaseModel):
@@ -42,11 +42,11 @@ class AnalysisBase(BaseModel):
     overall_sentiment: int
     classification: str  # bullish/bearish/neutral
     confidence: int
-    affected_stocks: list[AffectedStock] = []
-    affected_sectors: list[str] = []
-    affected_commodities: list[AffectedCommodity] = []
+    affected_stocks: list[AffectedStock] = Field(default_factory=list)
+    affected_sectors: list[str] = Field(default_factory=list)
+    affected_commodities: list[AffectedCommodity] = Field(default_factory=list)
     logic_chain: str
-    key_factors: list[str] = []
+    key_factors: list[str] = Field(default_factory=list)
     llm_provider: str
     llm_model: str
 
@@ -83,10 +83,10 @@ class MemeStockAlert(BaseModel):
 
 class XSentimentBase(BaseModel):
     query: str
-    trending_tickers: list[TrendingTicker] = []
+    trending_tickers: list[TrendingTicker] = Field(default_factory=list)
     retail_sentiment_score: int
-    key_narratives: list[str] = []
-    meme_stocks: list[MemeStockAlert] = []
+    key_narratives: list[str] = Field(default_factory=list)
+    meme_stocks: list[MemeStockAlert] = Field(default_factory=list)
     raw_analysis: str
 
 

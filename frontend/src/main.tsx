@@ -13,12 +13,6 @@ function applyTheme(mode: 'auto' | 'light' | 'dark') {
 const saved = (localStorage.getItem('theme') as 'auto' | 'light' | 'dark') ?? 'auto'
 applyTheme(saved)
 
-// Listen for system theme changes when in auto mode
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  const current = (localStorage.getItem('theme') as string) ?? 'auto'
-  if (current === 'auto') applyTheme('auto')
-})
-
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />

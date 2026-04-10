@@ -48,14 +48,22 @@ app = FastAPI(
 )
 
 # CORS configuration — reads from Settings (env/.env file)
+DEV_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 _cors_origins = [o.strip() for o in app_settings.cors_origins.split(",") if o.strip()]
-if not _cors_origins:
-    _cors_origins = ["*"]  # Development fallback
+if not _cors_origins or _cors_origins == ["*"]:
+    logger.warning("CORS_ORIGINS is empty or wildcard; using development-only localhost defaults")
+    _cors_origins = DEV_CORS_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=("*" not in _cors_origins),
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

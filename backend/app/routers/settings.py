@@ -1,17 +1,18 @@
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel, Field, field_validator
 
 from app.config import settings as app_settings
+from app.deps.auth import require_admin
 from app.models.database import get_db, get_all_settings, set_setting, get_setting
 from app.services.llm_providers import OpenAIProvider, AnthropicProvider, GrokProvider, OllamaProvider
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
-REDACT_KEYS = {
+SENSITIVE_KEYS = {
     "default_llm_api_key",
     "openai_api_key",
     "anthropic_api_key",
@@ -19,6 +20,7 @@ REDACT_KEYS = {
     "finnhub_api_key",
     "newsapi_api_key",
     "gnews_api_key",
+    "massive_api_key",
 }
 
 PROVIDER_MODELS = {
@@ -28,10 +30,23 @@ PROVIDER_MODELS = {
     "ollama": ["llama3", "mistral", "codellama", "phi3"],
 }
 
+ALLOWED_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "host.docker.internal"}
+
 
 def _redact(key: str, value: Any) -> Any:
-    if key in REDACT_KEYS and isinstance(value, str) and len(value) > 4:
-        return "****" + value[-4:]
+    if key in SENSITIVE_KEYS and value:
+        return "********"
+    return value
+
+
+def _validate_ollama_base_url(value: str) -> str:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("ollama_base_url must use http or https")
+    if parsed.hostname not in ALLOWED_OLLAMA_HOSTS:
+        raise ValueError("ollama_base_url must target localhost, 127.0.0.1, or host.docker.internal")
     return value
 
 
@@ -64,12 +79,19 @@ class SettingsUpdateRequest(BaseModel):
     anthropic_api_key: Optional[str] = None
     grok_api_key: Optional[str] = None
     ollama_base_url: Optional[str] = None
-    news_poll_interval: Optional[int] = None
-    analysis_batch_size: Optional[int] = None
-    x_sentiment_interval: Optional[int] = None
+    news_poll_interval: Optional[int] = Field(default=None, ge=30)
+    analysis_batch_size: Optional[int] = Field(default=None, ge=1, le=20)
+    x_sentiment_interval: Optional[int] = Field(default=None, ge=30)
     finnhub_api_key: Optional[str] = None
     newsapi_api_key: Optional[str] = None
     gnews_api_key: Optional[str] = None
+
+    @field_validator("ollama_base_url")
+    @classmethod
+    def validate_ollama_base_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return _validate_ollama_base_url(value)
 
 
 class TestLLMRequest(BaseModel):
@@ -89,13 +111,17 @@ async def get_settings():
 
 
 @router.put("")
-async def update_settings(body: SettingsUpdateRequest):
+async def update_settings(body: SettingsUpdateRequest, _: None = Depends(require_admin)):
     db = await get_db()
     try:
         updated = {}
         scheduler_keys = {"news_poll_interval", "x_sentiment_interval"}
         needs_scheduler_reload = False
         for key, value in body.model_dump(exclude_none=True).items():
+            if key in SENSITIVE_KEYS:
+                logger.warning("Ignoring attempt to persist sensitive setting '%s' via API", key)
+                updated[key] = _redact(key, value)
+                continue
             await set_setting(db, key, value)
             updated[key] = _redact(key, value)
             if key in scheduler_keys:
@@ -150,7 +176,7 @@ async def list_providers():
 
 
 @router.post("/test-llm")
-async def test_llm_connection(body: TestLLMRequest):
+async def test_llm_connection(body: TestLLMRequest, _: None = Depends(require_admin)):
     db = await get_db()
     try:
         overrides = await get_all_settings(db)

@@ -43,7 +43,8 @@ class Settings(BaseSettings):
     analysis_batch_size: int = 10
     x_sentiment_interval: int = 1800  # seconds (30 minutes)
     database_url: str = "sqlite+aiosqlite:///data/macrolens.db"
-    cors_origins: str = ""  # comma-separated origins, empty = allow all (dev mode)
+    cors_origins: str = ""  # comma-separated origins
+    admin_token: str = ""
 
     class Config:
         env_file = _find_env_file()
