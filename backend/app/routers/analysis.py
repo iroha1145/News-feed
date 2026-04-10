@@ -1,8 +1,9 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends
 
+from app.deps.auth import require_admin
 from app.models.database import (
     get_db,
     get_analyses,
@@ -84,7 +85,11 @@ async def analysis_stats():
 
 
 @router.post("/trigger")
-async def trigger_analysis(background_tasks: BackgroundTasks, batch_size: int = Query(5, ge=1, le=50)):
+async def trigger_analysis(
+    background_tasks: BackgroundTasks,
+    batch_size: int = Query(5, ge=1, le=50),
+    _: None = Depends(require_admin),
+):
     """Manually trigger analysis for unanalyzed news items."""
     background_tasks.add_task(run_analysis_batch, batch_size)
     return {"status": "triggered", "batch_size": batch_size}

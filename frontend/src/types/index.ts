@@ -1,4 +1,8 @@
-export interface NewsItem {
+export interface NewsItemImageFallback {
+  urlToImage?: string | null;
+}
+
+export interface NewsItem extends NewsItemImageFallback {
   id: number;
   source: string;
   title: string;

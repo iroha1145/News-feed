@@ -1,13 +1,35 @@
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import aiosqlite
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = "data/macrolens.db"
+
+def _resolve_db_path() -> str:
+    parsed = urlparse(settings.database_url)
+    if parsed.scheme != "sqlite+aiosqlite":
+        raise ValueError(f"Unsupported database_url scheme: {settings.database_url}")
+
+    db_path = parsed.path.lstrip("/")
+    if parsed.netloc:
+        db_path = f"{parsed.netloc}/{db_path}" if db_path else parsed.netloc
+
+    if not db_path:
+        raise ValueError("database_url must include a SQLite database path")
+
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+DB_PATH = _resolve_db_path()
 
 CREATE_NEWS_ITEMS = """
 CREATE TABLE IF NOT EXISTS news_items (
@@ -94,8 +116,9 @@ async def init_db() -> None:
         for table, col, definition in migrations:
             try:
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
-            except Exception:
-                pass  # Column already exists
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
         await db.commit()
     logger.info("Database tables initialized successfully")
 

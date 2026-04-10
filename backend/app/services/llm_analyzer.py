@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -85,6 +86,15 @@ def _resolve_api_key(provider: str, overrides: dict) -> str:
     return key_map.get(provider, "")
 
 
+def _extract_json_object(raw_response: str) -> dict:
+    cleaned = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+    json_start = cleaned.find('{')
+    json_end = cleaned.rfind('}')
+    if json_start >= 0 and json_end > json_start:
+        cleaned = cleaned[json_start:json_end + 1]
+    return json.loads(cleaned)
+
+
 async def analyze_news_item(news_item: dict, db: aiosqlite.Connection) -> Optional[dict]:
     """Analyze a single news item and store the result."""
     news_id = news_item["id"]
@@ -108,7 +118,7 @@ async def analyze_news_item(news_item: dict, db: aiosqlite.Connection) -> Option
     raw_response = ""
     try:
         raw_response = await provider.analyze(user_prompt, SYSTEM_PROMPT)
-        parsed = json.loads(raw_response)
+        parsed = _extract_json_object(raw_response)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse LLM JSON response for news_id={news_id}: {e}\nRaw: {raw_response[:500]}")
         await mark_analysis_failed(db, news_id, str(e))

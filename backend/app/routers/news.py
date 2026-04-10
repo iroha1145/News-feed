@@ -1,8 +1,9 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 
+from app.deps.auth import require_admin
 from app.models.database import get_db, get_news_items, get_news_item_by_id, get_analysis_for_news
 from app.services.news_aggregator import aggregate_all_news
 
@@ -43,7 +44,7 @@ async def get_news_item(news_id: int):
 
 
 @router.post("/fetch")
-async def trigger_fetch_news():
+async def trigger_fetch_news(_: None = Depends(require_admin)):
     """Manually trigger news fetching from all sources."""
     count = await aggregate_all_news()
     return {"status": "fetched", "new_items": count}

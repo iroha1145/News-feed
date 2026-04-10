@@ -268,9 +268,10 @@ export default function DeepAnalysis() {
               {affectedStocks.map((stock) => {
                 const positive = stock.impact_score > 0
                 return (
-                  <div
+                  <button
                     key={stock.ticker}
-                    className="bg-surface-container-lowest dark:bg-slate-900 rounded-xl p-4 space-y-2 cursor-pointer hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.98]"
+                    type="button"
+                    className="w-full text-left bg-surface-container-lowest dark:bg-slate-900 rounded-xl p-4 space-y-2 cursor-pointer hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.98]"
                     onClick={() => setSelectedTicker({ symbol: stock.ticker, name: stock.ticker })}
                   >
                     <div className="flex items-center justify-between">
@@ -286,7 +287,7 @@ export default function DeepAnalysis() {
                       />
                     </div>
                     <p className="text-xs text-on-surface-variant dark:text-slate-400">{stock.reason}</p>
-                  </div>
+                  </button>
                 )
               })}
             </div>

@@ -201,9 +201,9 @@ async def get_candles(
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Candle fetch failed for {symbol}: {e}")
-        raise HTTPException(500, f"Failed to fetch candle data: {e}")
+    except Exception:
+        logger.exception("Candle fetch failed for %s", symbol)
+        raise HTTPException(500, "Failed to fetch candle data")
 
 
 # ── Profile (fundamentals) ──────────────────────────────────────
@@ -278,9 +278,9 @@ async def get_profile(symbol: str):
         _profile_cache[symbol] = {"data": result, "ts": now}
         return result
 
-    except Exception as e:
-        logger.error(f"Profile fetch failed for {symbol}: {e}")
-        raise HTTPException(500, f"Failed to fetch profile: {e}")
+    except Exception:
+        logger.exception("Profile fetch failed for %s", symbol)
+        raise HTTPException(500, "Failed to fetch profile")
 
 
 # ── Asset Sentiment (aggregated from analyses) ──────────────────
@@ -387,6 +387,6 @@ async def get_constituents(symbol: str):
         _const_cache[symbol] = {"data": result, "ts": now}
         return result
 
-    except Exception as e:
-        logger.error(f"Constituents fetch failed for {symbol}: {e}")
-        raise HTTPException(500, f"Failed to fetch constituents: {e}")
+    except Exception:
+        logger.exception("Constituents fetch failed for %s", symbol)
+        raise HTTPException(500, "Failed to fetch constituents")

@@ -11,6 +11,10 @@ import type {
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
+if (import.meta.env.PROD && !BASE_URL) {
+  console.warn('VITE_API_BASE_URL is not set in production; frontend will use relative API paths.')
+}
+
 class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);

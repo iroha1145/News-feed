@@ -1,5 +1,6 @@
 import logging
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from app.deps.auth import require_admin
 from app.services.calendar_client import fetch_economic_calendar
 from app.services.calendar_analyzer import analyze_calendar_events, get_cached_analysis, merge_analysis
 
@@ -18,7 +19,7 @@ async def get_economic_calendar():
 
 
 @router.post("/analyze")
-async def analyze_economic_calendar():
+async def analyze_economic_calendar(_: None = Depends(require_admin)):
     """Trigger AI analysis of this week's calendar events."""
     events = await fetch_economic_calendar()
     analyzed = await analyze_calendar_events(events)
