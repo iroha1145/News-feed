@@ -22,11 +22,11 @@ function seededBars(seed: string, count = 7, min = 30, spread = 70) {
 }
 
 export default function Markets() {
-  const quotesApi = useApi<{ quotes: MarketQuote[] }>(() => getMarketQuotes(), [])
-  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>(() => getCalendar(), [])
-  const statsApi = useApi<AnalysisStats>(() => getAnalysisStats(), [])
-  const newsApi = useApi<{ items: NewsItem[]; total: number }>(() => getNews({ page_size: 5 }), [])
-  const xApi = useApi<XSentiment | null>(() => getXSentiment(), [])
+  const quotesApi = useApi<{ quotes: MarketQuote[] }>((signal) => getMarketQuotes(signal), [])
+  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>((signal) => getCalendar(signal), [])
+  const statsApi = useApi<AnalysisStats>((signal) => getAnalysisStats(signal), [])
+  const newsApi = useApi<{ items: NewsItem[]; total: number }>((signal) => getNews({ page_size: 5 }, signal), [])
+  const xApi = useApi<XSentiment | null>((signal) => getXSentiment(signal), [])
 
   const [selectedQuote, setSelectedQuote] = useState<MarketQuote | null>(null)
 

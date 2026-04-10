@@ -20,8 +20,8 @@ export default function NewsFeed() {
   const [selectedQuote, setSelectedQuote] = useState<MarketQuote | null>(null)
   const [selectedTicker, setSelectedTicker] = useState<{ symbol: string; name?: string } | null>(null)
 
-  const newsApi = useApi(() => getNews({ page_size: 25 }), [])
-  const statsApi = useApi(getAnalysisStats, [])
+  const newsApi = useApi((signal) => getNews({ page_size: 25 }, signal), [])
+  const statsApi = useApi((signal) => getAnalysisStats(signal), [])
 
   const refetchAll = useCallback(() => {
     newsApi.refetch()

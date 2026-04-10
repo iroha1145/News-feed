@@ -8,7 +8,7 @@ interface MarketSidebarProps {
 }
 
 export default function MarketSidebar({ stats, onQuoteClick }: MarketSidebarProps) {
-  const quotesApi = useApi(getMarketQuotes, [])
+  const quotesApi = useApi((signal) => getMarketQuotes(signal), [])
   const quotes = quotesApi.data?.quotes ?? []
 
   const indices = quotes.filter(q => q.type === 'index')

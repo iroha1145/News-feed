@@ -19,17 +19,17 @@ export default function DeepAnalysis() {
 
   // ── Detail mode: fetch by news_id directly ──
   const directApi = useApi<{ analysis: Analysis; news: NewsItem | null }>(
-    () => selectedNewsId ? getAnalysisByNewsId(selectedNewsId) : Promise.reject('no id'),
+    (signal) => selectedNewsId ? getAnalysisByNewsId(selectedNewsId, signal) : Promise.reject('no id'),
     [selectedNewsId]
   )
 
   // ── List mode (no id): load latest analyses ──
   const analysesApi = useApi<{ items: Analysis[]; total: number }>(
-    () => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getAnalyses({ page: 1, page_size: 20 }),
+    (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getAnalyses({ page: 1, page_size: 20 }, signal),
     [selectedNewsId]
   )
   const newsApi = useApi<{ items: NewsItem[]; total: number }>(
-    () => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getNews(),
+    (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getNews(undefined, signal),
     [selectedNewsId]
   )
 

@@ -29,6 +29,15 @@ export default class ErrorBoundary extends React.Component<ErrorBoundaryProps, E
             <p className="text-sm text-on-surface-variant dark:text-slate-400 leading-relaxed">
               页面发生了意外错误。请刷新重试；如果问题持续，请联系管理员并查看控制台日志。
             </p>
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => this.setState({ hasError: false })}
+                className="px-6 py-2.5 bg-primary text-white rounded-xl text-sm font-bold hover:bg-primary/90 transition-colors"
+              >
+                重试
+              </button>
+            </div>
           </div>
         </div>
       )

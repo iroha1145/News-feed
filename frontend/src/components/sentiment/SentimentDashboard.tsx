@@ -21,12 +21,12 @@ function seededBars(seed: string, count = 7, min = 25, spread = 75) {
 }
 
 export default function SentimentDashboard() {
-  const statsApi = useApi<AnalysisStats>(() => getAnalysisStats(), [])
-  const xApi = useApi<XSentiment | null>(() => getXSentiment(), [])
-  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>(() => getCalendar(), [])
-  const quotesApi = useApi<{ quotes: MarketQuote[] }>(() => getMarketQuotes(), [])
-  const analysesApi = useApi<Analysis[]>(() => getLatestAnalyses(1), [])
-  const newsApi = useApi<{ items: NewsItem[]; total: number }>(() => getNews({ page_size: 4 }), [])
+  const statsApi = useApi<AnalysisStats>((signal) => getAnalysisStats(signal), [])
+  const xApi = useApi<XSentiment | null>((signal) => getXSentiment(signal), [])
+  const calendarApi = useApi<{ events: CalendarEvent[]; count: number }>((signal) => getCalendar(signal), [])
+  const quotesApi = useApi<{ quotes: MarketQuote[] }>((signal) => getMarketQuotes(signal), [])
+  const analysesApi = useApi<Analysis[]>((signal) => getLatestAnalyses(1, signal), [])
+  const newsApi = useApi<{ items: NewsItem[]; total: number }>((signal) => getNews({ page_size: 4 }, signal), [])
 
   const [calendarExpanded, setCalendarExpanded] = useState(false)
   const [calendarAnalyzing, setCalendarAnalyzing] = useState(false)

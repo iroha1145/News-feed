@@ -8,7 +8,7 @@ export interface UseApiState<T> {
 }
 
 export function useApi<T>(
-  fetcher: (signal?: AbortSignal) => Promise<T>,
+  fetcher: (signal: AbortSignal) => Promise<T>,
   deps: unknown[] = []
 ): UseApiState<T> {
   const [data, setData] = useState<T | null>(null);

@@ -7,6 +7,18 @@ import SentimentDashboard from './components/sentiment/SentimentDashboard'
 import DeepAnalysis from './components/analysis/DeepAnalysis'
 
 export default function App() {
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const handler = () => {
+      const saved = localStorage.getItem('theme') ?? 'auto'
+      if (saved === 'auto') {
+        document.documentElement.classList.toggle('dark', media.matches)
+      }
+    }
+    media.addEventListener('change', handler)
+    return () => media.removeEventListener('change', handler)
+  }, [])
+
   return (
     <ErrorBoundary>
       <BrowserRouter>
