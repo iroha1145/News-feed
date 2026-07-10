@@ -2,13 +2,13 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings as app_settings
 from app.models.database import init_db
 from app.utils.scheduler import start_scheduler, stop_scheduler
-from app.routers import news, analysis, x_sentiment, settings, calendar
+from app.routers import auth, news, analysis, x_sentiment, settings, calendar
 from app.routers import quotes
 
 logging.basicConfig(
@@ -69,6 +69,7 @@ app.add_middleware(
 )
 
 # Routers
+app.include_router(auth.router)
 app.include_router(news.router)
 app.include_router(analysis.router)
 app.include_router(x_sentiment.router)
@@ -77,9 +78,51 @@ app.include_router(calendar.router)
 app.include_router(quotes.router)
 
 
+@app.get("/live")
+async def live():
+    return {"status": "alive", "service": "MacroLens"}
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "MacroLens"}
+    database_status = "unavailable"
+    scheduler_status = "stopped"
+    db = None
+    try:
+        from app.models.database import get_db
+        from app.utils.scheduler import get_scheduler
+
+        db = await get_db()
+        async with db.execute("SELECT 1") as cursor:
+            row = await cursor.fetchone()
+        if not row or row[0] != 1:
+            raise RuntimeError("database readiness query failed")
+        database_status = "ok"
+
+        scheduler = get_scheduler()
+        if scheduler is None or not scheduler.running:
+            raise RuntimeError("scheduler is not running")
+        scheduler_status = "running"
+    except Exception as exc:
+        logger.warning("Readiness check failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "unavailable",
+                "database": database_status,
+                "scheduler": scheduler_status,
+            },
+        ) from exc
+    finally:
+        if db is not None:
+            await db.close()
+
+    return {
+        "status": "ok",
+        "service": "MacroLens",
+        "database": database_status,
+        "scheduler": scheduler_status,
+    }
 
 
 @app.get("/")

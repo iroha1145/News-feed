@@ -20,14 +20,16 @@ function hasTimezone(s: string): boolean {
 }
 
 /** Parse a date string as UTC, appending 'Z' when no timezone is present. */
-export function parseUtcDate(dateStr: string): Date {
+export function parseUtcDate(dateStr: string | null | undefined): Date {
+  if (!dateStr) return new Date(Number.NaN)
   const normalized = hasTimezone(dateStr) ? dateStr : dateStr + 'Z'
   return new Date(normalized)
 }
 
 /** Human-friendly relative time string (Chinese). */
-export function timeAgo(dateStr: string): string {
+export function timeAgo(dateStr: string | null | undefined): string {
   const date = parseUtcDate(dateStr)
+  if (Number.isNaN(date.getTime())) return '时间未知'
   const now = new Date()
   const diff = Math.floor((now.getTime() - date.getTime()) / 1000)
   if (diff < 0) return '刚刚'
@@ -39,8 +41,10 @@ export function timeAgo(dateStr: string): string {
 }
 
 /** Format a date string to concise Chinese local time. */
-export function toLocalTime(dateStr: string): string {
-  return parseUtcDate(dateStr).toLocaleString('zh-CN', {
+export function toLocalTime(dateStr: string | null | undefined): string {
+  const date = parseUtcDate(dateStr)
+  if (Number.isNaN(date.getTime())) return '时间未知'
+  return date.toLocaleString('zh-CN', {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',

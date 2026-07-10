@@ -6,15 +6,13 @@ export interface NewsItem extends NewsItemImageFallback {
   id: number;
   source: string;
   title: string;
-  summary: string;
+  summary: string | null;
   url: string;
   image_url: string | null;
-  published_at: string;
+  published_at: string | null;
   fetched_at: string;
-  analysis_status?: 'pending' | 'processing' | 'completed' | 'failed';
-  analysis_attempts?: number;
-  analysis_error?: string;
-  analysis?: Analysis;
+  analysis_status?: 'pending' | 'processing' | 'completed' | 'failed' | 'skipped';
+  analysis?: Analysis | null;
   is_pinned?: boolean;
 }
 
@@ -32,6 +30,8 @@ export interface CalendarEvent {
   stock_impact?: 'bullish' | 'bearish' | 'neutral';
   commodity_impact?: 'bullish' | 'bearish' | 'neutral';
   explanation?: string;
+  is_stale?: boolean;
+  source_fetched_at?: string | null;
 }
 
 export interface Analysis {
@@ -51,6 +51,9 @@ export interface Analysis {
   llm_model: string;
   analyzed_at: string;
   news?: NewsItem;
+  news_title?: string;
+  news_source?: string;
+  news_url?: string;
 }
 
 export interface AffectedStock {
@@ -66,7 +69,7 @@ export interface AffectedCommodity {
   reason: string;
 }
 
-export interface XSentiment {
+export interface ModelMarketScenario {
   id: number;
   trending_tickers: TrendingTicker[];
   retail_sentiment_score: number;
@@ -75,6 +78,9 @@ export interface XSentiment {
   fear_greed_estimate?: number;
   analyzed_at: string;
 }
+
+/** @deprecated Use ModelMarketScenario; the server route keeps its legacy name. */
+export type XSentiment = ModelMarketScenario;
 
 export interface TrendingTicker {
   ticker: string;
@@ -98,7 +104,6 @@ export interface AppSettings {
   anthropic_api_key: string;
   grok_api_key: string;
   ollama_base_url: string;
-  news_poll_interval: number;
   analysis_batch_size: number;
   x_sentiment_interval: number;
   finnhub_api_key: string;
@@ -141,6 +146,7 @@ export interface SectorSentimentData {
 }
 
 export interface AnalysisStats {
+  window_days?: number;
   total_analyzed: number;
   avg_sentiment: number;
   bullish_count: number;

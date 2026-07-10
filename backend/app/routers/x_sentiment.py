@@ -20,7 +20,7 @@ async def get_latest_sentiment():
         sentiment = await get_latest_x_sentiment(db)
         if not sentiment:
             last_error = get_last_error()
-            msg = "No social sentiment estimate yet. Trigger a refresh to generate an LLM-based analysis."
+            msg = "No model market scenario yet. Trigger a refresh after recent news has been collected."
             sanitized_last_error = None
             if last_error:
                 msg = SANITIZED_ERROR_MESSAGE
@@ -36,9 +36,9 @@ async def refresh_x_sentiment(
     background_tasks: BackgroundTasks,
     _: None = Depends(require_admin),
 ):
-    """Trigger a new LLM-based social sentiment estimation via Grok."""
+    """Trigger a news-grounded model market scenario via Grok."""
     background_tasks.add_task(run_x_sentiment_analysis)
-    return {"status": "triggered", "message": "Social sentiment estimation started in background"}
+    return {"status": "triggered", "message": "News-grounded market scenario started in background"}
 
 
 @router.get("/history")

@@ -4,19 +4,60 @@ import NewsImage from './NewsImage'
 import SentimentChip from '../common/SentimentChip'
 import { timeAgo } from '../../utils/time'
 import { getRealImageUrl } from '../../utils/image'
+import { safeExternalUrl } from '../../utils/url'
+import { useEffect, useRef, useState } from 'react'
+import { retryFailedAnalysis } from '../../services/api'
+import { useAdminSession } from '../../context/AdminSessionContext'
 
 interface NewsCardProps {
   item: NewsItem
   onTickerClick?: (ticker: string, name?: string) => void
+  onRetryQueued?: () => void
 }
 
-export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
+export default function NewsCard({ item, onTickerClick, onRetryQueued }: NewsCardProps) {
+  const [retrying, setRetrying] = useState(false)
+  const [retryQueued, setRetryQueued] = useState(false)
+  const [retryError, setRetryError] = useState<string | null>(null)
+  const retryControllerRef = useRef<AbortController | null>(null)
+  const { requireAdmin, handleExpiredSession } = useAdminSession()
   const analysis = item.analysis
   const classification = analysis?.classification
   const rawImageUrl = item.image_url || item.urlToImage
   const imageUrl = getRealImageUrl(rawImageUrl)
+  const articleUrl = safeExternalUrl(item.url)
   const hasAnalysis = item.analysis_status === 'completed' && analysis
   const isPinned = item.is_pinned
+  const evidenceCount = analysis ? [
+    analysis.headline_summary,
+    analysis.logic_chain,
+    analysis.key_factors?.length,
+    analysis.affected_stocks?.length || analysis.affected_sectors?.length || analysis.affected_commodities?.length,
+  ].filter(Boolean).length : 0
+
+  useEffect(() => () => retryControllerRef.current?.abort(), [])
+
+  const handleRetry = async () => {
+    if (!requireAdmin('重新排队失败分析需要管理员登录。')) return
+    retryControllerRef.current?.abort()
+    const controller = new AbortController()
+    retryControllerRef.current = controller
+    setRetrying(true)
+    setRetryError(null)
+    try {
+      const result = await retryFailedAnalysis(item.id, controller.signal)
+      if (result.count < 1) throw new Error('这条新闻已不在失败状态，请刷新列表。')
+      setRetryQueued(true)
+      onRetryQueued?.()
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      if (!handleExpiredSession(error, '管理会话已过期，请重新登录后重试分析。')) {
+        setRetryError(error instanceof Error ? error.message : '重新排队失败，请稍后重试。')
+      }
+    } finally {
+      if (retryControllerRef.current === controller) setRetrying(false)
+    }
+  }
 
   const titleContent = (
     <h2 className="text-lg font-bold font-headline leading-snug text-on-surface dark:text-slate-100 group-hover:text-primary dark:group-hover:text-violet-400 transition-colors duration-200">
@@ -41,7 +82,7 @@ export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
             {hasAnalysis && (
               <>
                 <span className="w-1 h-1 bg-slate-300 dark:bg-slate-600 rounded-full" />
-                <span className="text-emerald-500 dark:text-emerald-400">AI已分析</span>
+                <span className="text-emerald-500 dark:text-emerald-400">模型已分析</span>
               </>
             )}
             {isPinned && (
@@ -58,7 +99,7 @@ export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
               {titleContent}
             </Link>
           ) : (
-            titleContent
+            articleUrl ? <a href={articleUrl} target="_blank" rel="noopener noreferrer" className="block">{titleContent}</a> : titleContent
           )}
 
           {/* Chinese title translation */}
@@ -84,9 +125,12 @@ export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
               />
             )}
             {analysis?.affected_stocks?.slice(0, 2).map((stock) => (
-              <div
+              <button
+                type="button"
                 key={stock.ticker}
-                className={onTickerClick ? 'cursor-pointer hover:opacity-80 active:scale-95 transition-all' : ''}
+                className={onTickerClick ? 'cursor-pointer rounded-lg hover:opacity-80 active:scale-95 transition-transform focus-visible:ring-2 focus-visible:ring-primary' : ''}
+                disabled={!onTickerClick}
+                aria-label={`查看 ${stock.company || stock.ticker} 行情`}
                 onClick={(e) => {
                   if (onTickerClick) {
                     e.preventDefault()
@@ -96,12 +140,12 @@ export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
                 }}
               >
                 <SentimentChip
-                  classification={stock.impact_score > 0 ? 'bullish' : 'bearish'}
+                  classification={stock.impact_score > 0 ? 'bullish' : stock.impact_score < 0 ? 'bearish' : 'neutral'}
                   ticker={stock.ticker}
                   score={Math.round(Math.abs(stock.impact_score))}
                   size="sm"
                 />
-              </div>
+              </button>
             ))}
             {analysis?.affected_sectors?.slice(0, 2).map((sector) => (
               <div
@@ -121,6 +165,15 @@ export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
             </p>
           )}
 
+          <div className="flex flex-wrap items-center gap-3 pt-1 text-[11px] font-bold">
+            {articleUrl && <a href={articleUrl} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline dark:text-violet-400">阅读原文 ↗</a>}
+            {hasAnalysis && (
+              <Link to={`/analysis/${item.id}`} className="text-on-surface-variant hover:underline dark:text-slate-400">
+                查看分析依据（{evidenceCount}/4）
+              </Link>
+            )}
+          </div>
+
           {/* Pending/processing status */}
           {(item.analysis_status === 'pending' || item.analysis_status === 'processing') && (
             <div className="pt-1">
@@ -132,10 +185,26 @@ export default function NewsCard({ item, onTickerClick }: NewsCardProps) {
               {item.analysis_status === 'processing' && (
                 <span className="flex items-center gap-1 text-[10px] font-bold text-primary uppercase tracking-wider">
                   <span className="w-1.5 h-1.5 bg-primary rounded-full animate-pulse" />
-                  分析中...
+                  分析中…
                 </span>
               )}
             </div>
+          )}
+          {item.analysis_status === 'failed' && (
+            <div className="flex flex-wrap items-center gap-2 text-[11px]" role="status">
+              <span className="font-bold text-error dark:text-red-400">
+                {retryQueued ? '已重新排队' : '分析失败'}
+              </span>
+              {!retryQueued && (
+                <button type="button" onClick={handleRetry} disabled={retrying} className="rounded-md border border-red-300 px-2 py-1 font-bold text-error disabled:opacity-50 dark:border-red-800 dark:text-red-400">
+                  {retrying ? '处理中…' : '重新排队'}
+                </button>
+              )}
+              {retryError && <span className="basis-full text-error dark:text-red-400" role="alert">{retryError}</span>}
+            </div>
+          )}
+          {item.analysis_status === 'skipped' && (
+            <p className="text-[11px] text-on-surface-variant dark:text-slate-500">此新闻已超出自动分析窗口</p>
           )}
         </div>
 

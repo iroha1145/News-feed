@@ -26,20 +26,21 @@ export default function Sidebar() {
         </p>
       </div>
 
-      <nav className="flex flex-col gap-1">
+      <nav className="flex flex-col gap-1" aria-label="主导航">
         {navItems.map((item) => {
           const active = isActive(item.path)
           return (
             <Link
               key={item.label}
               to={item.path}
+              aria-current={active ? 'page' : undefined}
               className={`p-3 flex items-center gap-3 rounded-xl transition-all duration-200 font-headline text-sm font-semibold hover:translate-x-1 ${
                 active
                   ? 'bg-white dark:bg-slate-800 text-violet-700 dark:text-violet-400 shadow-sm'
                   : 'text-slate-500 dark:text-slate-400 hover:bg-white/50 dark:hover:bg-slate-800/50'
               }`}
             >
-              <span className="material-symbols-outlined">{item.icon}</span>
+              <span className="material-symbols-outlined" aria-hidden="true">{item.icon}</span>
               {item.label}
             </Link>
           )

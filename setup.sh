@@ -1,296 +1,261 @@
-#!/bin/bash
-# ============================================
-# 🔭 MacroLens 一键部署脚本
-# ============================================
+#!/usr/bin/env bash
 
-set -e
+set -Eeuo pipefail
+umask 077
 
-BOLD='\033[1m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+ENV_FILE="${ENV_FILE:-.env}"
+TEMP_ENV="${ENV_FILE}.tmp.$$"
 
-echo ""
-echo -e "${BLUE}${BOLD}  🔭 MacroLens — 宏观新闻情绪分析平台${NC}"
-echo -e "${CYAN}  ────────────────────────────────────${NC}"
-echo ""
+cleanup() {
+    rm -f "$TEMP_ENV"
+}
+trap cleanup EXIT
 
-# ---- Check Docker ----
-if ! command -v docker &> /dev/null; then
-    echo -e "${RED}❌ 未检测到 Docker，请先安装 Docker Desktop${NC}"
-    echo "   https://www.docker.com/products/docker-desktop"
+if ! command -v docker >/dev/null 2>&1; then
+    echo "未检测到 Docker，请先安装并启动 Docker Desktop 或 Docker Engine。" >&2
     exit 1
 fi
-if ! docker info &> /dev/null 2>&1; then
-    echo -e "${RED}❌ Docker 未运行，请先启动 Docker Desktop${NC}"
+
+if ! docker info >/dev/null 2>&1; then
+    echo "Docker 尚未运行，或当前账户无权访问 Docker。" >&2
     exit 1
 fi
-echo -e "${GREEN}✓${NC} Docker 已就绪"
 
-# ---- Check docker-compose ----
-if command -v docker-compose &> /dev/null; then
-    COMPOSE="docker-compose"
-elif docker compose version &> /dev/null 2>&1; then
-    COMPOSE="docker compose"
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE=(docker compose)
 else
-    echo -e "${RED}❌ 未检测到 docker-compose${NC}"
+    echo "未检测到新版 Docker Compose，请先安装 Docker Compose v2。" >&2
     exit 1
 fi
-echo -e "${GREEN}✓${NC} $COMPOSE 已就绪"
-echo ""
 
-# ---- Load existing .env if present ----
-declare -A EXISTING
-if [ -f .env ]; then
-    while IFS='=' read -r key value; do
-        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-        EXISTING["$key"]="$value"
-    done < .env
-fi
-
-# ---- Helper: prompt with default ----
-prompt_key() {
-    local var_name="$1"
-    local display_name="$2"
-    local hint="$3"
-    local required="$4"
-    local default="${EXISTING[$var_name]}"
-    local masked=""
-
-    if [ -n "$default" ]; then
-        masked="${default:0:4}...${default: -4}"
-        echo -en "  ${BOLD}${display_name}${NC} ${CYAN}[已配置: ${masked}]${NC}"
-        echo -en "\n  回车保留现有值，或输入新值: "
-    else
-        echo -en "  ${BOLD}${display_name}${NC}"
-        [ -n "$hint" ] && echo -en " ${CYAN}(${hint})${NC}"
-        [ "$required" = "required" ] && echo -en " ${RED}*${NC}"
-        echo -en ": "
-    fi
-
-    read -r input
-    if [ -n "$input" ]; then
-        eval "$var_name='$input'"
-    elif [ -n "$default" ]; then
-        eval "$var_name='$default'"
-    else
-        eval "$var_name=''"
-    fi
+existing_value() {
+    local key="$1"
+    [ -f "$ENV_FILE" ] || return 0
+    awk -F= -v wanted="$key" '
+        $1 == wanted {
+            value = substr($0, index($0, "=") + 1)
+            if (value ~ /^".*"$/ || value ~ /^'\''.*'\''$/) {
+                value = substr(value, 2, length(value) - 2)
+            }
+            print value
+            exit
+        }
+    ' "$ENV_FILE"
 }
 
-# ============================================
-# Step 1: 新闻源 API Keys
-# ============================================
-echo -e "${YELLOW}${BOLD}📰 第一步：配置新闻源 API Keys${NC}"
-echo -e "  ${CYAN}至少配置一个新闻源，推荐全部配置以获得最全的新闻覆盖${NC}"
-echo ""
+setting_or_default() {
+    local key="$1"
+    local fallback="$2"
+    local value
+    value="$(existing_value "$key")"
+    printf '%s' "${value:-$fallback}"
+}
 
-prompt_key "FINNHUB_API_KEY" "Finnhub API Key" "https://finnhub.io 免费注册, 60次/分钟" "recommended"
-prompt_key "NEWSAPI_API_KEY" "NewsAPI API Key" "https://newsapi.org 免费注册, 100次/天" ""
-prompt_key "GNEWS_API_KEY" "GNews API Key" "https://gnews.io 免费注册, 100次/天" ""
+set_variable() {
+    local name="$1"
+    local value="$2"
+    printf -v "$name" '%s' "$value"
+}
 
-has_news=false
-[ -n "$FINNHUB_API_KEY" ] && has_news=true
-[ -n "$NEWSAPI_API_KEY" ] && has_news=true
-[ -n "$GNEWS_API_KEY" ] && has_news=true
+prompt_value() {
+    local name="$1"
+    local label="$2"
+    local hint="${3:-}"
+    local secret="${4:-false}"
+    local required="${5:-false}"
+    local current input
 
-if [ "$has_news" = false ]; then
-    echo -e "\n  ${RED}⚠ 未配置任何新闻源，系统将无法获取新闻${NC}"
-    echo -en "  是否继续？(y/N): "
-    read -r cont
-    [ "$cont" != "y" ] && exit 0
-fi
-echo ""
+    current="$(existing_value "$name")"
+    printf '%s' "$label"
+    [ -n "$hint" ] && printf '（%s）' "$hint"
+    [ -n "$current" ] && printf ' [已配置，回车保留]'
+    printf ': '
 
-# ============================================
-# Step 2: LLM 模型配置
-# ============================================
-echo -e "${YELLOW}${BOLD}🤖 第二步：配置 AI 分析模型${NC}"
-echo -e "  ${CYAN}选择一个 LLM 提供商用于新闻情绪分析和中文翻译${NC}"
-echo ""
+    if [ "$secret" = "true" ]; then
+        IFS= read -r -s input
+        printf '\n'
+    else
+        IFS= read -r input
+    fi
 
-echo "  可选提供商:"
-echo -e "    ${BOLD}1${NC}) OpenAI (GPT-4o, GPT-4o-mini 等)"
-echo -e "    ${BOLD}2${NC}) Anthropic (Claude)"
-echo -e "    ${BOLD}3${NC}) xAI Grok"
-echo -e "    ${BOLD}4${NC}) Ollama (本地模型, 无需 API Key)"
-echo -e "    ${BOLD}5${NC}) 自定义 OpenAI 兼容接口"
-echo ""
-echo -en "  选择提供商 [1-5]: "
-read -r provider_choice
+    if [ -z "$input" ]; then
+        input="$current"
+    fi
+    if [ "$required" = "true" ] && [ -z "$input" ]; then
+        echo "${label}不能为空。" >&2
+        exit 1
+    fi
+    case "$input" in
+        *$'\r'*|*$'\n'*)
+            echo "$label 不能包含换行。" >&2
+            exit 1
+            ;;
+    esac
+    set_variable "$name" "$input"
+}
 
-case "$provider_choice" in
-    1)
-        DEFAULT_LLM_PROVIDER="openai"
-        prompt_key "OPENAI_API_KEY" "OpenAI API Key" "sk-..." "required"
+write_env_value() {
+    local key="$1"
+    local value="$2"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//\$/\$\$}
+    printf '%s="%s"\n' "$key" "$value" >> "$TEMP_ENV"
+}
+
+echo "MacroLens 安装配置"
+echo
+echo "新闻源密钥均可留空；Google News 和 Seeking Alpha 会作为无密钥补充源。"
+prompt_value FINNHUB_API_KEY "Finnhub API Key" "推荐的核心金融新闻源" true false
+prompt_value MASSIVE_API_KEY "Massive API Key" "可选核心金融新闻源" true false
+prompt_value NEWSAPI_API_KEY "NewsAPI API Key" "默认关闭，付费方案再启用" true false
+prompt_value GNEWS_API_KEY "GNews API Key" "默认关闭，付费方案再启用" true false
+
+echo
+echo "模型分析配置"
+current_provider="$(existing_value DEFAULT_LLM_PROVIDER)"
+printf '提供方 [openai/anthropic/grok/ollama] [%s]: ' "${current_provider:-openai}"
+IFS= read -r DEFAULT_LLM_PROVIDER
+DEFAULT_LLM_PROVIDER="${DEFAULT_LLM_PROVIDER:-${current_provider:-openai}}"
+
+case "$DEFAULT_LLM_PROVIDER" in
+    openai)
+        prompt_value OPENAI_API_KEY "OpenAI API Key" "" true true
+        OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
+        OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 gpt-4o-mini" false false
+        DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-gpt-4o-mini}"
         DEFAULT_LLM_API_KEY="$OPENAI_API_KEY"
-        OPENAI_BASE_URL="${EXISTING[OPENAI_BASE_URL]:-https://api.openai.com/v1}"
-        echo -en "  ${BOLD}模型名称${NC} ${CYAN}[默认: gpt-4o-mini]${NC}: "
-        read -r model_input
-        DEFAULT_LLM_MODEL="${model_input:-gpt-4o-mini}"
+        ANTHROPIC_API_KEY="$(existing_value ANTHROPIC_API_KEY)"
+        GROK_API_KEY="$(existing_value GROK_API_KEY)"
         ;;
-    2)
-        DEFAULT_LLM_PROVIDER="anthropic"
-        prompt_key "ANTHROPIC_API_KEY" "Anthropic API Key" "" "required"
+    anthropic)
+        prompt_value ANTHROPIC_API_KEY "Anthropic API Key" "" true true
+        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 claude-sonnet-4-6" false false
+        DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-claude-sonnet-4-6}"
         DEFAULT_LLM_API_KEY="$ANTHROPIC_API_KEY"
-        echo -en "  ${BOLD}模型名称${NC} ${CYAN}[默认: claude-sonnet-4-20250514]${NC}: "
-        read -r model_input
-        DEFAULT_LLM_MODEL="${model_input:-claude-sonnet-4-20250514}"
+        OPENAI_API_KEY="$(existing_value OPENAI_API_KEY)"
+        OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
+        OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+        GROK_API_KEY="$(existing_value GROK_API_KEY)"
         ;;
-    3)
-        DEFAULT_LLM_PROVIDER="grok"
-        prompt_key "GROK_API_KEY" "Grok API Key" "" "required"
+    grok)
+        prompt_value GROK_API_KEY "Grok API Key" "" true true
+        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 grok-4" false false
+        DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-grok-4}"
         DEFAULT_LLM_API_KEY="$GROK_API_KEY"
-        GROK_BASE_URL="${EXISTING[GROK_BASE_URL]:-https://api.x.ai/v1}"
-        echo -en "  ${BOLD}Grok Base URL${NC} ${CYAN}[默认: ${GROK_BASE_URL}]${NC}: "
-        read -r grok_url_input
-        GROK_BASE_URL="${grok_url_input:-$GROK_BASE_URL}"
-        echo -en "  ${BOLD}模型名称${NC} ${CYAN}[默认: grok-beta]${NC}: "
-        read -r model_input
-        DEFAULT_LLM_MODEL="${model_input:-grok-beta}"
+        OPENAI_API_KEY="$(existing_value OPENAI_API_KEY)"
+        OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
+        OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+        ANTHROPIC_API_KEY="$(existing_value ANTHROPIC_API_KEY)"
         ;;
-    4)
-        DEFAULT_LLM_PROVIDER="ollama"
+    ollama)
         DEFAULT_LLM_API_KEY=""
-        echo -en "  ${BOLD}Ollama Base URL${NC} ${CYAN}[默认: http://host.docker.internal:11434]${NC}: "
-        read -r ollama_url
-        OLLAMA_BASE_URL="${ollama_url:-http://host.docker.internal:11434}"
-        echo -en "  ${BOLD}模型名称${NC} ${CYAN}[默认: llama3]${NC}: "
-        read -r model_input
-        DEFAULT_LLM_MODEL="${model_input:-llama3}"
-        ;;
-    5)
-        DEFAULT_LLM_PROVIDER="openai"
-        echo -en "  ${BOLD}自定义 API Base URL${NC}: "
-        read -r custom_url
-        OPENAI_BASE_URL="${custom_url}"
-        prompt_key "OPENAI_API_KEY" "API Key" "" "required"
-        DEFAULT_LLM_API_KEY="$OPENAI_API_KEY"
-        echo -en "  ${BOLD}模型名称${NC}: "
-        read -r model_input
-        DEFAULT_LLM_MODEL="${model_input:-gpt-4o-mini}"
+        prompt_value DEFAULT_LLM_MODEL "本地模型名称" "默认 llama3" false false
+        DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-llama3}"
+        OPENAI_API_KEY="$(existing_value OPENAI_API_KEY)"
+        OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
+        OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+        ANTHROPIC_API_KEY="$(existing_value ANTHROPIC_API_KEY)"
+        GROK_API_KEY="$(existing_value GROK_API_KEY)"
         ;;
     *)
-        echo -e "${RED}无效选择${NC}"
+        echo "不支持的模型提供方：$DEFAULT_LLM_PROVIDER" >&2
         exit 1
         ;;
 esac
-echo ""
 
-# ============================================
-# Step 3: X/推特情绪监控 (可选)
-# ============================================
-echo -e "${YELLOW}${BOLD}🐦 第三步：X/推特情绪监控 (可选)${NC}"
-echo -e "  ${CYAN}使用 Grok 模型分析 X/推特上的散户情绪和热门讨论${NC}"
-echo ""
+GROK_BASE_URL="$(existing_value GROK_BASE_URL)"
+GROK_BASE_URL="${GROK_BASE_URL:-https://api.x.ai/v1}"
+GROK_MODEL="$(existing_value GROK_MODEL)"
+GROK_MODEL="${GROK_MODEL:-grok-4}"
+OLLAMA_BASE_URL="$(existing_value OLLAMA_BASE_URL)"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
 
-if [ -z "$GROK_API_KEY" ]; then
-    prompt_key "GROK_API_KEY" "Grok API Key" "跳过则不启用 X 情绪监控" ""
+ADMIN_TOKEN="$(existing_value ADMIN_TOKEN)"
+if [ -z "$ADMIN_TOKEN" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        ADMIN_TOKEN="$(openssl rand -hex 32)"
+    else
+        ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+    fi
 fi
-if [ -n "$GROK_API_KEY" ] && [ -z "$GROK_BASE_URL" ]; then
-    GROK_BASE_URL="${EXISTING[GROK_BASE_URL]:-https://api.x.ai/v1}"
-    echo -en "  ${BOLD}Grok Base URL${NC} ${CYAN}[默认: ${GROK_BASE_URL}]${NC}: "
-    read -r grok_url_input
-    GROK_BASE_URL="${grok_url_input:-$GROK_BASE_URL}"
+
+CORS_ORIGINS="$(existing_value CORS_ORIGINS)"
+MACROLENS_DATA_DIR="$(existing_value MACROLENS_DATA_DIR)"
+case "$MACROLENS_DATA_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+        echo "MACROLENS_DATA_DIR 不能指向系统顶层目录。" >&2
+        exit 1
+        ;;
+esac
+
+if [ -f "$ENV_FILE" ]; then
+    backup="${ENV_FILE}.backup.$(date '+%Y%m%d-%H%M%S')"
+    cp "$ENV_FILE" "$backup"
+    chmod 600 "$backup"
+    echo "原配置已备份到 $backup"
 fi
-echo ""
 
-# ============================================
-# Step 4: 高级设置
-# ============================================
-echo -e "${YELLOW}${BOLD}⚙️  第四步：高级设置${NC}"
-echo ""
-echo -en "  ${BOLD}新闻拉取间隔(秒)${NC} ${CYAN}[默认: 60]${NC}: "
-read -r poll_input
-NEWS_POLL_INTERVAL="${poll_input:-60}"
+{
+    echo "# MacroLens configuration"
+    echo "# Generated at $(date '+%Y-%m-%d %H:%M:%S')"
+} > "$TEMP_ENV"
 
-echo -en "  ${BOLD}每批分析数量${NC} ${CYAN}[默认: 10]${NC}: "
-read -r batch_input
-ANALYSIS_BATCH_SIZE="${batch_input:-10}"
-echo ""
+write_env_value FINNHUB_API_KEY "$FINNHUB_API_KEY"
+write_env_value MASSIVE_API_KEY "$MASSIVE_API_KEY"
+write_env_value NEWSAPI_API_KEY "$NEWSAPI_API_KEY"
+write_env_value GNEWS_API_KEY "$GNEWS_API_KEY"
+write_env_value FINNHUB_NEWS_ENABLED "$(setting_or_default FINNHUB_NEWS_ENABLED "$([ -n "$FINNHUB_API_KEY" ] && echo true || echo false)")"
+write_env_value FINNHUB_NEWS_INTERVAL "$(setting_or_default FINNHUB_NEWS_INTERVAL 300)"
+write_env_value MASSIVE_NEWS_ENABLED "$(setting_or_default MASSIVE_NEWS_ENABLED "$([ -n "$MASSIVE_API_KEY" ] && echo true || echo false)")"
+write_env_value MASSIVE_NEWS_INTERVAL "$(setting_or_default MASSIVE_NEWS_INTERVAL 300)"
+write_env_value GOOGLE_NEWS_ENABLED "$(setting_or_default GOOGLE_NEWS_ENABLED true)"
+write_env_value GOOGLE_NEWS_INTERVAL "$(setting_or_default GOOGLE_NEWS_INTERVAL 900)"
+write_env_value SEEKINGALPHA_BREAKING_ENABLED "$(setting_or_default SEEKINGALPHA_BREAKING_ENABLED true)"
+write_env_value SEEKINGALPHA_BREAKING_INTERVAL "$(setting_or_default SEEKINGALPHA_BREAKING_INTERVAL 300)"
+write_env_value SEEKINGALPHA_DAILY_ENABLED "$(setting_or_default SEEKINGALPHA_DAILY_ENABLED true)"
+write_env_value SEEKINGALPHA_DAILY_INTERVAL "$(setting_or_default SEEKINGALPHA_DAILY_INTERVAL 21600)"
+write_env_value NEWSAPI_NEWS_ENABLED "$(setting_or_default NEWSAPI_NEWS_ENABLED false)"
+write_env_value NEWSAPI_NEWS_INTERVAL "$(setting_or_default NEWSAPI_NEWS_INTERVAL 1800)"
+write_env_value GNEWS_NEWS_ENABLED "$(setting_or_default GNEWS_NEWS_ENABLED false)"
+write_env_value GNEWS_NEWS_INTERVAL "$(setting_or_default GNEWS_NEWS_INTERVAL 1800)"
 
-# ============================================
-# Generate .env
-# ============================================
-cat > .env << ENVEOF
-# ============================================
-# MacroLens - 宏观新闻情绪分析平台
-# Generated by setup.sh at $(date '+%Y-%m-%d %H:%M:%S')
-# ============================================
+write_env_value DEFAULT_LLM_PROVIDER "$DEFAULT_LLM_PROVIDER"
+write_env_value DEFAULT_LLM_MODEL "$DEFAULT_LLM_MODEL"
+write_env_value DEFAULT_LLM_API_KEY "$DEFAULT_LLM_API_KEY"
+write_env_value OPENAI_API_KEY "$OPENAI_API_KEY"
+write_env_value OPENAI_BASE_URL "$OPENAI_BASE_URL"
+write_env_value ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+write_env_value GROK_API_KEY "$GROK_API_KEY"
+write_env_value GROK_MODEL "$GROK_MODEL"
+write_env_value GROK_BASE_URL "$GROK_BASE_URL"
+write_env_value OLLAMA_BASE_URL "$OLLAMA_BASE_URL"
 
-# ---------- 新闻源 API Keys ----------
-FINNHUB_API_KEY=${FINNHUB_API_KEY}
-NEWSAPI_API_KEY=${NEWSAPI_API_KEY}
-GNEWS_API_KEY=${GNEWS_API_KEY}
+write_env_value ADMIN_TOKEN "$ADMIN_TOKEN"
+write_env_value SESSION_COOKIE_SECURE "$(setting_or_default SESSION_COOKIE_SECURE false)"
+write_env_value SESSION_TTL_SECONDS "$(setting_or_default SESSION_TTL_SECONDS 28800)"
+write_env_value ANALYSIS_BATCH_SIZE "$(setting_or_default ANALYSIS_BATCH_SIZE 10)"
+write_env_value ANALYSIS_RETENTION_LIMIT "$(setting_or_default ANALYSIS_RETENTION_LIMIT 350)"
+write_env_value X_SENTIMENT_INTERVAL "$(setting_or_default X_SENTIMENT_INTERVAL 21600)"
+write_env_value CALENDAR_ANALYSIS_CACHE_TTL "$(setting_or_default CALENDAR_ANALYSIS_CACHE_TTL 3600)"
+write_env_value NEWS_RETENTION_DAYS "$(existing_value NEWS_RETENTION_DAYS)"
+write_env_value X_SENTIMENT_RETENTION_DAYS "$(existing_value X_SENTIMENT_RETENTION_DAYS)"
+write_env_value DATABASE_URL "$(setting_or_default DATABASE_URL sqlite+aiosqlite:///data/macrolens.db)"
+write_env_value CORS_ORIGINS "$CORS_ORIGINS"
+write_env_value MACROLENS_DATA_DIR "$MACROLENS_DATA_DIR"
 
-# ---------- 默认 LLM 配置 ----------
-DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER}
-DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL}
-DEFAULT_LLM_API_KEY=${DEFAULT_LLM_API_KEY}
+mv "$TEMP_ENV" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+trap - EXIT
 
-# ---------- LLM Provider Keys & URLs ----------
-OPENAI_API_KEY=${OPENAI_API_KEY:-${DEFAULT_LLM_API_KEY}}
-OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
-ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-GROK_API_KEY=${GROK_API_KEY}
-GROK_BASE_URL=${GROK_BASE_URL:-https://api.x.ai/v1}
-OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-
-# ---------- 应用设置 ----------
-NEWS_POLL_INTERVAL=${NEWS_POLL_INTERVAL}
-ANALYSIS_BATCH_SIZE=${ANALYSIS_BATCH_SIZE}
-ENVEOF
-
-echo -e "${GREEN}✓${NC} .env 配置文件已生成"
-echo ""
-
-# ============================================
-# Summary
-# ============================================
-echo -e "${BLUE}${BOLD}  📋 配置摘要${NC}"
-echo -e "  ${CYAN}────────────────────────────────${NC}"
-echo -en "  新闻源:    "
-[ -n "$FINNHUB_API_KEY" ] && echo -en "${GREEN}Finnhub ✓${NC}  "
-[ -n "$NEWSAPI_API_KEY" ] && echo -en "${GREEN}NewsAPI ✓${NC}  "
-[ -n "$GNEWS_API_KEY" ] && echo -en "${GREEN}GNews ✓${NC}  "
-echo ""
-echo -e "  LLM:       ${GREEN}${DEFAULT_LLM_PROVIDER} / ${DEFAULT_LLM_MODEL}${NC}"
-[ -n "$GROK_API_KEY" ] && echo -e "  X 情绪:    ${GREEN}已启用${NC}" || echo -e "  X 情绪:    ${YELLOW}未启用${NC}"
-echo -e "  拉取间隔:  ${NEWS_POLL_INTERVAL}s"
-echo -e "  分析批量:  ${ANALYSIS_BATCH_SIZE}"
-echo ""
-
-# ============================================
-# Start
-# ============================================
-echo -en "${BOLD}是否立即启动 MacroLens？(Y/n): ${NC}"
-read -r start_choice
-
-if [ "$start_choice" != "n" ] && [ "$start_choice" != "N" ]; then
-    echo ""
-    echo -e "${BLUE}🚀 正在构建并启动...${NC}"
-    echo ""
-    $COMPOSE up -d --build
-
-    echo ""
-    echo -e "${GREEN}${BOLD}  ✅ MacroLens 已启动！${NC}"
-    echo ""
-    echo -e "  ${BOLD}前端面板:${NC}  ${CYAN}http://localhost:3000${NC}"
-    echo -e "  ${BOLD}后端 API:${NC}  ${CYAN}http://localhost:8000${NC}"
-    echo -e "  ${BOLD}API 文档:${NC}  ${CYAN}http://localhost:8000/docs${NC}"
-    echo ""
-    echo -e "  ${YELLOW}首次启动后，系统会自动拉取新闻并开始 AI 分析${NC}"
-    echo -e "  ${YELLOW}通常需要 1-2 分钟才能看到第一批分析结果${NC}"
-    echo ""
-    echo -e "  停止: ${CYAN}$COMPOSE down${NC}"
-    echo -e "  日志: ${CYAN}$COMPOSE logs -f${NC}"
+echo
+echo "配置已安全写入 ${ENV_FILE}，管理员令牌未显示在终端。"
+printf '立即构建并启动服务？[Y/n]: '
+IFS= read -r start_choice
+if [ "${start_choice:-Y}" != "n" ] && [ "${start_choice:-Y}" != "N" ]; then
+    "${COMPOSE[@]}" up -d --build
+    echo "服务已启动：http://localhost:3000"
 else
-    echo ""
-    echo -e "  配置已保存到 ${CYAN}.env${NC}"
-    echo -e "  稍后运行 ${CYAN}$COMPOSE up -d --build${NC} 启动"
+    echo "稍后可运行 docker compose up -d --build。"
 fi
-
-echo ""

@@ -1,16 +1,18 @@
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import aiosqlite
+from pydantic import ValidationError
 
 from app.config import settings as app_settings
 from app.models.database import (
-    get_db, insert_analysis, get_unanalyzed_news, get_setting,
-    claim_news_for_analysis, mark_analysis_completed, mark_analysis_failed,
+    get_db, get_unanalyzed_news, get_setting, save_analysis_result,
+    claim_news_for_analysis, mark_analysis_failed,
 )
+from app.models.schemas import LLMAnalysisPayload, SentimentClassification
 from app.services.llm_providers import (
     BaseLLMProvider,
     OpenAIProvider,
@@ -18,8 +20,12 @@ from app.services.llm_providers import (
     GrokProvider,
     OllamaProvider,
 )
+from app.utils.http import safe_exception_message
 
 logger = logging.getLogger(__name__)
+
+MIN_SUMMARY_CHARS = 40
+MIN_TOTAL_CONTEXT_CHARS = 100
 
 SYSTEM_PROMPT = """You are a senior macro-economic analyst specializing in US equities and precious metals markets.
 Analyze the following news article and provide structured sentiment analysis with Chinese translation.
@@ -51,7 +57,13 @@ Rules:
 - Logic chain should show clear causal reasoning in Chinese"""
 
 
-def _get_provider(provider_name: str, model: str, api_key: str, overrides: dict = {}) -> BaseLLMProvider:
+def _get_provider(
+    provider_name: str,
+    model: str,
+    api_key: str,
+    overrides: Optional[dict] = None,
+) -> BaseLLMProvider:
+    overrides = overrides or {}
     if provider_name == "anthropic":
         return AnthropicProvider(api_key=api_key, model=model)
     elif provider_name == "grok":
@@ -59,9 +71,10 @@ def _get_provider(provider_name: str, model: str, api_key: str, overrides: dict 
         return GrokProvider(api_key=api_key, model=model, base_url=grok_base_url)
     elif provider_name == "ollama":
         return OllamaProvider(base_url=overrides.get("ollama_base_url") or app_settings.ollama_base_url, model=model)
-    else:
+    elif provider_name == "openai":
         openai_base_url = overrides.get("openai_base_url") or app_settings.openai_base_url
         return OpenAIProvider(api_key=api_key, model=model, base_url=openai_base_url)
+    raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
 
 async def _get_runtime_settings(db: aiosqlite.Connection) -> dict:
@@ -95,6 +108,52 @@ def _extract_json_object(raw_response: str) -> dict:
     return json.loads(cleaned)
 
 
+def _has_sufficient_context(news_item: dict) -> bool:
+    title = str(news_item.get("title") or "").strip()
+    summary = str(news_item.get("summary") or "").strip()
+    return len(summary) >= MIN_SUMMARY_CHARS and (len(title) + len(summary)) >= MIN_TOTAL_CONTEXT_CHARS
+
+
+def _low_context_payload() -> LLMAnalysisPayload:
+    return LLMAnalysisPayload(
+        title_zh="",
+        headline_summary="原文信息不足，系统保留该新闻，但不生成方向性判断。",
+        overall_sentiment=0,
+        classification=SentimentClassification.neutral,
+        confidence=0,
+        affected_stocks=[],
+        affected_sectors=[],
+        affected_commodities=[],
+        logic_chain="文章仅含标题或摘要过短，缺少形成可靠因果判断所需的上下文。",
+        key_factors=["上下文不足"],
+    )
+
+
+def _analysis_record(
+    news_id: int,
+    payload: LLMAnalysisPayload,
+    provider_name: str,
+    model: str,
+) -> dict:
+    validated = payload.model_dump(mode="json")
+    return {
+        "news_id": news_id,
+        "title_zh": validated["title_zh"],
+        "headline_summary": validated["headline_summary"],
+        "overall_sentiment": validated["overall_sentiment"],
+        "classification": validated["classification"],
+        "confidence": validated["confidence"],
+        "affected_stocks": json.dumps(validated["affected_stocks"], ensure_ascii=False),
+        "affected_sectors": json.dumps(validated["affected_sectors"], ensure_ascii=False),
+        "affected_commodities": json.dumps(validated["affected_commodities"], ensure_ascii=False),
+        "logic_chain": validated["logic_chain"],
+        "key_factors": json.dumps(validated["key_factors"], ensure_ascii=False),
+        "llm_provider": provider_name,
+        "llm_model": model,
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def analyze_news_item(news_item: dict, db: aiosqlite.Connection) -> Optional[dict]:
     """Analyze a single news item and store the result."""
     news_id = news_item["id"]
@@ -103,52 +162,56 @@ async def analyze_news_item(news_item: dict, db: aiosqlite.Connection) -> Option
         logger.debug(f"News {news_id} already claimed, skipping")
         return None
 
-    overrides = await _get_runtime_settings(db)
-
-    provider_name = overrides.get("default_llm_provider") or app_settings.default_llm_provider
-    model = overrides.get("default_llm_model") or app_settings.default_llm_model
-    api_key = _resolve_api_key(provider_name, overrides)
-
-    provider = _get_provider(provider_name, model, api_key, overrides)
-
-    title = news_item.get("title", "")
-    summary = news_item.get("summary", "") or ""
-    user_prompt = f"Title: {title}\n\nSummary: {summary}"
-
     raw_response = ""
+    api_key = ""
     try:
-        raw_response = await provider.analyze(user_prompt, SYSTEM_PROMPT)
-        parsed = _extract_json_object(raw_response)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse LLM JSON response for news_id={news_id}: {e}\nRaw: {raw_response[:500]}")
-        await mark_analysis_failed(db, news_id, str(e))
-        return None
-    except Exception as e:
-        logger.error(f"LLM analysis failed for news_id={news_id}: {e}")
-        await mark_analysis_failed(db, news_id, str(e))
-        return None
+        if not _has_sufficient_context(news_item):
+            payload = _low_context_payload()
+            provider_name = "system"
+            model = "low-context-neutral-v1"
+            logger.info("News %s has insufficient context; storing a neutral result without an LLM call", news_id)
+        else:
+            overrides = await _get_runtime_settings(db)
+            provider_name = overrides.get("default_llm_provider") or app_settings.default_llm_provider
+            model = overrides.get("default_llm_model") or app_settings.default_llm_model
+            api_key = _resolve_api_key(provider_name, overrides)
+            provider = _get_provider(provider_name, model, api_key, overrides)
 
-    analysis = {
-        "news_id": news_id,
-        "title_zh": parsed.get("title_zh", ""),
-        "headline_summary": parsed.get("headline_summary", ""),
-        "overall_sentiment": int(parsed.get("overall_sentiment", 0)),
-        "classification": parsed.get("classification", "neutral"),
-        "confidence": int(parsed.get("confidence", 0)),
-        "affected_stocks": json.dumps(parsed.get("affected_stocks", [])),
-        "affected_sectors": json.dumps(parsed.get("affected_sectors", [])),
-        "affected_commodities": json.dumps(parsed.get("affected_commodities", [])),
-        "logic_chain": parsed.get("logic_chain", ""),
-        "key_factors": json.dumps(parsed.get("key_factors", [])),
-        "llm_provider": provider_name,
-        "llm_model": model,
-        "analyzed_at": datetime.utcnow().isoformat(),
-    }
+            title = str(news_item.get("title") or "")
+            summary = str(news_item.get("summary") or "")
+            user_prompt = f"Title: {title}\n\nSummary: {summary}"
+            raw_response = await provider.analyze(user_prompt, SYSTEM_PROMPT)
+            parsed = _extract_json_object(raw_response)
+            payload = LLMAnalysisPayload.model_validate(parsed)
 
-    analysis_id = await insert_analysis(db, analysis)
-    await mark_analysis_completed(db, news_id)
-    logger.info(f"Analyzed news_id={news_id} -> analysis_id={analysis_id} [{analysis['classification']}]")
-    return analysis
+        analysis = _analysis_record(news_id, payload, provider_name, model)
+        analysis_id = await save_analysis_result(db, analysis)
+        logger.info(
+            "Analyzed news_id=%s -> analysis_id=%s [%s]",
+            news_id,
+            analysis_id,
+            analysis["classification"],
+        )
+        return analysis
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.error(
+            "Invalid structured analysis for news_id=%s: %s",
+            news_id,
+            type(exc).__name__,
+        )
+        try:
+            await mark_analysis_failed(db, news_id, "Invalid structured model output")
+        except Exception:
+            logger.error("Failed to release analysis lease for news_id=%s", news_id)
+        return None
+    except Exception as exc:
+        error = safe_exception_message(exc, secrets=(api_key,))
+        logger.error("Analysis failed for news_id=%s: %s", news_id, error)
+        try:
+            await mark_analysis_failed(db, news_id, error)
+        except Exception:
+            logger.error("Failed to release analysis lease for news_id=%s", news_id)
+        return None
 
 
 async def run_analysis_batch(batch_size: Optional[int] = None) -> int:

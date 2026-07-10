@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -7,51 +8,57 @@ from app.config import settings as app_settings
 
 logger = logging.getLogger(__name__)
 
-_scheduler: AsyncIOScheduler = None
+_scheduler: Optional[AsyncIOScheduler] = None
 
 
-async def _job_fetch_news():
-    """Scheduled job: fetch news from all sources."""
+async def _job_fetch_source(source: str) -> None:
     try:
-        from app.services.news_aggregator import aggregate_all_news
-        count = await aggregate_all_news()
-        logger.info(f"[Scheduler] News fetch complete: {count} new items")
-    except Exception as e:
-        logger.error(f"[Scheduler] News fetch job failed: {e}")
+        from app.services.news_aggregator import aggregate_source
+
+        result = await aggregate_source(source)
+        logger.info(
+            "[Scheduler] %s fetch: status=%s inserted=%s duplicates=%s",
+            source,
+            result.get("status", "ok"),
+            result.get("inserted", 0),
+            result.get("duplicates", 0),
+        )
+    except Exception as exc:
+        logger.error("[Scheduler] source %s job failed: %s", source, type(exc).__name__)
 
 
-async def _job_analyze_news():
-    """Scheduled job: analyze unanalyzed news items."""
+async def _job_analyze_news() -> None:
     try:
         from app.services.llm_analyzer import run_analysis_batch
+
         count = await run_analysis_batch()
-        logger.info(f"[Scheduler] Analysis batch complete: {count} items analyzed")
-    except Exception as e:
-        logger.error(f"[Scheduler] Analysis job failed: {e}")
+        logger.info("[Scheduler] Analysis batch complete: %s items analyzed", count)
+    except Exception as exc:
+        logger.error("[Scheduler] Analysis job failed: %s", type(exc).__name__)
 
 
-async def _job_x_sentiment():
-    """Scheduled job: refresh social sentiment estimation via Grok."""
+async def _job_x_sentiment() -> None:
     try:
         from app.services.grok_x_monitor import run_x_sentiment_analysis
+
         result = await run_x_sentiment_analysis()
         if result:
-            logger.info("[Scheduler] Social sentiment estimation complete")
+            logger.info("[Scheduler] News-grounded market scenario complete")
         else:
-            logger.debug("[Scheduler] Social sentiment skipped (no Grok key)")
-    except Exception as e:
-        logger.error(f"[Scheduler] Social sentiment job failed: {e}")
+            logger.debug("[Scheduler] Market scenario skipped (missing key or news context)")
+    except Exception as exc:
+        logger.error("[Scheduler] Market scenario job failed: %s", type(exc).__name__)
 
 
 async def _get_db_interval(key: str, fallback: int) -> int:
-    """Read interval from DB settings, falling back to env/config value."""
     try:
         from app.models.database import get_db, get_setting
+
         db = await get_db()
         try:
-            val = await get_setting(db, key)
-            if val is not None:
-                return int(val)
+            value = await get_setting(db, key)
+            if value is not None:
+                return max(30, int(value))
         finally:
             await db.close()
     except Exception:
@@ -59,48 +66,83 @@ async def _get_db_interval(key: str, fallback: int) -> int:
     return fallback
 
 
-async def start_scheduler(poll_interval: int = None) -> None:
+def _add_interval_job(
+    scheduler: AsyncIOScheduler,
+    function,
+    *,
+    seconds: int,
+    job_id: str,
+    name: str,
+    args: Optional[list] = None,
+) -> None:
+    jitter = min(60, max(5, seconds // 10))
+    scheduler.add_job(
+        function,
+        trigger=IntervalTrigger(seconds=seconds, jitter=jitter),
+        args=args or [],
+        id=job_id,
+        name=name,
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=max(30, min(seconds, 300)),
+    )
+
+
+async def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None and _scheduler.running:
         logger.warning("Scheduler already running, skipping start")
         return
+
+    from app.services.news_aggregator import (
+        SOURCE_DEFINITIONS,
+        get_enabled_sources,
+        get_source_interval,
+    )
+
     _scheduler = AsyncIOScheduler()
+    source_intervals: dict[str, int] = {}
+    for source in get_enabled_sources():
+        definition = SOURCE_DEFINITIONS[source]
+        fallback_interval = get_source_interval(source)
+        interval = await _get_db_interval(
+            f"{definition.settings_prefix}_interval",
+            fallback_interval,
+        )
+        source_intervals[source] = interval
+        _add_interval_job(
+            _scheduler,
+            _job_fetch_source,
+            seconds=interval,
+            job_id=f"fetch_news_{source}",
+            name=f"Fetch news: {source}",
+            args=[source],
+        )
 
-    # Read intervals: DB override > function arg > env config
-    news_interval = await _get_db_interval("news_poll_interval", poll_interval or app_settings.news_poll_interval)
-    x_sentiment_interval = await _get_db_interval("x_sentiment_interval", app_settings.x_sentiment_interval)
-
-    _scheduler.add_job(
-        _job_fetch_news,
-        trigger=IntervalTrigger(seconds=news_interval),
-        id="fetch_news",
-        name="Fetch news from all sources",
-        replace_existing=True,
-        max_instances=1,
-    )
-
-    _scheduler.add_job(
+    _add_interval_job(
+        _scheduler,
         _job_analyze_news,
-        trigger=IntervalTrigger(seconds=60),
-        id="analyze_news",
+        seconds=60,
+        job_id="analyze_news",
         name="Analyze unanalyzed news",
-        replace_existing=True,
-        max_instances=1,
     )
 
-    _scheduler.add_job(
+    x_sentiment_interval = await _get_db_interval(
+        "x_sentiment_interval",
+        getattr(app_settings, "x_sentiment_interval", 1800),
+    )
+    x_sentiment_interval = max(300, x_sentiment_interval)
+    _add_interval_job(
+        _scheduler,
         _job_x_sentiment,
-        trigger=IntervalTrigger(seconds=x_sentiment_interval),
-        id="x_sentiment",
-        name="Social sentiment estimation (LLM-based)",
-        replace_existing=True,
-        max_instances=1,
+        seconds=x_sentiment_interval,
+        job_id="x_sentiment",
+        name="News-grounded model market scenario",
     )
 
     _scheduler.start()
-    logger.info(
-        f"Scheduler started: news poll={news_interval}s, analysis=60s, x_sentiment={x_sentiment_interval}s"
-    )
+    logger.info("Scheduler started with independent news jobs: %s", source_intervals)
 
 
 def stop_scheduler() -> None:
@@ -109,5 +151,5 @@ def stop_scheduler() -> None:
         logger.info("Scheduler stopped")
 
 
-def get_scheduler() -> AsyncIOScheduler:
+def get_scheduler() -> Optional[AsyncIOScheduler]:
     return _scheduler

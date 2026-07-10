@@ -5,17 +5,27 @@ import type { Analysis, NewsItem } from '../../types'
 import LoadingSpinner from '../common/LoadingSpinner'
 import SentimentChip from '../common/SentimentChip'
 import NewsImage from '../news/NewsImage'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import AssetDetailModal from '../markets/AssetDetailModal'
 import { parseUtcDate } from '../../utils/time'
 import { getRealImageUrl } from '../../utils/image'
+import { useAdminSession } from '../../context/AdminSessionContext'
+import { safeExternalUrl } from '../../utils/url'
 
 export default function DeepAnalysis() {
   const { id } = useParams<{ id: string }>()
   const [triggerMsg, setTriggerMsg] = useState<string | null>(null)
+  const [triggerError, setTriggerError] = useState<string | null>(null)
+  const [triggering, setTriggering] = useState(false)
+  const [visibleAnalyses, setVisibleAnalyses] = useState(10)
   const [selectedTicker, setSelectedTicker] = useState<{ symbol: string; name?: string } | null>(null)
+  const actionControllerRef = useRef<AbortController | null>(null)
+  const { checking: sessionChecking, requireAdmin, handleExpiredSession } = useAdminSession()
 
-  const selectedNewsId = id ? parseInt(id) : null
+  const parsedId = id ? Number(id) : null
+  const selectedNewsId = parsedId != null && Number.isInteger(parsedId) && parsedId > 0 ? parsedId : null
+
+  useEffect(() => () => actionControllerRef.current?.abort(), [])
 
   // ── Detail mode: fetch by news_id directly ──
   const directApi = useApi<{ analysis: Analysis; news: NewsItem | null }>(
@@ -25,11 +35,11 @@ export default function DeepAnalysis() {
 
   // ── List mode (no id): load latest analyses ──
   const analysesApi = useApi<{ items: Analysis[]; total: number }>(
-    (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getAnalyses({ page: 1, page_size: 20 }, signal),
+    (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getAnalyses({ page: 1, page_size: 50 }, signal),
     [selectedNewsId]
   )
   const newsApi = useApi<{ items: NewsItem[]; total: number }>(
-    (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getNews(undefined, signal),
+    (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getNews({ page: 1, page_size: 100 }, signal),
     [selectedNewsId]
   )
 
@@ -50,23 +60,33 @@ export default function DeepAnalysis() {
   const isLoading = selectedNewsId ? directApi.loading : analysesApi.loading
 
   const handleTrigger = async () => {
-    setTriggerMsg('分析已触发...')
+    if (!requireAdmin('提交新闻分析任务需要管理员登录。')) return
+    actionControllerRef.current?.abort()
+    const controller = new AbortController()
+    actionControllerRef.current = controller
+    setTriggering(true)
+    setTriggerMsg(null)
+    setTriggerError(null)
     try {
-      await triggerAnalysis()
-      setTriggerMsg('分析正在后台运行，稍后刷新查看')
-      setTimeout(() => {
-        if (selectedNewsId) directApi.refetch()
-        else analysesApi.refetch()
-        setTriggerMsg(null)
-      }, 5000)
-    } catch {
-      setTriggerMsg('触发分析失败')
+      await triggerAnalysis(controller.signal)
+      setTriggerMsg('分析任务已提交，请稍后刷新页面查看结果。')
+      if (selectedNewsId) directApi.refetch()
+      else analysesApi.refetch()
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+      if (!handleExpiredSession(error, '管理会话已过期，请重新登录后提交分析任务。')) {
+        setTriggerError(error instanceof Error ? error.message : '分析任务提交失败，请稍后重试。')
+      }
+    } finally {
+      if (actionControllerRef.current === controller) setTriggering(false)
     }
   }
 
   if (isLoading) {
-    return <LoadingSpinner className="py-20" />
+    return <LoadingSpinner className="py-20" label="分析加载中" />
   }
+
+  const activeError = selectedNewsId ? directApi.error : analysesApi.error
 
   // No analysis found (directApi returned 404, or list is empty)
   if (!selectedAnalysis) {
@@ -76,32 +96,34 @@ export default function DeepAnalysis() {
           <span className="material-symbols-outlined text-6xl text-primary/30 dark:text-violet-400/30 mb-6 block">
             psychology
           </span>
-          <h2 className="text-2xl font-extrabold font-headline mb-4 dark:text-white">
-            {selectedNewsId ? '未找到分析' : '暂无分析'}
-          </h2>
+          <h1 className="text-2xl font-extrabold font-headline mb-4 dark:text-white">
+            {activeError ? '分析暂时无法加载' : selectedNewsId ? '未找到分析' : '暂无分析'}
+          </h1>
           <p className="text-on-surface-variant dark:text-slate-400 mb-8 leading-relaxed">
-            {selectedNewsId
-              ? 'This news article hasn\'t been analyzed yet. Trigger an analysis to get AI-powered insights.'
-              : '运行分析引擎，获取AI深度分析。'}
+            {activeError
+              ? activeError
+              : selectedNewsId
+              ? '这篇新闻尚未生成分析，管理员可提交最新未分析新闻批次。'
+              : '运行分析引擎后，这里会显示新闻深度分析。'}
           </p>
           <div className="flex justify-center gap-4">
             <button
               onClick={handleTrigger}
+              disabled={sessionChecking || triggering}
               className="bg-gradient-to-r from-primary to-primary-container text-white px-6 py-3 rounded-xl font-bold text-sm hover:shadow-lg hover:shadow-primary/20 active:scale-95 transition-all"
             >
               <span className="material-symbols-outlined text-sm align-middle mr-2">auto_awesome</span>
-              Run Analysis
+              {triggering ? '提交中…' : '提交分析任务'}
             </button>
             <Link
               to="/news"
               className="px-6 py-3 rounded-xl font-bold text-sm border border-surface-container dark:border-slate-700 text-on-surface-variant dark:text-slate-400 hover:bg-surface-container dark:hover:bg-slate-800 transition-all"
             >
-              Back to News
+              返回新闻
             </Link>
           </div>
-          {triggerMsg && (
-            <p className="mt-4 text-sm text-primary dark:text-violet-400 animate-pulse">{triggerMsg}</p>
-          )}
+          {triggerMsg && <p className="mt-4 text-sm text-primary dark:text-violet-400" role="status" aria-live="polite">{triggerMsg}</p>}
+          {triggerError && <p className="mt-4 text-sm text-error dark:text-red-400" role="alert">{triggerError}</p>}
         </div>
       </div>
     )
@@ -119,11 +141,20 @@ export default function DeepAnalysis() {
 
   // 置信度 score
   const confidence = selectedAnalysis.confidence ?? 0
+  const sourceUrl = safeExternalUrl(matchedNews?.url || selectedAnalysis.news_url)
+  const sourceName = matchedNews?.source || selectedAnalysis.news_source || '来源未标注'
+  const evidenceParts = [
+    Boolean(selectedAnalysis.headline_summary),
+    keyFactors.length > 0,
+    Boolean(selectedAnalysis.logic_chain),
+    affectedStocks.length > 0 || affectedSectors.length > 0 || affectedCommodities.length > 0,
+  ]
+  const evidenceCount = evidenceParts.filter(Boolean).length
 
   return (
     <div className="xl:grid xl:grid-cols-[1fr_20rem] gap-0">
       {/* Main Content */}
-      <main className="min-w-0 p-4 md:p-6 lg:p-8 space-y-8">
+      <main id="main-content" className="min-w-0 p-4 md:p-6 lg:p-8 space-y-8">
         {/* Breadcrumb */}
         <div className="flex items-center gap-2 text-xs text-on-surface-variant dark:text-slate-500">
           <Link to="/news" className="hover:text-primary dark:hover:text-violet-400 transition-colors">新闻</Link>
@@ -134,15 +165,18 @@ export default function DeepAnalysis() {
         {/* Hero */}
         <section className="space-y-6">
           <div className="flex flex-wrap items-center gap-3">
-            <SentimentChip classification={classification} score={selectedAnalysis.overall_sentiment} />
+            <SentimentChip classification={classification} score={Math.abs(selectedAnalysis.overall_sentiment)} />
             <span className="text-xs font-bold text-on-surface-variant dark:text-slate-400 uppercase tracking-wider">
-              分析时间: {selectedAnalysis.analyzed_at ? parseUtcDate(selectedAnalysis.analyzed_at).toLocaleString('zh-CN') : ''}
+              分析时间：{selectedAnalysis.analyzed_at ? parseUtcDate(selectedAnalysis.analyzed_at).toLocaleString('zh-CN') : '时间未提供'}
             </span>
             {selectedAnalysis.llm_provider && (
               <span className="text-[10px] font-bold text-on-surface-variant dark:text-slate-500 bg-surface-container dark:bg-slate-800 px-2 py-1 rounded-full uppercase">
                 {selectedAnalysis.llm_provider} / {selectedAnalysis.llm_model}
               </span>
             )}
+            <span className="rounded-full bg-surface-container px-2 py-1 text-[10px] font-bold text-on-surface-variant dark:bg-slate-800 dark:text-slate-400">
+              分析依据完整度 {evidenceCount}/4
+            </span>
           </div>
 
           <h1 className="text-xl md:text-2xl lg:text-3xl font-extrabold font-headline tracking-tight leading-tight dark:text-white break-words">
@@ -151,6 +185,14 @@ export default function DeepAnalysis() {
           {matchedNews?.title && selectedAnalysis.title_zh && selectedAnalysis.title_zh !== matchedNews.title && (
             <p className="text-sm text-on-surface-variant dark:text-slate-400">{matchedNews.title}</p>
           )}
+          <div className="flex flex-wrap items-center gap-3 text-xs font-bold text-on-surface-variant dark:text-slate-400">
+            <span>新闻来源：{sourceName}</span>
+            {sourceUrl ? (
+              <a href={sourceUrl} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline dark:text-violet-400">阅读原文 ↗</a>
+            ) : (
+              <span>原文链接未提供</span>
+            )}
+          </div>
 
           {/* News Image — filter out generic publisher logos */}
           {(() => {
@@ -178,7 +220,7 @@ export default function DeepAnalysis() {
         <section className="bg-surface-container-lowest dark:bg-slate-900 rounded-2xl p-6">
           <div className="flex items-center gap-3 mb-4">
             <span className="material-symbols-outlined text-primary dark:text-violet-400">verified</span>
-            <h3 className="font-bold font-headline dark:text-white">AI置信度</h3>
+            <h3 className="font-bold font-headline dark:text-white">模型置信度</h3>
           </div>
           <div className="flex items-center gap-6">
             <div className="relative w-24 h-24">
@@ -210,10 +252,10 @@ export default function DeepAnalysis() {
               </p>
               <p className="text-sm text-on-surface-variant dark:text-slate-400 leading-relaxed">
                 {isBullish
-                  ? 'The analysis engine identifies a strong positive signal in the underlying data. Multiple corroborating factors suggest upward momentum.'
+                  ? '本次模型分析偏多；请结合原文、行情时间和其他资料核验。'
                   : isBearish
-                  ? '多个指标检测到警告信号。分析表明应保持谨慎，存在潜在下行风险。'
-                  : '各指标信号混合。市场方向不明确，需持续关注。'}
+                  ? '本次模型分析偏空；请结合原文、行情时间和其他资料核验。'
+                  : '本次模型分析为中性；现有新闻信息不足以支持明确方向。'}
               </p>
             </div>
           </div>
@@ -250,7 +292,7 @@ export default function DeepAnalysis() {
           <section className="bg-surface-container-lowest dark:bg-slate-900 rounded-2xl p-6 md:p-8">
             <div className="flex items-center gap-3 mb-4">
               <span className="material-symbols-outlined text-primary dark:text-violet-400">timeline</span>
-              <h3 className="font-bold font-headline dark:text-white">AI深度解读</h3>
+              <h3 className="font-bold font-headline dark:text-white">模型深度解读</h3>
             </div>
             <div className="prose prose-sm dark:prose-invert max-w-none">
               <p className="text-on-surface-variant dark:text-slate-300 leading-relaxed whitespace-pre-line">
@@ -267,6 +309,7 @@ export default function DeepAnalysis() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {affectedStocks.map((stock) => {
                 const positive = stock.impact_score > 0
+                const negative = stock.impact_score < 0
                 return (
                   <button
                     key={stock.ticker}
@@ -276,14 +319,14 @@ export default function DeepAnalysis() {
                   >
                     <div className="flex items-center justify-between">
                       <span className="font-mono font-bold dark:text-white">{stock.ticker}</span>
-                      <span className={`font-bold text-sm ${positive ? 'text-tertiary dark:text-emerald-400' : 'text-error dark:text-red-400'}`}>
-                        {positive ? '▲' : '▼'} Impact: {Math.abs(stock.impact_score)}
+                      <span className={`font-bold text-sm ${positive ? 'text-tertiary dark:text-emerald-400' : negative ? 'text-error dark:text-red-400' : 'text-on-surface-variant dark:text-slate-400'}`}>
+                        {positive ? '▲' : negative ? '▼' : '•'} 影响分数：{Math.abs(stock.impact_score)}
                       </span>
                     </div>
                     <div className="h-1.5 bg-surface-container dark:bg-slate-700 rounded-full overflow-hidden">
                       <div
-                        className={`h-full rounded-full transition-all ${positive ? 'bg-tertiary dark:bg-emerald-500' : 'bg-error dark:bg-red-500'}`}
-                        style={{ width: `${Math.min(Math.abs(stock.impact_score) * 10, 100)}%` }}
+                        className={`h-full rounded-full transition-all ${positive ? 'bg-tertiary dark:bg-emerald-500' : negative ? 'bg-error dark:bg-red-500' : 'bg-slate-400'}`}
+                        style={{ width: `${Math.min(Math.abs(stock.impact_score), 100)}%` }}
                       />
                     </div>
                     <p className="text-xs text-on-surface-variant dark:text-slate-400">{stock.reason}</p>
@@ -299,7 +342,7 @@ export default function DeepAnalysis() {
           <section>
             <h3 className="text-xl font-extrabold font-headline mb-6 dark:text-white">近期分析</h3>
             <div className="space-y-3">
-              {analyses.slice(1, 10).map((a) => {
+              {analyses.slice(1, visibleAnalyses).map((a) => {
                 const aNews = newsItems.find(n => n.id === a.news_id)
                 return (
                   <Link
@@ -318,10 +361,10 @@ export default function DeepAnalysis() {
                     )}
                     <div className="flex-1 min-w-0">
                       <p className="font-semibold text-sm truncate group-hover:text-primary dark:text-white dark:group-hover:text-violet-400 transition-colors">
-                        {a.headline_summary || aNews?.title || `Analysis #${a.id}`}
+                        {a.headline_summary || aNews?.title || `分析 #${a.id}`}
                       </p>
                       <p className="text-xs text-on-surface-variant dark:text-slate-400 mt-1 truncate">
-                        {a.headline_summary?.slice(0, 100)}...
+                        {a.headline_summary?.slice(0, 100)}…
                       </p>
                     </div>
                     <SentimentChip
@@ -332,6 +375,11 @@ export default function DeepAnalysis() {
                 )
               })}
             </div>
+            {visibleAnalyses < analyses.length && (
+              <button type="button" onClick={() => setVisibleAnalyses((count) => count + 10)} className="mt-4 w-full rounded-xl border border-surface-container py-3 text-sm font-bold text-on-surface-variant hover:bg-surface-container dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800">
+                加载更多分析
+              </button>
+            )}
           </section>
         )}
       </main>
@@ -347,26 +395,13 @@ export default function DeepAnalysis() {
               </h3>
               <div className="space-y-3">
                 {affectedSectors.map((sector, i) => {
-                  // Map overall_sentiment (-100..100) to a 0-100% bar
-                  const sent = selectedAnalysis.overall_sentiment ?? 0
-                  const barPct = Math.min(100, Math.max(5, Math.round((sent + 100) / 2)))
                   return (
                     <div
                       key={i}
                       className="bg-surface-container-lowest dark:bg-slate-800 p-4 rounded-xl"
                     >
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-sm font-semibold dark:text-white">{sector}</span>
-                        <span className={`text-xs font-bold ${isBullish ? 'text-tertiary dark:text-emerald-400' : isBearish ? 'text-error dark:text-red-400' : 'text-slate-400'}`}>
-                          {sent > 0 ? '+' : ''}{sent}
-                        </span>
-                      </div>
-                      <div className="h-1.5 bg-surface-container dark:bg-slate-700 rounded-full overflow-hidden">
-                        <div
-                          className={`h-full rounded-full ${isBullish ? 'bg-tertiary dark:bg-emerald-500' : isBearish ? 'bg-error dark:bg-red-500' : 'bg-slate-400'}`}
-                          style={{ width: `${barPct}%` }}
-                        />
-                      </div>
+                      <span className="text-sm font-semibold dark:text-white">{sector}</span>
+                      <p className="mt-1 text-[10px] text-on-surface-variant dark:text-slate-500">分析仅标记受影响板块，未生成独立板块分数。</p>
                     </div>
                   )
                 })}
@@ -384,6 +419,7 @@ export default function DeepAnalysis() {
                 {affectedCommodities.map((c, i) => {
                   const n = c.name.toLowerCase()
                   const isPositive = c.impact_score > 0
+                  const isNegative = c.impact_score < 0
                   return (
                     <div key={i} className="flex items-center gap-3 p-3 bg-surface-container-lowest dark:bg-slate-800 rounded-xl">
                       <span className="material-symbols-outlined text-amber-500">
@@ -396,8 +432,8 @@ export default function DeepAnalysis() {
                         <span className="text-sm font-semibold dark:text-slate-300">{c.name}</span>
                         {c.reason && <p className="text-xs text-on-surface-variant dark:text-slate-500 mt-0.5">{c.reason}</p>}
                       </div>
-                      <span className={`text-sm font-bold ${isPositive ? 'text-tertiary dark:text-emerald-400' : 'text-error dark:text-red-400'}`}>
-                        {isPositive ? '▲' : '▼'} {Math.abs(c.impact_score)}
+                      <span className={`text-sm font-bold ${isPositive ? 'text-tertiary dark:text-emerald-400' : isNegative ? 'text-error dark:text-red-400' : 'text-on-surface-variant dark:text-slate-400'}`}>
+                        {isPositive ? '▲' : isNegative ? '▼' : '•'} {Math.abs(c.impact_score)}
                       </span>
                     </div>
                   )
@@ -432,19 +468,19 @@ export default function DeepAnalysis() {
           <div className="space-y-3">
             <button
               onClick={handleTrigger}
+              disabled={sessionChecking || triggering}
               className="w-full py-3 bg-gradient-to-r from-primary to-primary-container text-white rounded-xl text-xs font-bold hover:shadow-lg active:scale-95 transition-all"
             >
               <span className="material-symbols-outlined text-sm align-middle mr-1">auto_awesome</span>
-              Run New Analysis
+              {triggering ? '提交中…' : '提交新分析'}
             </button>
-            {triggerMsg && (
-              <p className="text-xs text-primary dark:text-violet-400 text-center animate-pulse">{triggerMsg}</p>
-            )}
+            {triggerMsg && <p className="text-xs text-primary dark:text-violet-400 text-center" role="status" aria-live="polite">{triggerMsg}</p>}
+            {triggerError && <p className="text-xs text-error dark:text-red-400 text-center" role="alert">{triggerError}</p>}
             <Link
               to="/news"
               className="block w-full py-3 border border-surface-container dark:border-slate-700 text-on-surface-variant dark:text-slate-400 rounded-xl text-xs font-bold text-center hover:bg-surface-container dark:hover:bg-slate-800 transition-all"
             >
-              Back to News Feed
+              返回新闻流
             </Link>
           </div>
         </div>

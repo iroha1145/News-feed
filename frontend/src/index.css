@@ -11,6 +11,13 @@ body {
   color: #2c2f33;
   transition: background-color 0.2s ease, color 0.2s ease;
   -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+button,
+a {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: rgba(106, 28, 246, 0.14);
 }
 
 .dark body {
@@ -85,3 +92,14 @@ body {
 /* Dark mode surface overrides */
 .dark .md3-surface { background-color: #1e293b; }
 .dark .md3-surface-low { background-color: #0f172a; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,8 +1,8 @@
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import settings as app_settings
 from app.deps.auth import require_admin
@@ -23,12 +23,7 @@ SENSITIVE_KEYS = {
     "massive_api_key",
 }
 
-PROVIDER_MODELS = {
-    "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
-    "anthropic": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
-    "grok": ["grok-beta", "grok-2"],
-    "ollama": ["llama3", "mistral", "codellama", "phi3"],
-}
+PROVIDER_NAMES = ("openai", "anthropic", "grok", "ollama")
 
 ALLOWED_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "host.docker.internal"}
 
@@ -60,7 +55,6 @@ def _merge_settings(db_overrides: dict) -> dict:
         "anthropic_api_key": app_settings.anthropic_api_key,
         "grok_api_key": app_settings.grok_api_key,
         "ollama_base_url": app_settings.ollama_base_url,
-        "news_poll_interval": app_settings.news_poll_interval,
         "analysis_batch_size": app_settings.analysis_batch_size,
         "x_sentiment_interval": app_settings.x_sentiment_interval,
         "finnhub_api_key": app_settings.finnhub_api_key,
@@ -72,19 +66,13 @@ def _merge_settings(db_overrides: dict) -> dict:
 
 
 class SettingsUpdateRequest(BaseModel):
-    default_llm_provider: Optional[str] = None
-    default_llm_model: Optional[str] = None
-    default_llm_api_key: Optional[str] = None
-    openai_api_key: Optional[str] = None
-    anthropic_api_key: Optional[str] = None
-    grok_api_key: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    default_llm_provider: Optional[Literal["openai", "anthropic", "grok", "ollama"]] = None
+    default_llm_model: Optional[str] = Field(default=None, min_length=1, max_length=200)
     ollama_base_url: Optional[str] = None
-    news_poll_interval: Optional[int] = Field(default=None, ge=30)
     analysis_batch_size: Optional[int] = Field(default=None, ge=1, le=20)
-    x_sentiment_interval: Optional[int] = Field(default=None, ge=30)
-    finnhub_api_key: Optional[str] = None
-    newsapi_api_key: Optional[str] = None
-    gnews_api_key: Optional[str] = None
+    x_sentiment_interval: Optional[int] = Field(default=None, ge=300)
 
     @field_validator("ollama_base_url")
     @classmethod
@@ -95,9 +83,11 @@ class SettingsUpdateRequest(BaseModel):
 
 
 class TestLLMRequest(BaseModel):
-    provider: str
-    model: str
-    api_key: Optional[str] = None
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    provider: Literal["openai", "anthropic", "grok", "ollama"]
+    model: str = Field(min_length=1, max_length=200)
+    api_key: Optional[str] = Field(default=None, max_length=4096)
 
 
 @router.get("")
@@ -115,7 +105,7 @@ async def update_settings(body: SettingsUpdateRequest, _: None = Depends(require
     db = await get_db()
     try:
         updated = {}
-        scheduler_keys = {"news_poll_interval", "x_sentiment_interval"}
+        scheduler_keys = {"x_sentiment_interval"}
         needs_scheduler_reload = False
         for key, value in body.model_dump(exclude_none=True).items():
             if key in SENSITIVE_KEYS:
@@ -160,14 +150,18 @@ async def list_providers():
             }
             return key_map.get(provider, "")
 
+        active_provider = overrides.get("default_llm_provider") or app_settings.default_llm_provider
+        active_model = overrides.get("default_llm_model") or app_settings.default_llm_model
         providers = []
-        for name, models in PROVIDER_MODELS.items():
+        for name in PROVIDER_NAMES:
             api_key = resolve_key(name)
             configured = bool(api_key) if name != "ollama" else True
             providers.append({
                 "name": name,
                 "configured": configured,
-                "models": models,
+                # Model catalogues age quickly. Return only the operator's configured
+                # model instead of presenting a hard-coded list as authoritative.
+                "models": [active_model] if name == active_provider else [],
             })
 
         return {"providers": providers}

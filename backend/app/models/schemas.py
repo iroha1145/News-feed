@@ -1,6 +1,13 @@
 from datetime import datetime
+from enum import Enum
 from typing import Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+
+
+class SentimentClassification(str, Enum):
+    bullish = "bullish"
+    bearish = "bearish"
+    neutral = "neutral"
 
 
 class NewsItemBase(BaseModel):
@@ -17,31 +24,39 @@ class NewsItemCreate(NewsItemBase):
 
 
 class NewsItem(NewsItemBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     fetched_at: datetime
     content_hash: str
 
-    class Config:
-        from_attributes = True
-
 
 class AffectedStock(BaseModel):
-    ticker: str
-    company: str
-    impact_score: int
-    reason: str
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    ticker: str = Field(min_length=1, max_length=20)
+    company: str = Field(min_length=1, max_length=200)
+    impact_score: StrictInt = Field(ge=-100, le=100)
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("ticker")
+    @classmethod
+    def normalize_ticker(cls, value: str) -> str:
+        return value.upper()
 
 
 class AffectedCommodity(BaseModel):
-    name: str
-    impact_score: int
-    reason: str
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    impact_score: StrictInt = Field(ge=-100, le=100)
+    reason: str = Field(min_length=1, max_length=2000)
 
 
 class AnalysisBase(BaseModel):
-    overall_sentiment: int
-    classification: str  # bullish/bearish/neutral
-    confidence: int
+    overall_sentiment: StrictInt = Field(ge=-100, le=100)
+    classification: SentimentClassification
+    confidence: StrictInt = Field(ge=0, le=100)
     affected_stocks: list[AffectedStock] = Field(default_factory=list)
     affected_sectors: list[str] = Field(default_factory=list)
     affected_commodities: list[AffectedCommodity] = Field(default_factory=list)
@@ -51,17 +66,46 @@ class AnalysisBase(BaseModel):
     llm_model: str
 
 
+class LLMAnalysisPayload(BaseModel):
+    """Strict contract for untrusted structured output returned by an LLM."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    title_zh: str = Field(max_length=500)
+    headline_summary: str = Field(max_length=2000)
+    overall_sentiment: StrictInt = Field(ge=-100, le=100)
+    classification: SentimentClassification
+    confidence: StrictInt = Field(ge=0, le=100)
+    affected_stocks: list[AffectedStock] = Field(default_factory=list, max_length=50)
+    affected_sectors: list[str] = Field(default_factory=list, max_length=50)
+    affected_commodities: list[AffectedCommodity] = Field(default_factory=list, max_length=30)
+    logic_chain: str = Field(min_length=1, max_length=8000)
+    key_factors: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("affected_sectors", "key_factors")
+    @classmethod
+    def validate_text_lists(cls, values: list[str]) -> list[str]:
+        cleaned = []
+        for value in values:
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("list entries must not be empty")
+            if len(stripped) > 500:
+                raise ValueError("list entries must be at most 500 characters")
+            cleaned.append(stripped)
+        return cleaned
+
+
 class AnalysisCreate(AnalysisBase):
     news_id: int
 
 
 class Analysis(AnalysisBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     news_id: int
     analyzed_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class NewsItemWithAnalysis(NewsItem):
@@ -95,57 +139,19 @@ class XSentimentCreate(XSentimentBase):
 
 
 class XSentiment(XSentimentBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     analyzed_at: datetime
 
-    class Config:
-        from_attributes = True
-
-
-class SettingItem(BaseModel):
-    key: str
-    value: Any
-
-
-class SettingsUpdate(BaseModel):
-    default_llm_provider: Optional[str] = None
-    default_llm_model: Optional[str] = None
-    default_llm_api_key: Optional[str] = None
-    openai_api_key: Optional[str] = None
-    anthropic_api_key: Optional[str] = None
-    grok_api_key: Optional[str] = None
-    ollama_base_url: Optional[str] = None
-    news_poll_interval: Optional[int] = None
-    analysis_batch_size: Optional[int] = None
-    finnhub_api_key: Optional[str] = None
-    newsapi_api_key: Optional[str] = None
-    gnews_api_key: Optional[str] = None
-
-
-class LLMProviderStatus(BaseModel):
-    name: str
-    configured: bool
-    models: list[str]
-
-
-class TestLLMRequest(BaseModel):
-    provider: str
-    model: str
-    api_key: Optional[str] = None
-
-
-class PaginatedResponse(BaseModel):
-    total: int
-    page: int
-    page_size: int
-    items: list[Any]
-
 
 class AnalysisStats(BaseModel):
+    window_days: int = 7
     total_analyzed: int
     avg_sentiment: float
     bullish_count: int
     bearish_count: int
     neutral_count: int
     sector_breakdown: dict[str, int]
+    sector_sentiment: dict[str, dict[str, Any]] = Field(default_factory=dict)
     top_affected_stocks: list[dict[str, Any]]

@@ -1,6 +1,11 @@
+import asyncio
 import logging
+import os
+import re
 import time
-from typing import Optional
+from collections import OrderedDict
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import numpy as np
 import yfinance as yf
@@ -8,6 +13,9 @@ from fastapi import APIRouter, HTTPException, Query
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/quotes", tags=["quotes"])
+
+YAHOO_SOURCE = "Yahoo Finance via yfinance"
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9.^=_-]{0,19}$")
 
 INDICES = {
     "^IXIC": {"name": "NASDAQ", "label": "纳斯达克"},
@@ -24,111 +32,39 @@ COMMODITIES = {
 
 ALL_SYMBOLS = {**INDICES, **COMMODITIES}
 
-# Proxy ETFs for fundamental data (indices/commodities lack market_cap, PE, yield)
-_ETF_PROXY: dict[str, str] = {
-    "^IXIC": "QQQ",
-    "^GSPC": "SPY",
-    "^N225": "EWJ",
-    "000001.SS": "ASHR",
-    "GC=F": "GLD",
-    "SI=F": "SLV",
-    "CL=F": "USO",
-}
 
-# Cache to avoid hitting API too frequently
-_cache: dict = {"data": None, "ts": 0}
-CACHE_TTL = 120  # 2 minutes
+class BoundedTTLCache:
+    def __init__(self, max_size: int, ttl_seconds: int):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._items: OrderedDict[str, tuple[float, Any]] = OrderedDict()
 
+    def get(self, key: str) -> Optional[Any]:
+        item = self._items.get(key)
+        if item is None:
+            return None
+        created_at, value = item
+        if time.monotonic() - created_at >= self.ttl_seconds:
+            self._items.pop(key, None)
+            return None
+        self._items.move_to_end(key)
+        return value
 
-def _is_market_open(info) -> bool:
-    """Heuristic: if last_price != previous_close, market likely moved today."""
-    try:
-        return abs(info.last_price - info.previous_close) > 0.001
-    except Exception:
-        return False
+    def set(self, key: str, value: Any) -> None:
+        self._items[key] = (time.monotonic(), value)
+        self._items.move_to_end(key)
+        while len(self._items) > self.max_size:
+            self._items.popitem(last=False)
 
-
-@router.get("")
-async def get_market_quotes():
-    """Fetch market quotes using yfinance with 52-week range data."""
-    now = time.time()
-    if _cache["data"] and (now - _cache["ts"]) < CACHE_TTL:
-        return _cache["data"]
-
-    try:
-        symbols_str = " ".join(ALL_SYMBOLS.keys())
-        tickers = yf.Tickers(symbols_str)
-
-        quotes = []
-        for symbol, meta in ALL_SYMBOLS.items():
-            try:
-                t = tickers.tickers[symbol]
-                info = t.fast_info
-                price = info.last_price
-                prev = info.previous_close
-                change = price - prev if price and prev else None
-                change_pct = (change / prev * 100) if change and prev else None
-                market_open = _is_market_open(info)
-
-                quotes.append({
-                    "symbol": symbol,
-                    "name": meta["name"],
-                    "label": meta["label"],
-                    "price": round(price, 2) if price else None,
-                    "change": round(change, 2) if change is not None else None,
-                    "changePercent": round(change_pct, 2) if change_pct is not None else None,
-                    "previousClose": round(prev, 2) if prev else None,
-                    "yearLow": round(info.year_low, 2) if info.year_low else None,
-                    "yearHigh": round(info.year_high, 2) if info.year_high else None,
-                    "marketOpen": market_open,
-                    "type": "commodity" if symbol in COMMODITIES else "index",
-                })
-            except Exception as e:
-                logger.warning(f"Failed to fetch {symbol}: {e}")
-                quotes.append({
-                    "symbol": symbol,
-                    "name": meta["name"],
-                    "label": meta["label"],
-                    "price": None,
-                    "change": None,
-                    "changePercent": None,
-                    "previousClose": None,
-                    "yearLow": None,
-                    "yearHigh": None,
-                    "marketOpen": False,
-                    "type": "commodity" if symbol in COMMODITIES else "index",
-                })
-
-        result = {"quotes": quotes}
-        _cache["data"] = result
-        _cache["ts"] = now
-        return result
-
-    except Exception as e:
-        logger.warning(f"Failed to fetch market quotes: {e}")
-        return {
-            "quotes": [
-                {
-                    "symbol": s,
-                    "name": ALL_SYMBOLS[s]["name"],
-                    "label": ALL_SYMBOLS[s]["label"],
-                    "price": None,
-                    "change": None,
-                    "changePercent": None,
-                    "previousClose": None,
-                    "yearLow": None,
-                    "yearHigh": None,
-                    "marketOpen": False,
-                    "type": "commodity" if s in COMMODITIES else "index",
-                }
-                for s in ALL_SYMBOLS
-            ]
-        }
+    def __len__(self) -> int:
+        return len(self._items)
 
 
-# ── Candles (OHLCV + EMA/SMA) ──────────────────────────────────
+_market_cache = BoundedTTLCache(max_size=1, ttl_seconds=120)
+_candle_cache = BoundedTTLCache(max_size=64, ttl_seconds=300)
+_profile_cache = BoundedTTLCache(max_size=128, ttl_seconds=600)
+_yfinance_slots: Optional[asyncio.Semaphore] = None
 
-# Map frontend timeframe → yfinance (period, interval)
 _TF_MAP = {
     "1D": ("5d", "15m"),
     "1W": ("1mo", "1h"),
@@ -136,174 +72,299 @@ _TF_MAP = {
     "1Y": ("1y", "1d"),
 }
 
-_candle_cache: dict = {}
-_CANDLE_TTL = 300  # 5 min
+
+def _configure_yfinance_cache() -> None:
+    cache_dir = os.getenv("YFINANCE_CACHE_DIR", "/tmp/macrolens-yfinance")
+    try:
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+        yf.set_tz_cache_location(cache_dir)
+    except Exception as exc:
+        logger.warning("Unable to configure yfinance cache: %s", type(exc).__name__)
+
+
+_configure_yfinance_cache()
+
+
+def _as_of() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _run_yfinance(function, *args):
+    global _yfinance_slots
+    if _yfinance_slots is None:
+        _yfinance_slots = asyncio.Semaphore(4)
+    async with _yfinance_slots:
+        return await asyncio.to_thread(function, *args)
+
+
+def _validated_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if not SYMBOL_PATTERN.fullmatch(normalized):
+        raise HTTPException(status_code=400, detail="Unsupported symbol format")
+    return normalized
+
+
+def _finite_float(value: Any, digits: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(parsed):
+        return None
+    return round(parsed, digits)
+
+
+def _finite_int(value: Any) -> Optional[int]:
+    if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+        return int(value)
+    parsed = _finite_float(value, digits=6)
+    return int(parsed) if parsed is not None else None
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
+def _first_present(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
+
+
+def _empty_quote(symbol: str, meta: dict, as_of: str) -> dict:
+    return {
+        "symbol": symbol,
+        "name": meta["name"],
+        "label": meta["label"],
+        "price": None,
+        "change": None,
+        "changePercent": None,
+        "previousClose": None,
+        "yearLow": None,
+        "yearHigh": None,
+        "marketOpen": None,
+        "type": "commodity" if symbol in COMMODITIES else "index",
+        "source": YAHOO_SOURCE,
+        "as_of": as_of,
+    }
+
+
+def _fetch_market_quotes_sync() -> dict:
+    as_of = _as_of()
+    tickers = yf.Tickers(" ".join(ALL_SYMBOLS))
+    quotes = []
+    for symbol, meta in ALL_SYMBOLS.items():
+        try:
+            ticker = tickers.tickers[symbol]
+            info = ticker.fast_info
+            price = _finite_float(_safe_attr(info, "last_price"))
+            previous = _finite_float(_safe_attr(info, "previous_close"))
+            change = round(price - previous, 2) if price is not None and previous is not None else None
+            change_percent = (
+                round(change / previous * 100, 2)
+                if change is not None and previous not in (None, 0)
+                else None
+            )
+            quotes.append({
+                "symbol": symbol,
+                "name": meta["name"],
+                "label": meta["label"],
+                "price": price,
+                "change": change,
+                "changePercent": change_percent,
+                "previousClose": previous,
+                "yearLow": _finite_float(_safe_attr(info, "year_low")),
+                "yearHigh": _finite_float(_safe_attr(info, "year_high")),
+                # yfinance does not provide a reliable cross-market open/closed signal here.
+                "marketOpen": None,
+                "type": "commodity" if symbol in COMMODITIES else "index",
+                "source": YAHOO_SOURCE,
+                "as_of": as_of,
+            })
+        except Exception as exc:
+            logger.warning("Failed to fetch %s: %s", symbol, exc)
+            quotes.append(_empty_quote(symbol, meta, as_of))
+    return {"quotes": quotes, "source": YAHOO_SOURCE, "as_of": as_of}
+
+
+@router.get("")
+async def get_market_quotes():
+    cached = _market_cache.get("all")
+    if cached is not None:
+        return cached
+    try:
+        result = await _run_yfinance(_fetch_market_quotes_sync)
+    except Exception as exc:
+        logger.warning("Failed to fetch market quotes: %s", exc)
+        as_of = _as_of()
+        result = {
+            "quotes": [_empty_quote(symbol, meta, as_of) for symbol, meta in ALL_SYMBOLS.items()],
+            "source": YAHOO_SOURCE,
+            "as_of": as_of,
+        }
+    _market_cache.set("all", result)
+    return result
+
+
+def _fetch_candles_sync(symbol: str, timeframe: str) -> dict:
+    period, interval = _TF_MAP[timeframe]
+    frame = yf.Ticker(symbol).history(period=period, interval=interval)
+    if frame.empty:
+        raise LookupError("No candle data available")
+
+    if getattr(frame.index, "tz", None) is not None:
+        frame.index = frame.index.tz_convert(None)
+
+    close = frame["Close"]
+    ema20 = close.ewm(span=min(20, len(close)), min_periods=1, adjust=False).mean()
+    sma50 = close.rolling(window=min(50, len(close)), min_periods=1).mean()
+    candles = []
+    ema_points = []
+    sma_points = []
+
+    for idx, row in frame.iterrows():
+        timestamp = idx.isoformat()
+        open_price = _finite_float(row.get("Open"))
+        high = _finite_float(row.get("High"))
+        low = _finite_float(row.get("Low"))
+        close_price = _finite_float(row.get("Close"))
+        if None in (open_price, high, low, close_price):
+            continue
+        candles.append({
+            "time": timestamp,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close_price,
+            "volume": _finite_int(row.get("Volume")),
+        })
+        ema_value = _finite_float(ema20.loc[idx])
+        sma_value = _finite_float(sma50.loc[idx])
+        if ema_value is not None:
+            ema_points.append({"time": timestamp, "value": ema_value})
+        if sma_value is not None:
+            sma_points.append({"time": timestamp, "value": sma_value})
+
+    if not candles:
+        raise LookupError("No valid candle data available")
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candles": candles,
+        "ema20": ema_points,
+        "sma50": sma_points,
+        "source": YAHOO_SOURCE,
+        "as_of": _as_of(),
+    }
 
 
 @router.get("/{symbol:path}/candles")
 async def get_candles(
     symbol: str,
-    timeframe: str = Query("1D", regex="^(1D|1W|1M|1Y)$"),
+    timeframe: str = Query("1D", pattern="^(1D|1W|1M|1Y)$"),
 ):
-    """Return OHLCV candles + EMA-20 / SMA-50 for a given symbol & timeframe."""
-
-    cache_key = f"{symbol}:{timeframe}"
-    now = time.time()
+    normalized = _validated_symbol(symbol)
+    cache_key = f"{normalized}:{timeframe}"
     cached = _candle_cache.get(cache_key)
-    if cached and (now - cached["ts"]) < _CANDLE_TTL:
-        return cached["data"]
-
-    period, interval = _TF_MAP[timeframe]
-
+    if cached is not None:
+        return cached
     try:
-        t = yf.Ticker(symbol)
-        df = t.history(period=period, interval=interval)
+        result = await _run_yfinance(_fetch_candles_sync, normalized, timeframe)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Candle fetch failed for %s", normalized)
+        raise HTTPException(status_code=502, detail="Market data provider unavailable") from exc
+    _candle_cache.set(cache_key, result)
+    return result
 
-        if df.empty:
-            raise HTTPException(404, "No candle data available")
 
-        # Drop timezone info for JSON serialisation
-        df.index = df.index.tz_localize(None) if df.index.tz is None else df.index.tz_convert(None)
-
-        # Compute moving averages on Close
-        close = df["Close"]
-        ema20 = close.ewm(span=min(20, len(close)), min_periods=1, adjust=False).mean()
-        sma50 = close.rolling(window=min(50, len(close)), min_periods=1).mean()
-
-        candles = []
-        ema_points = []
-        sma_points = []
-
-        for idx, row in df.iterrows():
-            ts = idx.isoformat()
-            candles.append({
-                "time": ts,
-                "open": round(float(row["Open"]), 2),
-                "high": round(float(row["High"]), 2),
-                "low": round(float(row["Low"]), 2),
-                "close": round(float(row["Close"]), 2),
-                "volume": int(row["Volume"]),
-            })
-            if not np.isnan(ema20[idx]):
-                ema_points.append({"time": ts, "value": round(float(ema20[idx]), 2)})
-            if not np.isnan(sma50[idx]):
-                sma_points.append({"time": ts, "value": round(float(sma50[idx]), 2)})
-
-        result = {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "candles": candles,
-            "ema20": ema_points,
-            "sma50": sma_points,
-        }
-        _candle_cache[cache_key] = {"data": result, "ts": now}
-        return result
-
-    except HTTPException:
-        raise
+def _fetch_profile_sync(symbol: str) -> dict:
+    ticker = yf.Ticker(symbol)
+    info = ticker.info or {}
+    try:
+        fast_info = ticker.fast_info
     except Exception:
-        logger.exception("Candle fetch failed for %s", symbol)
-        raise HTTPException(500, "Failed to fetch candle data")
+        fast_info = None
 
+    meta = ALL_SYMBOLS.get(symbol)
+    display_name = meta["name"] if meta else symbol
+    open_price = _first_present(info.get("open"), info.get("regularMarketOpen"), _safe_attr(fast_info, "open"))
+    day_high = _first_present(info.get("dayHigh"), info.get("regularMarketDayHigh"), _safe_attr(fast_info, "day_high"))
+    day_low = _first_present(info.get("dayLow"), info.get("regularMarketDayLow"), _safe_attr(fast_info, "day_low"))
+    description = info.get("longBusinessSummary") or info.get("description")
+    if not isinstance(description, str) or not description.strip():
+        description = None
+    short_name = info.get("shortName")
+    if not isinstance(short_name, str) or not short_name.strip():
+        short_name = display_name
 
-# ── Profile (fundamentals) ──────────────────────────────────────
-
-_profile_cache: dict = {}
-_PROFILE_TTL = 600  # 10 min
+    return {
+        "symbol": symbol,
+        "name": display_name,
+        "shortName": short_name,
+        "description": description,
+        "market_cap": _finite_int(info.get("marketCap")),
+        "pe_ratio": _finite_float(_first_present(info.get("trailingPE"), info.get("forwardPE"))),
+        "dividend_yield": _finite_float(info.get("dividendYield"), digits=6),
+        "avg_volume": _finite_int(_first_present(info.get("averageVolume"), info.get("averageDailyVolume10Day"))),
+        "open": _finite_float(open_price),
+        "day_high": _finite_float(day_high),
+        "day_low": _finite_float(day_low),
+        "last_volume": _finite_int(_first_present(_safe_attr(fast_info, "last_volume"), info.get("volume"), info.get("regularMarketVolume"))),
+        "year_low": _finite_float(_first_present(info.get("fiftyTwoWeekLow"), _safe_attr(fast_info, "year_low"))),
+        "year_high": _finite_float(_first_present(info.get("fiftyTwoWeekHigh"), _safe_attr(fast_info, "year_high"))),
+        "fifty_day_avg": _finite_float(_first_present(info.get("fiftyDayAverage"), _safe_attr(fast_info, "fifty_day_average"))),
+        "two_hundred_day_avg": _finite_float(_first_present(info.get("twoHundredDayAverage"), _safe_attr(fast_info, "two_hundred_day_average"))),
+        "beta": _finite_float(info.get("beta")),
+        "source": YAHOO_SOURCE,
+        "as_of": _as_of(),
+    }
 
 
 @router.get("/{symbol:path}/profile")
 async def get_profile(symbol: str):
-    """Return fundamental profile data for a given symbol."""
-    now = time.time()
-    cached = _profile_cache.get(symbol)
-    if cached and (now - cached["ts"]) < _PROFILE_TTL:
-        return cached["data"]
-
-    # Derive name/type for both known and arbitrary symbols
-    meta = ALL_SYMBOLS.get(symbol)
-    display_name = meta["name"] if meta else symbol
-
+    normalized = _validated_symbol(symbol)
+    cached = _profile_cache.get(normalized)
+    if cached is not None:
+        return cached
     try:
-        t = yf.Ticker(symbol)
-        info = t.info or {}
+        result = await _run_yfinance(_fetch_profile_sync, normalized)
+    except Exception as exc:
+        logger.exception("Profile fetch failed for %s", normalized)
+        raise HTTPException(status_code=502, detail="Market data provider unavailable") from exc
+    _profile_cache.set(normalized, result)
+    return result
 
-        # fast_info is more reliable for OHLV on indices
-        try:
-            fi = t.fast_info
-            fi_open = fi.open
-            fi_high = fi.day_high
-            fi_low = fi.day_low
-            fi_vol = fi.last_volume
-            fi_year_low = fi.year_low
-            fi_year_high = fi.year_high
-            fi_50d = fi.fifty_day_average if hasattr(fi, "fifty_day_average") else None
-            fi_200d = fi.two_hundred_day_average if hasattr(fi, "two_hundred_day_average") else None
-        except Exception:
-            fi_open = fi_high = fi_low = fi_vol = fi_year_low = fi_year_high = fi_50d = fi_200d = None
-
-        # Fetch proxy ETF fundamentals if the symbol itself lacks them
-        etf_info: dict = {}
-        proxy = _ETF_PROXY.get(symbol)
-        if proxy and not info.get("marketCap"):
-            try:
-                etf_info = yf.Ticker(proxy).info or {}
-            except Exception:
-                pass
-
-        def _r(v):
-            return round(float(v), 2) if v is not None else None
-
-        result = {
-            "symbol": symbol,
-            "name": display_name,
-            "shortName": info.get("shortName", display_name),
-            "description": info.get("longBusinessSummary") or info.get("description", ""),
-            "market_cap": info.get("marketCap") or etf_info.get("totalAssets") or etf_info.get("marketCap"),
-            "pe_ratio": info.get("trailingPE") or info.get("forwardPE") or etf_info.get("trailingPE"),
-            "dividend_yield": info.get("dividendYield") or etf_info.get("yield") or etf_info.get("dividendYield"),
-            "avg_volume": info.get("averageVolume") or info.get("averageDailyVolume10Day"),
-            "open": _r(info.get("open") or info.get("regularMarketOpen") or fi_open),
-            "day_high": _r(info.get("dayHigh") or info.get("regularMarketDayHigh") or fi_high),
-            "day_low": _r(info.get("dayLow") or info.get("regularMarketDayLow") or fi_low),
-            "last_volume": int(fi_vol) if fi_vol else (info.get("volume") or info.get("regularMarketVolume")),
-            "year_low": _r(info.get("fiftyTwoWeekLow") or fi_year_low),
-            "year_high": _r(info.get("fiftyTwoWeekHigh") or fi_year_high),
-            "fifty_day_avg": _r(info.get("fiftyDayAverage") or fi_50d),
-            "two_hundred_day_avg": _r(info.get("twoHundredDayAverage") or fi_200d),
-            "beta": info.get("beta") or etf_info.get("beta3Year") or etf_info.get("beta"),
-            "etf_proxy": proxy,
-        }
-
-        _profile_cache[symbol] = {"data": result, "ts": now}
-        return result
-
-    except Exception:
-        logger.exception("Profile fetch failed for %s", symbol)
-        raise HTTPException(500, "Failed to fetch profile")
-
-
-# ── Asset Sentiment (aggregated from analyses) ──────────────────
 
 @router.get("/{symbol:path}/sentiment")
 async def get_asset_sentiment_api(
     symbol: str,
     days: int = Query(7, ge=1, le=90),
 ):
-    """Aggregate news sentiment for a given asset over the past N days."""
+    normalized = _validated_symbol(symbol)
     try:
-        from app.models.database import get_db, get_asset_sentiment
+        from app.models.database import get_asset_sentiment, get_db
+
         db = await get_db()
         try:
-            result = await get_asset_sentiment(db, symbol, days=days)
-            return {"symbol": symbol, "days": days, **result}
+            result = await get_asset_sentiment(db, normalized, days=days)
         finally:
             await db.close()
-    except Exception as e:
-        logger.warning(f"Sentiment aggregation failed for {symbol}: {e}")
-        # Return empty/null sentiment for unknown or unsupported symbols
         return {
-            "symbol": symbol,
+            "symbol": normalized,
+            "days": days,
+            **result,
+            "source": "MacroLens analyzed news",
+            "as_of": _as_of(),
+        }
+    except Exception as exc:
+        logger.warning("Sentiment aggregation failed for %s: %s", normalized, exc)
+        return {
+            "symbol": normalized,
             "days": days,
             "score": None,
             "total": 0,
@@ -313,80 +374,18 @@ async def get_asset_sentiment_api(
             "signal": None,
             "description": None,
             "tags": [],
+            "source": "MacroLens analyzed news",
+            "as_of": _as_of(),
         }
-
-
-# ── Top Constituents (index weight contributors) ────────────────
-
-_CONSTITUENTS: dict[str, list[dict]] = {
-    "^IXIC": [
-        {"ticker": "AAPL", "name": "Apple Inc.", "weight": 12.4},
-        {"ticker": "MSFT", "name": "Microsoft Corp.", "weight": 10.2},
-        {"ticker": "NVDA", "name": "NVIDIA Corp.", "weight": 6.8},
-        {"ticker": "AMZN", "name": "Amazon.com Inc.", "weight": 5.6},
-        {"ticker": "META", "name": "Meta Platforms", "weight": 4.3},
-    ],
-    "^GSPC": [
-        {"ticker": "AAPL", "name": "Apple Inc.", "weight": 7.1},
-        {"ticker": "MSFT", "name": "Microsoft Corp.", "weight": 6.8},
-        {"ticker": "NVDA", "name": "NVIDIA Corp.", "weight": 5.2},
-        {"ticker": "AMZN", "name": "Amazon.com Inc.", "weight": 3.8},
-        {"ticker": "GOOG", "name": "Alphabet Inc.", "weight": 3.5},
-    ],
-    "^N225": [
-        {"ticker": "TM", "name": "Toyota Motor", "weight": 4.8},
-        {"ticker": "SONY", "name": "Sony Group", "weight": 3.2},
-        {"ticker": "6758.T", "name": "Sony Group (TSE)", "weight": 3.2},
-        {"ticker": "7203.T", "name": "Toyota Motor (TSE)", "weight": 4.8},
-        {"ticker": "8306.T", "name": "Mitsubishi UFJ", "weight": 2.5},
-    ],
-}
-
-_const_cache: dict = {}
-_CONST_TTL = 300  # 5 min
 
 
 @router.get("/{symbol:path}/constituents")
 async def get_constituents(symbol: str):
-    """Return top weight contributors with live change % for an index."""
-    mapping = _CONSTITUENTS.get(symbol)
-    if not mapping:
-        return {"symbol": symbol, "constituents": []}
-
-    now = time.time()
-    cached = _const_cache.get(symbol)
-    if cached and (now - cached["ts"]) < _CONST_TTL:
-        return cached["data"]
-
-    try:
-        tickers_str = " ".join(c["ticker"] for c in mapping)
-        tks = yf.Tickers(tickers_str)
-        result_list = []
-
-        for c in mapping:
-            try:
-                t = tks.tickers.get(c["ticker"])
-                if t:
-                    fi = t.fast_info
-                    prc = fi.last_price
-                    prev = fi.previous_close
-                    chg_pct = ((prc - prev) / prev * 100) if prc and prev else None
-                else:
-                    chg_pct = None
-            except Exception:
-                chg_pct = None
-
-            result_list.append({
-                "ticker": c["ticker"],
-                "name": c["name"],
-                "weight": c["weight"],
-                "changePercent": round(chg_pct, 2) if chg_pct is not None else None,
-            })
-
-        result = {"symbol": symbol, "constituents": result_list}
-        _const_cache[symbol] = {"data": result, "ts": now}
-        return result
-
-    except Exception:
-        logger.exception("Constituents fetch failed for %s", symbol)
-        raise HTTPException(500, "Failed to fetch constituents")
+    """No static weights are returned because index membership and weights change over time."""
+    normalized = _validated_symbol(symbol)
+    return {
+        "symbol": normalized,
+        "constituents": [],
+        "source": None,
+        "as_of": None,
+    }

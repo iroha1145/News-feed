@@ -1,7 +1,7 @@
-export default function LoadingSpinner({ className = '' }: { className?: string }) {
+export default function LoadingSpinner({ className = '', label = '加载中' }: { className?: string; label?: string }) {
   return (
-    <div className={`flex items-center justify-center ${className}`}>
-      <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
+    <div className={`flex items-center justify-center ${className}`} role="status" aria-label={label}>
+      <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin" aria-hidden="true" />
     </div>
   )
 }

@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class GrokProvider(BaseLLMProvider):
-    def __init__(self, api_key: str, model: str = "grok-beta", base_url: str = "https://api.x.ai/v1"):
+    def __init__(self, api_key: str, model: str = "grok-4", base_url: str = "https://api.x.ai/v1"):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
@@ -50,14 +50,9 @@ class GrokProvider(BaseLLMProvider):
 
             # Fallback: if proxy rejects system role (403/502), merge into user message and retry
             if response.status_code in (403, 502) and any(m["role"] == "system" for m in messages):
-                body = ""
-                try:
-                    body = response.text[:300]
-                except Exception:
-                    pass
                 logger.warning(
-                    f"Grok proxy rejected system role (HTTP {response.status_code}): {body}. "
-                    f"Retrying with merged user message."
+                    "Grok proxy rejected system role (HTTP %s); retrying with merged user message",
+                    response.status_code,
                 )
                 system_text = next((m["content"] for m in messages if m["role"] == "system"), "")
                 user_text = next((m["content"] for m in messages if m["role"] == "user"), "")

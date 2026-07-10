@@ -1,10 +1,12 @@
 import logging
 import xml.etree.ElementTree as ET
-from datetime import datetime
 from typing import Optional
 from email.utils import parsedate_to_datetime
 
 import httpx
+
+from app.utils.http import log_http_failure
+from app.utils.news_text import clean_news_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +33,13 @@ def _parse_rss_item(item: ET.Element) -> Optional[dict]:
     pub_el = item.find("pubDate")
     source_el = item.find("source")
 
-    title = title_el.text.strip() if title_el is not None and title_el.text else ""
-    url = link_el.text.strip() if link_el is not None and link_el.text else ""
+    title = clean_news_text(title_el.text if title_el is not None else None, empty="") or ""
+    url = clean_news_text(link_el.text if link_el is not None else None, empty="") or ""
     if not title or not url:
         return None
 
     # Remove " - SourceName" suffix that Google News appends
-    source_name = source_el.text if source_el is not None and source_el.text else "Google News"
+    source_name = clean_news_text(source_el.text if source_el is not None else None, empty="Google News") or "Google News"
 
     # Parse RFC 2822 date
     published_at = ""
@@ -66,6 +68,8 @@ async def fetch_google_news() -> list[dict]:
     """Fetch financial news from Google News RSS. Free, no API key needed."""
     results: list[dict] = []
     seen_titles: set[str] = set()
+    successful_feeds = 0
+    errors: list[str] = []
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -73,11 +77,12 @@ async def fetch_google_news() -> list[dict]:
                 try:
                     resp = await client.get(
                         feed["url"],
-                        headers={"User-Agent": "Mozilla/5.0 MacroLens/1.0"},
+                        headers={"User-Agent": "MacroLens/1.0 (news aggregator)"},
                     )
                     resp.raise_for_status()
                     tree = ET.fromstring(resp.text)
                     items = tree.findall(".//item")
+                    successful_feeds += 1
 
                     count = 0
                     for item in items[:30]:  # Cap per feed
@@ -89,10 +94,12 @@ async def fetch_google_news() -> list[dict]:
 
                     logger.info(f"Google News [{feed['label']}]: {count} items")
                 except Exception as e:
-                    logger.warning(f"Google News [{feed['label']}] error: {e}")
+                    errors.append(log_http_failure(logger, f"Google News [{feed['label']}]", e, endpoint=feed["url"]))
 
     except Exception as e:
-        logger.error(f"Google News fetch error: {e}")
+        errors.append(log_http_failure(logger, "Google News", e, warning=False))
 
     logger.info(f"Google News total: {len(results)} items")
+    if successful_feeds == 0 and errors:
+        raise RuntimeError("All Google News feeds failed")
     return results

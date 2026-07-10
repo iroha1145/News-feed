@@ -11,11 +11,7 @@ import type {
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
-if (import.meta.env.PROD && !BASE_URL) {
-  console.warn('VITE_API_BASE_URL is not set in production; frontend will use relative API paths.')
-}
-
-class ApiError extends Error {
+export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
     this.name = 'ApiError';
@@ -24,22 +20,75 @@ class ApiError extends Error {
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${BASE_URL}${path}`;
-  const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    ...options,
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      credentials: 'include',
+      headers: {
+        ...(options?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...options?.headers,
+      },
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw new ApiError(0, '无法连接服务器，请检查网络或稍后重试。');
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
+    let message = text || res.statusText || `请求失败（${res.status}）`;
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown; message?: unknown };
+      if (typeof parsed.detail === 'string') message = parsed.detail;
+      else if (typeof parsed.message === 'string') message = parsed.message;
+      else message = res.statusText || `请求失败（${res.status}）`;
+    } catch {
+      // Keep the plain-text response when the server did not return JSON.
+    }
+    if (res.status === 401) {
+      message = path === '/api/auth/login' ? '管理令牌不正确，请重新输入。' : '管理会话已过期，请重新登录。';
+    } else if (res.status === 429) {
+      message = '登录尝试过多，请稍后再试。';
+    } else if (res.status === 503 && message.includes('ADMIN_TOKEN')) {
+      message = '服务器尚未配置管理令牌，请先完成服务端配置。';
+    }
+    throw new ApiError(res.status, message);
   }
-  return res.json() as Promise<T>;
+  if (res.status === 204) return undefined as T;
+  try {
+    return await res.json() as T;
+  } catch {
+    throw new ApiError(res.status, '服务器返回了无法识别的数据。');
+  }
 }
 
+export function isUnauthorizedError(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 401;
+}
+
+// Admin session
+export const loginAdmin = (token: string, signal?: AbortSignal) =>
+  request<{ authenticated: boolean }>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+    signal,
+  });
+
+export const getAdminSession = (signal?: AbortSignal) =>
+  request<{ authenticated: boolean }>('/api/auth/session', { signal });
+
+export const logoutAdmin = (signal?: AbortSignal) =>
+  request<{ authenticated?: boolean; status?: string }>('/api/auth/logout', {
+    method: 'POST',
+    signal,
+  });
+
 // News
-export const getNews = (params?: { page?: number; page_size?: number }, signal?: AbortSignal) => {
+export const getNews = (params?: { page?: number; page_size?: number; classification?: 'bullish' | 'bearish' | 'neutral' }, signal?: AbortSignal) => {
   const qs = new URLSearchParams();
   if (params?.page != null) qs.set('page', String(params.page));
   if (params?.page_size != null) qs.set('page_size', String(params.page_size));
+  if (params?.classification) qs.set('classification', params.classification);
   const query = qs.toString() ? `?${qs}` : '';
   return request<NewsListResponse>(`/api/news${query}`, { signal });
 };
@@ -49,6 +98,21 @@ export const getNewsById = (id: number, signal?: AbortSignal) =>
 
 export const fetchNews = (signal?: AbortSignal) =>
   request<{ status: string; new_items: number }>('/api/news/fetch', { method: 'POST', signal });
+
+export interface NewsSourceStatus {
+  source: string
+  group: string | null
+  enabled: boolean
+  configured: boolean
+  interval_seconds: number
+  last_success: string | null
+  last_error: string | null
+  consecutive_failures: number
+  next_attempt_at: string | null
+}
+
+export const getNewsSources = (signal?: AbortSignal) =>
+  request<{ sources: NewsSourceStatus[] }>('/api/news/sources', { signal });
 
 // Analysis
 export const getAnalyses = (params?: { page?: number; page_size?: number }, signal?: AbortSignal) => {
@@ -68,19 +132,25 @@ export const getAnalysisByNewsId = (newsId: number, signal?: AbortSignal) =>
 export const triggerAnalysis = (signal?: AbortSignal) =>
   request<import('../types').TriggerAnalysisResponse>('/api/analysis/trigger', { method: 'POST', signal });
 
+export const retryFailedAnalysis = (newsId: number, signal?: AbortSignal) =>
+  request<{ status: string; count: number; news_id: number }>(
+    `/api/analysis/retry-failed?news_id=${encodeURIComponent(newsId)}`,
+    { method: 'POST', signal },
+  );
+
 export const getAnalysisStats = (signal?: AbortSignal) =>
   request<AnalysisStats>('/api/analysis/stats', { signal });
 
-// X Sentiment
-export const getXSentiment = async (signal?: AbortSignal): Promise<XSentiment | null> => {
+// Model market scenario (the backend keeps its legacy /x-sentiment route)
+export const getModelMarketScenario = async (signal?: AbortSignal): Promise<XSentiment | null> => {
   const res = await request<{ data: XSentiment | null }>('/api/x-sentiment', { signal });
   return res.data;
 };
 
-export const refreshXSentiment = (signal?: AbortSignal) =>
+export const refreshModelMarketScenario = (signal?: AbortSignal) =>
   request<import('../types').RefreshXSentimentResponse>('/api/x-sentiment/refresh', { method: 'POST', signal });
 
-export const getXSentimentHistory = async (signal?: AbortSignal): Promise<XSentiment[]> => {
+export const getModelMarketScenarioHistory = async (signal?: AbortSignal): Promise<XSentiment[]> => {
   const res = await request<{ items: XSentiment[]; total: number }>('/api/x-sentiment/history', { signal });
   return res.items ?? [];
 };
@@ -94,7 +164,15 @@ export interface SettingsUpdateResponse {
   message: string;
 }
 
-export const updateSettings = (settings: Partial<AppSettings>, signal?: AbortSignal) =>
+export interface SettingsUpdatePayload {
+  default_llm_provider?: 'openai' | 'anthropic' | 'grok' | 'ollama'
+  default_llm_model?: string
+  ollama_base_url?: string
+  analysis_batch_size?: number
+  x_sentiment_interval?: number
+}
+
+export const updateSettings = (settings: SettingsUpdatePayload, signal?: AbortSignal) =>
   request<SettingsUpdateResponse>('/api/settings', {
     method: 'PUT',
     body: JSON.stringify(settings),
@@ -122,8 +200,11 @@ export interface MarketQuote {
   previousClose: number | null
   yearLow: number | null
   yearHigh: number | null
-  marketOpen: boolean
+  marketOpen: boolean | null
   type: 'index' | 'commodity'
+  source?: string | null
+  as_of?: string | null
+  stale?: boolean
 }
 
 export const getMarketQuotes = (signal?: AbortSignal) =>
@@ -136,7 +217,7 @@ export interface Candle {
   high: number
   low: number
   close: number
-  volume: number
+  volume: number | null
 }
 
 export interface MAPoint {
@@ -150,6 +231,9 @@ export interface CandleData {
   candles: Candle[]
   ema20: MAPoint[]
   sma50: MAPoint[]
+  source?: string | null
+  as_of?: string | null
+  period?: string | null
 }
 
 export const getCandles = (symbol: string, timeframe = '1D', signal?: AbortSignal) =>
@@ -160,7 +244,7 @@ export interface AssetProfile {
   symbol: string
   name: string
   shortName: string
-  description: string
+  description: string | null
   market_cap: number | null
   pe_ratio: number | null
   dividend_yield: number | null
@@ -174,6 +258,8 @@ export interface AssetProfile {
   fifty_day_avg: number | null
   two_hundred_day_avg: number | null
   beta: number | null
+  source?: string | null
+  as_of?: string | null
 }
 
 export const getAssetProfile = (symbol: string, signal?: AbortSignal) =>
@@ -191,25 +277,27 @@ export interface AssetSentiment {
   signal: string | null
   description: string | null
   tags: string[]
+  source?: string | null
+  as_of?: string | null
 }
 
 export const getAssetSentiment = (symbol: string, days = 7, signal?: AbortSignal) =>
   request<AssetSentiment>(`/api/quotes/${encodeURIComponent(symbol)}/sentiment?days=${days}`, { signal })
 
-// Top Constituents
-export interface Constituent {
-  ticker: string
-  name: string
-  weight: number
-  changePercent: number | null
+// Calendar
+export interface CalendarResponse {
+  events: CalendarEvent[]
+  count: number
+  analyzed?: number
+  source?: string
+  stale?: boolean
+  as_of?: string | null
+  last_success?: string | null
+  last_error?: string | null
 }
 
-export const getConstituents = (symbol: string, signal?: AbortSignal) =>
-  request<{ symbol: string; constituents: Constituent[] }>(`/api/quotes/${encodeURIComponent(symbol)}/constituents`, { signal })
-
-// Calendar
 export const getCalendar = (signal?: AbortSignal) =>
-  request<{ events: CalendarEvent[]; count: number }>('/api/calendar', { signal });
+  request<CalendarResponse>('/api/calendar', { signal });
 
 export const analyzeCalendar = (signal?: AbortSignal) =>
-  request<{ events: CalendarEvent[]; count: number; analyzed: number }>('/api/calendar/analyze', { method: 'POST', signal });
+  request<CalendarResponse>('/api/calendar/analyze', { method: 'POST', signal });

@@ -10,10 +10,10 @@ export default function FearGreedGauge({ value, label }: FearGreedGaugeProps) {
   const offset = circumference - (clampedValue / 100) * circumference
 
   const sentimentLabel = label || (
-    clampedValue >= 80 ? '极度贪婪' :
-    clampedValue >= 60 ? '贪婪' :
+    clampedValue >= 80 ? '极度乐观' :
+    clampedValue >= 60 ? '乐观' :
     clampedValue >= 40 ? '中性' :
-    clampedValue >= 20 ? '恐惧' : '极度恐惧'
+    clampedValue >= 20 ? '谨慎' : '极度谨慎'
   )
 
   const color = clampedValue >= 60 ? '#5cfd80' : clampedValue >= 40 ? '#ac8eff' : '#f74b6d'
@@ -21,7 +21,7 @@ export default function FearGreedGauge({ value, label }: FearGreedGaugeProps) {
   return (
     <div className="flex flex-col items-center gap-4">
       <div className="relative inline-block">
-        <svg width="180" height="180" className="transform -rotate-90">
+        <svg width="180" height="180" className="transform -rotate-90" role="img" aria-label={`新闻情绪指数 ${Math.round(clampedValue)}，${sentimentLabel}`}>
           <circle cx="90" cy="90" r={radius} fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="12" />
           <circle
             cx="90"

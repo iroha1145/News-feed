@@ -23,11 +23,11 @@ export default function SectorCard({ name, score, count }: SectorCardProps) {
   const icon = isNeutral ? 'trending_flat' : isPositive ? 'trending_up' : 'trending_down'
 
   return (
-    <div className={`p-4 rounded-xl transition-all hover:shadow-md cursor-pointer ${bgColor}`}>
+    <div className={`p-4 rounded-xl transition-shadow hover:shadow-md ${bgColor}`}>
       <div className="flex items-start justify-between mb-3">
         <div>
           <p className="text-xs font-bold text-on-surface-variant dark:text-slate-400 uppercase tracking-wider">{name}</p>
-          <p className="text-[10px] text-on-surface-variant/60 dark:text-slate-500">{count} articles</p>
+          <p className="text-[10px] text-on-surface-variant/60 dark:text-slate-500">{count} 篇文章</p>
         </div>
         <span className={`material-symbols-outlined ${scoreColor}`}>{icon}</span>
       </div>

@@ -1,7 +1,9 @@
 import logging
 import os
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from typing import Literal, Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,13 @@ def _find_env_file() -> str:
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=_find_env_file(),
+        env_file_encoding="utf-8",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
+
     # News APIs
     finnhub_api_key: str = ""
     newsapi_api_key: str = ""
@@ -26,29 +35,48 @@ class Settings(BaseSettings):
     massive_api_key: str = ""
 
     # Default LLM
-    default_llm_provider: str = "openai"  # openai/anthropic/grok/ollama
-    default_llm_model: str = "gpt-4o"
+    default_llm_provider: Literal["openai", "anthropic", "grok", "ollama"] = "openai"
+    default_llm_model: str = Field(default="gpt-4o-mini", min_length=1, max_length=200)
     default_llm_api_key: str = ""
 
     # Additional LLM keys
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     grok_api_key: str = ""
+    grok_model: str = Field(default="grok-4", min_length=1, max_length=200)
     ollama_base_url: str = "http://localhost:11434"
     openai_base_url: str = "https://api.openai.com/v1"
     grok_base_url: str = "https://api.x.ai/v1"
 
     # App
-    news_poll_interval: int = 60  # seconds
-    analysis_batch_size: int = 10
-    x_sentiment_interval: int = 1800  # seconds (30 minutes)
+    analysis_batch_size: int = Field(default=10, ge=1, le=100)
+    x_sentiment_interval: int = Field(default=21600, ge=300)
     database_url: str = "sqlite+aiosqlite:///data/macrolens.db"
     cors_origins: str = ""  # comma-separated origins
     admin_token: str = ""
+    session_cookie_secure: bool = False
+    session_ttl_seconds: int = Field(default=28800, ge=300, le=604800)
 
-    class Config:
-        env_file = _find_env_file()
-        env_file_encoding = "utf-8"
+    # News-source scheduling. Paid quota-limited aggregators stay opt-in.
+    finnhub_news_enabled: bool = True
+    finnhub_news_interval: int = Field(default=300, ge=30)
+    massive_news_enabled: bool = True
+    massive_news_interval: int = Field(default=300, ge=30)
+    google_news_enabled: bool = True
+    google_news_interval: int = Field(default=900, ge=30)
+    seekingalpha_breaking_enabled: bool = True
+    seekingalpha_breaking_interval: int = Field(default=300, ge=30)
+    seekingalpha_daily_enabled: bool = True
+    seekingalpha_daily_interval: int = Field(default=21600, ge=30)
+    newsapi_news_enabled: bool = False
+    newsapi_news_interval: int = Field(default=1800, ge=30)
+    gnews_news_enabled: bool = False
+    gnews_news_interval: int = Field(default=1800, ge=30)
+
+    calendar_analysis_cache_ttl: int = Field(default=3600, ge=60, le=86400)
+    analysis_retention_limit: int = Field(default=350, ge=1, le=100000)
+    news_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    x_sentiment_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
 
     def validate_config(self) -> list[str]:
         """Check for common config mistakes. Returns list of warnings."""

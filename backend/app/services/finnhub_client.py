@@ -1,8 +1,11 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
+
+from app.utils.http import log_http_failure
+from app.utils.news_text import clean_news_text
 
 logger = logging.getLogger(__name__)
 
@@ -11,8 +14,8 @@ BASE_URL = "https://finnhub.io/api/v1"
 
 def _parse_item(item: dict) -> Optional[dict]:
     """Normalize a Finnhub news item to our internal schema."""
-    title = (item.get("headline") or "").strip()
-    url = (item.get("url") or "").strip()
+    title = clean_news_text(item.get("headline"), empty="") or ""
+    url = clean_news_text(item.get("url"), empty="") or ""
     if not title or not url:
         return None
 
@@ -20,14 +23,14 @@ def _parse_item(item: dict) -> Optional[dict]:
     published_at = None
     if published_ts:
         try:
-            published_at = datetime.utcfromtimestamp(int(published_ts)).isoformat() + "Z"
+            published_at = datetime.fromtimestamp(int(published_ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
         except (ValueError, OSError):
             published_at = None
 
     return {
         "source": f"finnhub/{item.get('source', 'unknown')}",
         "title": title,
-        "summary": item.get("summary") or None,
+        "summary": clean_news_text(item.get("summary")),
         "url": url,
         "image_url": item.get("image") or None,
         "published_at": published_at,
@@ -41,6 +44,9 @@ async def fetch_finnhub_news(api_key: str) -> list[dict]:
 
     categories = ["general", "forex", "merger"]
     results: list[dict] = []
+    successful_requests = 0
+    errors: list[str] = []
+    headers = {"X-Finnhub-Token": api_key, "User-Agent": "MacroLens/1.0"}
 
     async with httpx.AsyncClient(timeout=15) as client:
         # Market news categories
@@ -48,37 +54,45 @@ async def fetch_finnhub_news(api_key: str) -> list[dict]:
             try:
                 response = await client.get(
                     f"{BASE_URL}/news",
-                    params={"category": category, "token": api_key},
+                    params={"category": category},
+                    headers=headers,
                 )
                 response.raise_for_status()
                 items = response.json()
+                if not isinstance(items, list):
+                    raise ValueError("Finnhub returned an invalid news payload")
+                successful_requests += 1
                 for item in items:
                     parsed = _parse_item(item)
                     if parsed:
                         results.append(parsed)
                 logger.info(f"Finnhub [{category}]: fetched {len(items)} items")
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Finnhub [{category}] HTTP error {e.response.status_code}: {e}")
             except Exception as e:
-                logger.error(f"Finnhub [{category}] error: {e}")
+                errors.append(log_http_failure(logger, f"Finnhub [{category}]", e, endpoint=f"{BASE_URL}/news", secrets=(api_key,)))
 
         # Company news for key tickers (more real-time)
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         for symbol in ["AAPL", "NVDA", "TSLA", "MSFT", "AMZN", "GOOGL", "GLD", "SPY"]:
             try:
                 response = await client.get(
                     f"{BASE_URL}/company-news",
-                    params={"symbol": symbol, "from": today, "to": today, "token": api_key},
+                    params={"symbol": symbol, "from": today, "to": today},
+                    headers=headers,
                 )
                 response.raise_for_status()
                 items = response.json()
+                if not isinstance(items, list):
+                    raise ValueError("Finnhub returned an invalid company-news payload")
+                successful_requests += 1
                 for item in items[:10]:  # cap per symbol
                     parsed = _parse_item(item)
                     if parsed:
                         results.append(parsed)
-            except Exception:
-                pass  # best-effort per symbol
+            except Exception as e:
+                errors.append(log_http_failure(logger, f"Finnhub [{symbol}]", e, endpoint=f"{BASE_URL}/company-news", secrets=(api_key,)))
 
         logger.info(f"Finnhub total: {len(results)} items")
 
+    if successful_requests == 0 and errors:
+        raise RuntimeError("All Finnhub requests failed")
     return results

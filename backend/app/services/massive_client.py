@@ -1,8 +1,10 @@
 import logging
 from typing import Optional
-from datetime import datetime, timezone
 
 import httpx
+
+from app.utils.http import log_http_failure
+from app.utils.news_text import clean_news_text
 
 logger = logging.getLogger(__name__)
 
@@ -10,8 +12,8 @@ BASE_URL = "https://api.massive.com/v2/reference/news"
 
 
 def _parse_item(item: dict) -> Optional[dict]:
-    title = (item.get("title") or "").strip()
-    url = (item.get("article_url") or "").strip()
+    title = clean_news_text(item.get("title"), empty="") or ""
+    url = clean_news_text(item.get("article_url"), empty="") or ""
     if not title or not url:
         return None
 
@@ -25,7 +27,7 @@ def _parse_item(item: dict) -> Optional[dict]:
 
     tickers = item.get("tickers", [])
     # Build summary from description + tickers
-    desc = item.get("description", "") or ""
+    desc = clean_news_text(item.get("description"), empty="") or ""
     if tickers:
         desc = f"[{', '.join(tickers[:5])}] {desc}"
 
@@ -49,7 +51,8 @@ async def fetch_massive_news(api_key: str) -> list[dict]:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 BASE_URL,
-                params={"limit": 50, "sort": "published_utc", "order": "desc", "apiKey": api_key},
+                params={"limit": 50, "sort": "published_utc", "order": "desc"},
+                headers={"Authorization": f"Bearer {api_key}", "User-Agent": "MacroLens/1.0"},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -60,9 +63,8 @@ async def fetch_massive_news(api_key: str) -> list[dict]:
                     results.append(parsed)
 
         logger.info(f"Massive: fetched {len(results)} items")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Massive HTTP error {e.response.status_code}: {e}")
     except Exception as e:
-        logger.error(f"Massive error: {e}")
+        log_http_failure(logger, "Massive", e, endpoint=BASE_URL, secrets=(api_key,), warning=False)
+        raise RuntimeError("Massive request failed") from e
 
     return results

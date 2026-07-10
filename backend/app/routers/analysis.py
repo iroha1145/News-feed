@@ -11,6 +11,7 @@ from app.models.database import (
     get_analysis_stats,
     get_analysis_for_news,
     get_news_item_by_id,
+    requeue_failed_analyses,
 )
 from app.services.llm_analyzer import run_analysis_batch
 
@@ -26,7 +27,7 @@ async def get_analysis_by_news_id(news_id: int):
         analysis = await get_analysis_for_news(db, news_id)
         if not analysis:
             raise HTTPException(status_code=404, detail="No analysis found for this news item")
-        news = await get_news_item_by_id(db, news_id)
+        news = await get_news_item_by_id(db, news_id, include_internal=False)
         return {"analysis": analysis, "news": news}
     finally:
         await db.close()
@@ -75,10 +76,10 @@ async def latest_analyses(
 
 
 @router.get("/stats")
-async def analysis_stats():
+async def analysis_stats(days: int = Query(7, ge=1, le=365)):
     db = await get_db()
     try:
-        stats = await get_analysis_stats(db)
+        stats = await get_analysis_stats(db, days=days)
         return stats
     finally:
         await db.close()
@@ -93,3 +94,17 @@ async def trigger_analysis(
     """Manually trigger analysis for unanalyzed news items."""
     background_tasks.add_task(run_analysis_batch, batch_size)
     return {"status": "triggered", "batch_size": batch_size}
+
+
+@router.post("/retry-failed")
+async def retry_failed_analyses(
+    news_id: Optional[int] = Query(None, ge=1),
+    _: None = Depends(require_admin),
+):
+    """Reset failed analyses after an operator has corrected the underlying issue."""
+    db = await get_db()
+    try:
+        count = await requeue_failed_analyses(db, news_id=news_id)
+        return {"status": "requeued", "count": count, "news_id": news_id}
+    finally:
+        await db.close()
