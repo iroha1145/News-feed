@@ -274,12 +274,7 @@ def test_expired_analysis_lease_is_recovered(isolated_db):
     run(scenario())
 
 
-def test_low_context_news_skips_llm_but_keeps_neutral_analysis(isolated_db, monkeypatch):
-    def unexpected_provider(*args, **kwargs):
-        raise AssertionError("low-context news must not create an LLM provider")
-
-    monkeypatch.setattr(llm_analyzer, "_get_provider", unexpected_provider)
-
+def test_low_context_news_skips_llm_but_keeps_neutral_analysis(isolated_db):
     async def scenario():
         db = await database.get_db()
         try:
@@ -300,27 +295,7 @@ def test_low_context_news_skips_llm_but_keeps_neutral_analysis(isolated_db, monk
     run(scenario())
 
 
-def test_invalid_llm_output_releases_processing_lease(isolated_db, monkeypatch):
-    class InvalidProvider:
-        async def analyze(self, prompt: str, system_prompt: str = "") -> str:
-            return json.dumps({
-                "title_zh": "标题",
-                "headline_summary": "摘要",
-                "overall_sentiment": 999,
-                "classification": "neutral",
-                "confidence": 50,
-                "affected_stocks": [],
-                "affected_sectors": [],
-                "affected_commodities": [],
-                "logic_chain": "无效分数",
-                "key_factors": [],
-            })
-
-        async def is_available(self) -> bool:
-            return True
-
-    monkeypatch.setattr(llm_analyzer, "_get_provider", lambda *args, **kwargs: InvalidProvider())
-
+def test_legacy_analyzer_only_enqueues_durable_job(isolated_db):
     async def scenario():
         db = await database.get_db()
         try:
@@ -330,6 +305,8 @@ def test_invalid_llm_output_releases_processing_lease(isolated_db, monkeypatch):
             refreshed = await database.get_news_item_by_id(db, news_id)
             assert refreshed["analysis_status"] == "pending"
             assert refreshed["analysis_lease_expires_at"] is None
+            async with db.execute("SELECT status FROM analysis_jobs WHERE news_id=?", (news_id,)) as cursor:
+                assert (await cursor.fetchone())[0] == "pending"
         finally:
             await db.close()
 
@@ -519,6 +496,22 @@ def test_quote_symbol_validation_bounded_cache_and_no_static_constituents(monkey
         "as_of": None,
     }
     assert quotes._empty_quote("^GSPC", quotes.INDICES["^GSPC"], "test")["marketOpen"] is None
+
+
+def test_quote_provider_failure_logs_strip_query_credentials(monkeypatch, caplog):
+    async def fail_provider(*_args, **_kwargs):
+        raise RuntimeError(
+            "provider failed at https://query.example.test/chart?token=top-secret&symbol=SPY"
+        )
+
+    monkeypatch.setattr(quotes, "_run_yfinance", fail_provider)
+    monkeypatch.setattr(quotes, "_market_cache", quotes.BoundedTTLCache(2, 60))
+    with caplog.at_level("WARNING", logger=quotes.__name__):
+        response = run(quotes.get_market_quotes())
+    assert response["quotes"]
+    assert "https://query.example.test/chart" in caplog.text
+    assert "?token=" not in caplog.text
+    assert "top-secret" not in caplog.text
 
 
 def test_live_and_health_check_database_and_scheduler(isolated_db, monkeypatch):

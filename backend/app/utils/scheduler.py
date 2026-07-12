@@ -29,10 +29,10 @@ async def _job_fetch_source(source: str) -> None:
 
 async def _job_analyze_news() -> None:
     try:
-        from app.services.llm_analyzer import run_analysis_batch
+        from app.services.analysis_jobs import enqueue_auto_jobs
 
-        count = await run_analysis_batch()
-        logger.info("[Scheduler] Analysis batch complete: %s items analyzed", count)
+        count = await enqueue_auto_jobs()
+        logger.info("[Scheduler] Persistent analysis jobs enqueued: %s", count)
     except Exception as exc:
         logger.error("[Scheduler] Analysis job failed: %s", type(exc).__name__)
 
@@ -48,6 +48,16 @@ async def _job_x_sentiment() -> None:
             logger.debug("[Scheduler] Market scenario skipped (missing key or news context)")
     except Exception as exc:
         logger.error("[Scheduler] Market scenario job failed: %s", type(exc).__name__)
+
+
+async def _job_fetch_calendar() -> None:
+    try:
+        from app.services.calendar_client import fetch_economic_calendar
+
+        events = await fetch_economic_calendar(force=True)
+        logger.info("[Scheduler] Economic calendar refreshed: %s events", len(events))
+    except Exception as exc:
+        logger.error("[Scheduler] Economic calendar job failed: %s", type(exc).__name__)
 
 
 async def _get_db_interval(key: str, fallback: int) -> int:
@@ -97,11 +107,13 @@ async def start_scheduler() -> None:
 
     from app.services.news_aggregator import (
         SOURCE_DEFINITIONS,
+        initialize_source_health,
         get_enabled_sources,
         get_source_interval,
     )
 
     _scheduler = AsyncIOScheduler()
+    await initialize_source_health()
     source_intervals: dict[str, int] = {}
     for source in get_enabled_sources():
         definition = SOURCE_DEFINITIONS[source]
@@ -126,6 +138,14 @@ async def start_scheduler() -> None:
         seconds=60,
         job_id="analyze_news",
         name="Analyze unanalyzed news",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_fetch_calendar,
+        seconds=app_settings.calendar_fetch_interval_seconds,
+        job_id="fetch_economic_calendar",
+        name="Fetch economic calendar",
     )
 
     x_sentiment_interval = await _get_db_interval(

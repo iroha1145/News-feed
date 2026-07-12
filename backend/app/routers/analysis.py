@@ -11,9 +11,8 @@ from app.models.database import (
     get_analysis_stats,
     get_analysis_for_news,
     get_news_item_by_id,
-    requeue_failed_analyses,
 )
-from app.services.llm_analyzer import run_analysis_batch
+from app.services.analysis_jobs import enqueue_auto_jobs, retry_failed_jobs
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
@@ -92,7 +91,7 @@ async def trigger_analysis(
     _: None = Depends(require_admin),
 ):
     """Manually trigger analysis for unanalyzed news items."""
-    background_tasks.add_task(run_analysis_batch, batch_size)
+    background_tasks.add_task(enqueue_auto_jobs, batch_size)
     return {"status": "triggered", "batch_size": batch_size}
 
 
@@ -104,7 +103,12 @@ async def retry_failed_analyses(
     """Reset failed analyses after an operator has corrected the underlying issue."""
     db = await get_db()
     try:
-        count = await requeue_failed_analyses(db, news_id=news_id)
-        return {"status": "requeued", "count": count, "news_id": news_id}
+        jobs = await retry_failed_jobs(db, news_id=news_id)
+        return {
+            "status": "requeued",
+            "count": len(jobs),
+            "news_id": news_id,
+            "job_ids": [job["job_id"] for job in jobs],
+        }
     finally:
         await db.close()

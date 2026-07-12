@@ -24,6 +24,7 @@ SENSITIVE_KEYS = {
 }
 
 PROVIDER_NAMES = ("openai", "anthropic", "grok", "ollama")
+ENV_MANAGED_RUNTIME_KEYS = frozenset({"default_llm_provider", "default_llm_model"})
 
 ALLOWED_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "host.docker.internal"}
 
@@ -46,7 +47,7 @@ def _validate_ollama_base_url(value: str) -> str:
 
 
 def _merge_settings(db_overrides: dict) -> dict:
-    """Merge env settings with DB overrides, redacting sensitive values."""
+    """Merge mutable settings while keeping the durable queue identity env-only."""
     env_vals = {
         "default_llm_provider": app_settings.default_llm_provider,
         "default_llm_model": app_settings.default_llm_model,
@@ -61,7 +62,12 @@ def _merge_settings(db_overrides: dict) -> dict:
         "newsapi_api_key": app_settings.newsapi_api_key,
         "gnews_api_key": app_settings.gnews_api_key,
     }
-    merged = {**env_vals, **db_overrides}
+    mutable_overrides = {
+        key: value for key, value in db_overrides.items()
+        if key not in ENV_MANAGED_RUNTIME_KEYS
+    }
+    merged = {**env_vals, **mutable_overrides}
+    merged["runtime_llm_settings_source"] = "environment"
     return {k: _redact(k, v) for k, v in merged.items()}
 
 
@@ -102,12 +108,23 @@ async def get_settings():
 
 @router.put("")
 async def update_settings(body: SettingsUpdateRequest, _: None = Depends(require_admin)):
+    requested = body.model_dump(exclude_none=True)
+    blocked = sorted(ENV_MANAGED_RUNTIME_KEYS.intersection(requested))
+    if blocked:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "runtime_llm_settings_managed_by_environment",
+                "message": "Restart the web and worker services with matching environment settings.",
+                "keys": blocked,
+            },
+        )
     db = await get_db()
     try:
         updated = {}
         scheduler_keys = {"x_sentiment_interval"}
         needs_scheduler_reload = False
-        for key, value in body.model_dump(exclude_none=True).items():
+        for key, value in requested.items():
             if key in SENSITIVE_KEYS:
                 logger.warning("Ignoring attempt to persist sensitive setting '%s' via API", key)
                 updated[key] = _redact(key, value)
@@ -150,8 +167,8 @@ async def list_providers():
             }
             return key_map.get(provider, "")
 
-        active_provider = overrides.get("default_llm_provider") or app_settings.default_llm_provider
-        active_model = overrides.get("default_llm_model") or app_settings.default_llm_model
+        active_provider = app_settings.default_llm_provider
+        active_model = app_settings.default_llm_model
         providers = []
         for name in PROVIDER_NAMES:
             api_key = resolve_key(name)
