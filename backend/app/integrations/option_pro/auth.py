@@ -93,6 +93,15 @@ def canonical_query(raw_query: bytes | str) -> str:
     return "&".join(f"{key}={value}" for key, value in encoded)
 
 
+def canonical_path(raw_path: bytes | str) -> str:
+    if isinstance(raw_path, str):
+        raw_path = raw_path.encode("ascii", errors="strict")
+    # Starlette 0.38's TestClient copied httpx.URL.raw_path verbatim, including
+    # the query suffix. ASGI servers provide only the path here; accept both
+    # shapes while continuing to sign the query separately below.
+    return raw_path.split(b"?", 1)[0].decode("ascii", errors="strict")
+
+
 def canonical_string(
     method: str,
     path: str,
@@ -226,7 +235,7 @@ async def authenticate_request(request: Request, required_scope: Literal["read",
         scope, candidate_secrets = material
 
         raw_path = request.scope.get("raw_path") or request.url.path.encode("ascii")
-        path = raw_path.decode("ascii", errors="strict")
+        path = canonical_path(raw_path)
         query = canonical_query(request.scope.get("query_string", b""))
         canonical = canonical_string(request.method, path, query, timestamp, nonce, supplied_hash)
         valid_signature = any(

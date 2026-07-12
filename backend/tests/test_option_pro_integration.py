@@ -21,6 +21,7 @@ from app.integrations.option_pro import router as integration_router
 from app.integrations.option_pro.auth import (
     IntegrationAPIError,
     calculate_signature,
+    canonical_path,
     canonical_query,
     canonical_string,
 )
@@ -1980,6 +1981,11 @@ def test_hmac_scope_rotation_replay_and_expired_timestamp(isolated_integration_d
 
 def test_canonical_query_preserves_repeated_empty_values_and_rfc3986_spaces():
     assert canonical_query("z=1&a=hello+world&a=&a=%2F") == "a=&a=%2F&a=hello%20world&z=1"
+
+
+def test_canonical_path_discards_legacy_testclient_query_suffix():
+    assert canonical_path(b"/v1/health?b=two&a=hello%20world&a=") == "/v1/health"
+    assert canonical_path(b"/v1/news%3Farchive?limit=20") == "/v1/news%3Farchive"
 
 
 def test_signed_integration_endpoints_match_committed_contract(isolated_integration_db, monkeypatch):
