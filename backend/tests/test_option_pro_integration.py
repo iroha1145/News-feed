@@ -1825,6 +1825,13 @@ def _integration_app():
     app = FastAPI()
     app.include_router(integration_router.router)
 
+    @app.middleware("http")
+    async def fixed_test_client_address(request, call_next):
+        # Starlette 0.38 does not expose TestClient(client=...). Keep the
+        # service-source boundary deterministic without depending on that API.
+        request.scope["client"] = ("127.0.0.1", 50000)
+        return await call_next(request)
+
     @app.exception_handler(IntegrationAPIError)
     async def handle(request, exc):
         return integration_router.error_response(request, exc)
@@ -1843,7 +1850,7 @@ def test_trusted_tls_proxy_is_honored_but_untrusted_forwarded_proto_is_rejected(
     target = "/api/integrations/option-pro/v1/health"
     app = _integration_app()
 
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+    with TestClient(app) as client:
         trusted_headers = _signed_headers(
             "GET", target, b"", "read-key", "read-secret", "nonce-trusted-tls-01"
         )
@@ -1921,7 +1928,7 @@ def test_hmac_scope_rotation_replay_and_expired_timestamp(isolated_integration_d
     app = _integration_app()
     target = "/api/integrations/option-pro/v1/health?b=two&a=hello%20world&a="
 
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+    with TestClient(app) as client:
         headers = _signed_headers("GET", target, b"", "read-key", "read-current-secret", "nonce-current-0001")
         response = client.get(target, headers=headers)
         assert response.status_code == 200
@@ -1995,7 +2002,7 @@ def test_signed_integration_endpoints_match_committed_contract(isolated_integrat
     news_id = run(seed())
     app = _integration_app()
     prefix = "/api/integrations/option-pro/v1"
-    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+    with TestClient(app) as client:
         create_target = f"{prefix}/analysis-jobs"
         create_body = json.dumps(
             {
