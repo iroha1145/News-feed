@@ -30,17 +30,54 @@ fi
 
 existing_value() {
     local key="$1"
+    local line value decoded char next i length
     [ -f "$ENV_FILE" ] || return 0
-    awk -F= -v wanted="$key" '
-        $1 == wanted {
-            value = substr($0, index($0, "=") + 1)
-            if (value ~ /^".*"$/ || value ~ /^'\''.*'\''$/) {
-                value = substr(value, 2, length(value) - 2)
-            }
-            print value
-            exit
-        }
-    ' "$ENV_FILE"
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" == "$key="* ]] || continue
+        value="${line#*=}"
+        if [[ "$value" == \"*\" ]] && [[ "$value" == *\" ]]; then
+            value="${value:1:${#value}-2}"
+            decoded=""
+            length=${#value}
+            for ((i = 0; i < length; i++)); do
+                char="${value:i:1}"
+                next=""
+                if ((i + 1 < length)); then
+                    next="${value:i+1:1}"
+                fi
+                if [ "$char" = '\' ] && { [ "$next" = '\' ] || [ "$next" = '"' ]; }; then
+                    decoded+="$next"
+                    i=$((i + 1))
+                elif [ "$char" = '$' ] && [ "$next" = '$' ]; then
+                    decoded+='$'
+                    i=$((i + 1))
+                else
+                    decoded+="$char"
+                fi
+            done
+            value="$decoded"
+        elif [[ "$value" == \'*\' ]] && [[ "$value" == *\' ]]; then
+            value="${value:1:${#value}-2}"
+            decoded=""
+            length=${#value}
+            for ((i = 0; i < length; i++)); do
+                char="${value:i:1}"
+                next=""
+                if ((i + 1 < length)); then
+                    next="${value:i+1:1}"
+                fi
+                if [ "$char" = '\' ] && { [ "$next" = '\' ] || [ "$next" = "'" ]; }; then
+                    decoded+="$next"
+                    i=$((i + 1))
+                else
+                    decoded+="$char"
+                fi
+            done
+            value="$decoded"
+        fi
+        printf '%s' "$value"
+        return 0
+    done < "$ENV_FILE"
 }
 
 setting_or_default() {
@@ -63,9 +100,14 @@ prompt_value() {
     local hint="${3:-}"
     local secret="${4:-false}"
     local required="${5:-false}"
+    local preserve_current="${6:-true}"
     local current input
 
-    current="$(existing_value "$name")"
+    if [ "$preserve_current" = "true" ]; then
+        current="$(existing_value "$name")"
+    else
+        current=""
+    fi
     printf '%s' "$label"
     [ -n "$hint" ] && printf '（%s）' "$hint"
     [ -n "$current" ] && printf ' [已配置，回车保留]'
@@ -97,10 +139,33 @@ prompt_value() {
 write_env_value() {
     local key="$1"
     local value="$2"
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    value=${value//\$/\$\$}
-    printf '%s="%s"\n' "$key" "$value" >> "$TEMP_ENV"
+    local escaped="" char i
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            \\|\') escaped+="\\$char" ;;
+            *) escaped+="$char" ;;
+        esac
+    done
+    # Single-quoted dotenv values are literal, so dollar signs cannot be
+    # mistaken for Compose interpolation.  Backslashes and quotes are escaped
+    # for both Docker Compose and pydantic-settings.
+    printf "%s='%s'\n" "$key" "$escaped" >> "$TEMP_ENV"
+}
+
+append_unmanaged_values() {
+    local line key
+    [ -f "$ENV_FILE" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        if ! grep -q "^${key}=" "$TEMP_ENV"; then
+            # Keep future or deployment-specific settings byte-for-byte.  This
+            # avoids silently deleting secrets that a newer release introduces.
+            printf '%s\n' "$line" >> "$TEMP_ENV"
+        fi
+    done < "$ENV_FILE"
 }
 
 echo "MacroLens 安装配置"
@@ -117,21 +182,25 @@ current_provider="$(existing_value DEFAULT_LLM_PROVIDER)"
 printf '提供方 [openai/anthropic/grok/ollama] [%s]: ' "${current_provider:-openai}"
 IFS= read -r DEFAULT_LLM_PROVIDER
 DEFAULT_LLM_PROVIDER="${DEFAULT_LLM_PROVIDER:-${current_provider:-openai}}"
+provider_changed=false
+if [ "$DEFAULT_LLM_PROVIDER" != "${current_provider:-openai}" ]; then
+    provider_changed=true
+fi
 
 case "$DEFAULT_LLM_PROVIDER" in
     openai)
         prompt_value OPENAI_API_KEY "OpenAI API Key" "" true true
         OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
         OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 gpt-4o-mini" false false
-        DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-gpt-4o-mini}"
+        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 gpt-5.6-terra" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
+        DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-gpt-5.6-terra}"
         DEFAULT_LLM_API_KEY="$OPENAI_API_KEY"
         ANTHROPIC_API_KEY="$(existing_value ANTHROPIC_API_KEY)"
         GROK_API_KEY="$(existing_value GROK_API_KEY)"
         ;;
     anthropic)
         prompt_value ANTHROPIC_API_KEY "Anthropic API Key" "" true true
-        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 claude-sonnet-4-6" false false
+        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 claude-sonnet-4-6" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
         DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-claude-sonnet-4-6}"
         DEFAULT_LLM_API_KEY="$ANTHROPIC_API_KEY"
         OPENAI_API_KEY="$(existing_value OPENAI_API_KEY)"
@@ -141,7 +210,7 @@ case "$DEFAULT_LLM_PROVIDER" in
         ;;
     grok)
         prompt_value GROK_API_KEY "Grok API Key" "" true true
-        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 grok-4" false false
+        prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 grok-4" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
         DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-grok-4}"
         DEFAULT_LLM_API_KEY="$GROK_API_KEY"
         OPENAI_API_KEY="$(existing_value OPENAI_API_KEY)"
@@ -151,7 +220,7 @@ case "$DEFAULT_LLM_PROVIDER" in
         ;;
     ollama)
         DEFAULT_LLM_API_KEY=""
-        prompt_value DEFAULT_LLM_MODEL "本地模型名称" "默认 llama3" false false
+        prompt_value DEFAULT_LLM_MODEL "本地模型名称" "默认 llama3" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
         DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-llama3}"
         OPENAI_API_KEY="$(existing_value OPENAI_API_KEY)"
         OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
@@ -226,6 +295,35 @@ write_env_value DEFAULT_LLM_MODEL "$DEFAULT_LLM_MODEL"
 write_env_value DEFAULT_LLM_API_KEY "$DEFAULT_LLM_API_KEY"
 write_env_value OPENAI_API_KEY "$OPENAI_API_KEY"
 write_env_value OPENAI_BASE_URL "$OPENAI_BASE_URL"
+write_env_value OPENAI_ALLOW_CUSTOM_BASE_URL "$(setting_or_default OPENAI_ALLOW_CUSTOM_BASE_URL false)"
+write_env_value OPENAI_ALLOW_LOCAL_HTTP "$(setting_or_default OPENAI_ALLOW_LOCAL_HTTP false)"
+write_env_value OPENAI_REASONING "$(setting_or_default OPENAI_REASONING max)"
+write_env_value OPENAI_EXECUTION_MODE "$(setting_or_default OPENAI_EXECUTION_MODE background)"
+write_env_value OPENAI_SYNC_TIMEOUT_SECONDS "$(setting_or_default OPENAI_SYNC_TIMEOUT_SECONDS 900)"
+write_env_value OPENAI_BACKGROUND_POLL_TIMEOUT_SECONDS "$(setting_or_default OPENAI_BACKGROUND_POLL_TIMEOUT_SECONDS 1800)"
+write_env_value OPENAI_BACKGROUND_INITIAL_POLL_SECONDS "$(setting_or_default OPENAI_BACKGROUND_INITIAL_POLL_SECONDS 2)"
+write_env_value OPENAI_BACKGROUND_MAX_POLL_SECONDS "$(setting_or_default OPENAI_BACKGROUND_MAX_POLL_SECONDS 15)"
+write_env_value OPENAI_MAX_OUTPUT_TOKENS "$(setting_or_default OPENAI_MAX_OUTPUT_TOKENS 16384)"
+write_env_value OPENAI_MAX_CONCURRENCY "$(setting_or_default OPENAI_MAX_CONCURRENCY 2)"
+write_env_value OPENAI_MAX_RETRIES "$(setting_or_default OPENAI_MAX_RETRIES 0)"
+write_env_value NEWS_IMPACT_PROMPT_VERSION "$(setting_or_default NEWS_IMPACT_PROMPT_VERSION news-impact-v2)"
+write_env_value NEWS_IMPACT_SCHEMA_VERSION "$(setting_or_default NEWS_IMPACT_SCHEMA_VERSION news-impact-schema-v2)"
+write_env_value NEWS_LLM_AUTO_ANALYZE_ENABLED "$(setting_or_default NEWS_LLM_AUTO_ANALYZE_ENABLED true)"
+write_env_value NEWS_LLM_MAX_INFLIGHT "$(setting_or_default NEWS_LLM_MAX_INFLIGHT 2)"
+write_env_value NEWS_LLM_MAX_QUEUED "$(setting_or_default NEWS_LLM_MAX_QUEUED 200)"
+write_env_value NEWS_LLM_DAILY_JOB_LIMIT "$(existing_value NEWS_LLM_DAILY_JOB_LIMIT)"
+write_env_value NEWS_LLM_DAILY_OUTPUT_TOKEN_LIMIT "$(existing_value NEWS_LLM_DAILY_OUTPUT_TOKEN_LIMIT)"
+write_env_value NEWS_LLM_MIN_CONTEXT_CHARS "$(setting_or_default NEWS_LLM_MIN_CONTEXT_CHARS 100)"
+write_env_value NEWS_LLM_MIN_MARKET_RELEVANCE "$(setting_or_default NEWS_LLM_MIN_MARKET_RELEVANCE 35)"
+write_env_value ANALYSIS_WORKER_POLL_SECONDS "$(setting_or_default ANALYSIS_WORKER_POLL_SECONDS 5)"
+write_env_value ANALYSIS_WORKER_LEASE_SECONDS "$(setting_or_default ANALYSIS_WORKER_LEASE_SECONDS 120)"
+write_env_value ANALYSIS_JOB_RETRY_COOLDOWN_SECONDS "$(setting_or_default ANALYSIS_JOB_RETRY_COOLDOWN_SECONDS 300)"
+write_env_value CALENDAR_ANALYSIS_PROMPT_VERSION "$(setting_or_default CALENDAR_ANALYSIS_PROMPT_VERSION calendar-impact-v1)"
+write_env_value CALENDAR_ANALYSIS_SCHEMA_VERSION "$(setting_or_default CALENDAR_ANALYSIS_SCHEMA_VERSION calendar-impact-schema-v1)"
+write_env_value CALENDAR_LLM_MAX_INFLIGHT "$(setting_or_default CALENDAR_LLM_MAX_INFLIGHT 1)"
+write_env_value CALENDAR_LLM_MAX_QUEUED "$(setting_or_default CALENDAR_LLM_MAX_QUEUED 10)"
+write_env_value CALENDAR_LLM_DAILY_JOB_LIMIT "$(setting_or_default CALENDAR_LLM_DAILY_JOB_LIMIT 10)"
+write_env_value CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT "$(setting_or_default CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT 200000)"
 write_env_value ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
 write_env_value GROK_API_KEY "$GROK_API_KEY"
 write_env_value GROK_MODEL "$GROK_MODEL"
@@ -239,11 +337,27 @@ write_env_value ANALYSIS_BATCH_SIZE "$(setting_or_default ANALYSIS_BATCH_SIZE 10
 write_env_value ANALYSIS_RETENTION_LIMIT "$(setting_or_default ANALYSIS_RETENTION_LIMIT 350)"
 write_env_value X_SENTIMENT_INTERVAL "$(setting_or_default X_SENTIMENT_INTERVAL 21600)"
 write_env_value CALENDAR_ANALYSIS_CACHE_TTL "$(setting_or_default CALENDAR_ANALYSIS_CACHE_TTL 3600)"
+write_env_value CALENDAR_FETCH_INTERVAL_SECONDS "$(setting_or_default CALENDAR_FETCH_INTERVAL_SECONDS 600)"
 write_env_value NEWS_RETENTION_DAYS "$(existing_value NEWS_RETENTION_DAYS)"
 write_env_value X_SENTIMENT_RETENTION_DAYS "$(existing_value X_SENTIMENT_RETENTION_DAYS)"
 write_env_value DATABASE_URL "$(setting_or_default DATABASE_URL sqlite+aiosqlite:///data/macrolens.db)"
 write_env_value CORS_ORIGINS "$CORS_ORIGINS"
 write_env_value MACROLENS_DATA_DIR "$MACROLENS_DATA_DIR"
+write_env_value MACROLENS_OPTION_PRO_CONTRACT_PATH "$(existing_value MACROLENS_OPTION_PRO_CONTRACT_PATH)"
+write_env_value OPTION_PRO_READ_KEY_ID "$(existing_value OPTION_PRO_READ_KEY_ID)"
+write_env_value OPTION_PRO_READ_SECRET "$(existing_value OPTION_PRO_READ_SECRET)"
+write_env_value OPTION_PRO_ACTION_KEY_ID "$(existing_value OPTION_PRO_ACTION_KEY_ID)"
+write_env_value OPTION_PRO_ACTION_SECRET "$(existing_value OPTION_PRO_ACTION_SECRET)"
+write_env_value OPTION_PRO_PREVIOUS_READ_SECRET "$(existing_value OPTION_PRO_PREVIOUS_READ_SECRET)"
+write_env_value OPTION_PRO_PREVIOUS_ACTION_SECRET "$(existing_value OPTION_PRO_PREVIOUS_ACTION_SECRET)"
+write_env_value OPTION_PRO_ALLOWED_CIDRS "$(existing_value OPTION_PRO_ALLOWED_CIDRS)"
+write_env_value OPTION_PRO_TRUSTED_PROXY_CIDRS "$(existing_value OPTION_PRO_TRUSTED_PROXY_CIDRS)"
+write_env_value OPTION_PRO_SIGNATURE_CLOCK_SKEW_SECONDS "$(setting_or_default OPTION_PRO_SIGNATURE_CLOCK_SKEW_SECONDS 300)"
+write_env_value OPTION_PRO_NONCE_TTL_SECONDS "$(setting_or_default OPTION_PRO_NONCE_TTL_SECONDS 600)"
+write_env_value OPTION_PRO_SOURCE_STALE_AFTER_SECONDS "$(setting_or_default OPTION_PRO_SOURCE_STALE_AFTER_SECONDS 86400)"
+write_env_value OPTION_PRO_ALLOW_LOCAL_HTTP "$(setting_or_default OPTION_PRO_ALLOW_LOCAL_HTTP false)"
+
+append_unmanaged_values
 
 mv "$TEMP_ENV" "$ENV_FILE"
 chmod 600 "$ENV_FILE"

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
 
 permissions:
@@ -28,6 +28,10 @@ jobs:
           DATABASE_URL: sqlite+aiosqlite:///backend/data/ci.db
           ADMIN_TOKEN: ci-test-admin-token
         run: pytest -q backend/tests
+      - name: Validate integration contract
+        env:
+          PYTHONPATH: backend
+        run: python -m app.integrations.option_pro.contract --check
 
   frontend:
     runs-on: ubuntu-latest
@@ -60,6 +64,49 @@ jobs:
       - name: Validate installer syntax
         run: bash -n setup.sh
       - name: Validate Compose configuration
-        run: cp .env.example .env && docker compose config --quiet
+        shell: bash
+        run: |
+          cp .env.example .env
+          sed -i \
+            -e 's/^FINNHUB_NEWS_ENABLED=.*/FINNHUB_NEWS_ENABLED=false/' \
+            -e 's/^MASSIVE_NEWS_ENABLED=.*/MASSIVE_NEWS_ENABLED=false/' \
+            -e 's/^GOOGLE_NEWS_ENABLED=.*/GOOGLE_NEWS_ENABLED=false/' \
+            -e 's/^SEEKINGALPHA_BREAKING_ENABLED=.*/SEEKINGALPHA_BREAKING_ENABLED=false/' \
+            -e 's/^SEEKINGALPHA_DAILY_ENABLED=.*/SEEKINGALPHA_DAILY_ENABLED=false/' \
+            -e 's/^NEWSAPI_NEWS_ENABLED=.*/NEWSAPI_NEWS_ENABLED=false/' \
+            -e 's/^GNEWS_NEWS_ENABLED=.*/GNEWS_NEWS_ENABLED=false/' \
+            -e 's/^NEWS_LLM_AUTO_ANALYZE_ENABLED=.*/NEWS_LLM_AUTO_ANALYZE_ENABLED=false/' \
+            -e 's/^CALENDAR_FETCH_INTERVAL_SECONDS=.*/CALENDAR_FETCH_INTERVAL_SECONDS=86400/' \
+            .env
+          docker compose config --quiet
       - name: Build containers
         run: docker compose build
+      - name: Start backend, analysis worker, and frontend
+        run: >-
+          docker compose up -d --no-build --force-recreate --remove-orphans
+          --wait --wait-timeout 180 backend analysis-worker frontend
+      - name: Verify runtime contract, worker heartbeat, and isolation
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --retry 5 http://127.0.0.1:8000/live |
+            python -c 'import json,sys; assert json.load(sys.stdin)["status"] == "alive"'
+          curl --fail --silent --show-error --retry 5 http://127.0.0.1:8000/health |
+            python -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok"'
+          curl --fail --silent --show-error --retry 5 http://127.0.0.1:3000/ |
+            grep -q '<title>MacroLens'
+          curl --fail --silent --show-error http://127.0.0.1:3000/api/news |
+            python -c 'import json,sys; p=json.load(sys.stdin); assert isinstance(p.get("items"), list); assert isinstance(p.get("total"), int)'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' 'http://127.0.0.1:3000/api/integrations/option-pro/v1/health?probe=redacted')" = "404"
+          docker compose exec -T backend python -m app.integrations.option_pro.contract --check
+          docker compose exec -T analysis-worker python -m app.worker_healthcheck
+          docker compose exec -T backend python -m app.worker_healthcheck
+          docker compose exec -T backend python -c 'import os; assert os.geteuid() != 0'
+          docker compose exec -T analysis-worker python -c 'import os; assert os.geteuid() != 0'
+          if docker compose exec -T backend touch /app/.rootfs-write-probe; then exit 1; fi
+          if docker compose exec -T analysis-worker touch /app/.rootfs-write-probe; then exit 1; fi
+      - name: Show container logs after failure
+        if: failure()
+        run: docker compose logs --tail=200 backend analysis-worker frontend
+      - name: Clean up containers
+        if: always()
+        run: docker compose down --remove-orphans --volumes
