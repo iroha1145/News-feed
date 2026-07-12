@@ -199,6 +199,68 @@ async def _update_status(name: str, **changes: object) -> None:
         current = dict(_source_status.get(name, {}))
         current.update(changes)
         _source_status[name] = current
+        snapshot = _source_snapshot(name)
+    try:
+        from app.integrations.option_pro.repository import upsert_source_health
+
+        if not snapshot.get("enabled"):
+            persistent_status = "disabled"
+        elif not snapshot.get("configured"):
+            persistent_status = "not_configured"
+        elif snapshot.get("last_error"):
+            persistent_status = "degraded" if snapshot.get("last_success") else "unavailable"
+        elif snapshot.get("last_success"):
+            persistent_status = "ok"
+        else:
+            persistent_status = "unavailable"
+        neutral_counts = persistent_status in {"disabled", "not_configured"} or not snapshot.get("last_attempt")
+        db = await get_db()
+        try:
+            await upsert_source_health(
+                db,
+                source=name,
+                status=persistent_status,
+                last_attempt_at=snapshot.get("last_attempt"),
+                last_success_at=snapshot.get("last_success"),
+                data_through=snapshot.get("last_success"),
+                consecutive_failures=int(snapshot.get("consecutive_failures") or 0),
+                next_attempt_at=snapshot.get("next_attempt_at"),
+                raw_count=None if neutral_counts else int(snapshot.get("raw") or 0),
+                inserted_count=None if neutral_counts else int(snapshot.get("inserted") or 0),
+                duplicates_count=None if neutral_counts else int(snapshot.get("duplicates") or 0),
+                error_code="source_fetch_failed" if snapshot.get("last_error") else None,
+            )
+        finally:
+            await db.close()
+    except Exception:
+        # Source ingestion remains isolated from the Integration projection.
+        logger.exception("Unable to persist health for news source %s", name)
+
+
+async def initialize_source_health() -> None:
+    """Restore durable health before applying current configured/disabled states."""
+    db = await get_db()
+    try:
+        async with db.execute("SELECT * FROM source_health") as cursor:
+            persisted = {str(row["source"]): dict(row) for row in await cursor.fetchall()}
+    finally:
+        await db.close()
+    async with _status_lock:
+        for name, row in persisted.items():
+            if name not in SOURCE_DEFINITIONS:
+                continue
+            _source_status[name] = {
+                "last_attempt": row.get("last_attempt_at"),
+                "last_success": row.get("last_success_at"),
+                "last_error": row.get("error_code"),
+                "raw": row.get("raw_count") or 0,
+                "inserted": row.get("inserted_count") or 0,
+                "duplicates": row.get("duplicates_count") or 0,
+                "consecutive_failures": row.get("consecutive_failures") or 0,
+                "next_attempt_at": row.get("next_attempt_at"),
+            }
+    for name in SOURCE_DEFINITIONS:
+        await _update_status(name)
 
 
 async def aggregate_source(name: str, *, force: bool = False) -> dict:

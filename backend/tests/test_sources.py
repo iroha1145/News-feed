@@ -11,6 +11,8 @@ import httpx
 
 from app.services import calendar_analyzer, calendar_client, googlenews_client, newsapi_client
 from app.services import news_aggregator
+from app.models import database
+from app.integrations.option_pro.repository import upsert_source_health
 from app.services.seekingalpha_client import _parse_sa_item
 from app.utils.dedup import (
     compute_content_hash,
@@ -308,6 +310,40 @@ class SourceScheduleTests(unittest.TestCase):
             "raw", "inserted", "duplicates",
         }
         self.assertTrue(all(required <= set(item) for item in news_aggregator.get_source_statuses()))
+
+
+class SourceHealthPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restart_restores_last_success_before_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "source-health.db")
+            with patch.object(database, "DB_PATH", path):
+                await database.init_db()
+                db = await database.get_db()
+                try:
+                    await upsert_source_health(
+                        db,
+                        source="google",
+                        status="degraded",
+                        last_attempt_at="2026-07-12T10:05:00+00:00",
+                        last_success_at="2026-07-12T10:00:00+00:00",
+                        data_through="2026-07-12T10:00:00+00:00",
+                        consecutive_failures=2,
+                        next_attempt_at="2026-07-12T10:15:00+00:00",
+                        raw_count=12,
+                        inserted_count=7,
+                        duplicates_count=5,
+                        error_code="source_fetch_failed",
+                    )
+                finally:
+                    await db.close()
+                with patch.object(news_aggregator, "_source_status", {}):
+                    await news_aggregator.initialize_source_health()
+                    google = next(
+                        item for item in news_aggregator.get_source_statuses()
+                        if item["source"] == "google"
+                    )
+                    self.assertEqual(google["last_success"], "2026-07-12T10:00:00+00:00")
+                    self.assertEqual(google["consecutive_failures"], 2)
 
 
 if __name__ == "__main__":

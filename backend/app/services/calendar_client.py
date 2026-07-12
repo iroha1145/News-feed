@@ -183,7 +183,62 @@ async def fetch_economic_calendar(*, force: bool = False) -> list[dict]:
         _calendar_status.update(stale=True, as_of=fetched_at, last_error=upstream_error)
         _cache_ttl = STALE_RETRY_TTL
 
+    # Point-in-time availability starts when the response/fallback decision is
+    # complete, never when the request began.
+    observed_at = _utc_now()
     events = _normalize_events(raw_events, stale=stale, fetched_at=fetched_at)
+    if fetched_at:
+        try:
+            from app.integrations.option_pro.repository import (
+                record_calendar_snapshot,
+                upsert_source_health,
+            )
+            from app.models.database import get_db
+
+            db = await get_db()
+            try:
+                async with db.execute(
+                    """SELECT last_success_at,consecutive_failures FROM source_health
+                       WHERE source='faireconomy'"""
+                ) as cursor:
+                    prior_health = await cursor.fetchone()
+                prior_success = prior_health[0] if prior_health else None
+                prior_failures = int(prior_health[1] or 0) if prior_health else 0
+                if stale and not _calendar_status.get("last_success"):
+                    _calendar_status["last_success"] = prior_success or fetched_at
+                await record_calendar_snapshot(
+                    db,
+                    events,
+                    source_fetched_at=fetched_at,
+                    stale=stale,
+                    observed_at=observed_at,
+                )
+                await upsert_source_health(
+                    db,
+                    source="faireconomy",
+                    status="degraded" if stale else "ok",
+                    last_attempt_at=attempted_at,
+                    last_success_at=(fetched_at if not stale else (prior_success or fetched_at)),
+                    data_through=fetched_at,
+                    consecutive_failures=prior_failures + 1 if stale else 0,
+                    next_attempt_at=(
+                        (
+                            datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                            + timedelta(seconds=STALE_RETRY_TTL)
+                        ).isoformat()
+                        if stale else None
+                    ),
+                    raw_count=0 if stale else len(events),
+                    inserted_count=None,
+                    duplicates_count=None,
+                    error_code="calendar_source_failed" if stale else None,
+                )
+            finally:
+                await db.close()
+        except Exception:
+            # Calendar display remains available from its last-known-good file
+            # even if the additive Integration projection cannot be published.
+            logger.exception("Economic calendar integration projection failed")
     _calendar_cache = events
     _cache_time = time.monotonic()
     logger.info("Economic calendar: %s events (stale=%s)", len(events), stale)

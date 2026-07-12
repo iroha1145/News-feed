@@ -38,6 +38,7 @@ def _parse_item(item: dict) -> Optional[dict]:
         "url": url,
         "image_url": item.get("image_url"),
         "published_at": published_at,
+        "source_tickers": [str(value).upper() for value in tickers[:100] if value],
     }
 
 

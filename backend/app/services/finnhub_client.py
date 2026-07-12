@@ -27,6 +27,9 @@ def _parse_item(item: dict) -> Optional[dict]:
         except (ValueError, OSError):
             published_at = None
 
+    related = str(item.get("related") or "")
+    source_tickers = [value.strip().upper() for value in related.split(",") if value.strip()]
+
     return {
         "source": f"finnhub/{item.get('source', 'unknown')}",
         "title": title,
@@ -34,6 +37,7 @@ def _parse_item(item: dict) -> Optional[dict]:
         "url": url,
         "image_url": item.get("image") or None,
         "published_at": published_at,
+        "source_tickers": source_tickers[:100],
     }
 
 
@@ -87,6 +91,8 @@ async def fetch_finnhub_news(api_key: str) -> list[dict]:
                 for item in items[:10]:  # cap per symbol
                     parsed = _parse_item(item)
                     if parsed:
+                        if symbol not in parsed["source_tickers"]:
+                            parsed["source_tickers"].append(symbol)
                         results.append(parsed)
             except Exception as e:
                 errors.append(log_http_failure(logger, f"Finnhub [{symbol}]", e, endpoint=f"{BASE_URL}/company-news", secrets=(api_key,)))
