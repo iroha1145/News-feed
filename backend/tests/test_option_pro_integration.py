@@ -35,14 +35,17 @@ from app.integrations.option_pro.repository import (
     query_calendar,
     query_feed,
     query_latest,
+    query_ticker,
     record_calendar_snapshot,
     upsert_source_health,
 )
-from app.models import database
+from app.models import catalyst_database, database
 from app.models.catalysts import CatalystBatchRequest, NewsImpactAnalysis
 from app.routers import calendar as calendar_router
 from app.routers import settings as settings_router
 from app.services import calendar_analyzer, calendar_client
+from app.services.focus_context import FOCUS_SCHEMA_SHA256, FocusContext, persist_focus_context
+from app.services.market_focus import ingest_event_evidence
 from app.services.analysis_jobs import (
     InputVersionConflict,
     claim_next_job,
@@ -72,6 +75,9 @@ def run(coro):
 def isolated_integration_db(tmp_path, monkeypatch):
     path = tmp_path / "integration.db"
     monkeypatch.setattr(database, "DB_PATH", str(path))
+    monkeypatch.setattr(settings, "news_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 50)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", 1_638_400)
     run(database.init_db())
     return path
 
@@ -87,6 +93,7 @@ def news_record(index: int, *, summary: str | None = None, fetched_at: str | Non
         "published_at": now,
         "fetched_at": now,
         "content_hash": hashlib.sha256(f"news-{index}".encode()).hexdigest(),
+        "source_tickers": ["AMD"],
     }
 
 
@@ -155,6 +162,12 @@ class RetrieveFailureProvider(FakeProvider):
     async def retrieve(self, response_id: str):
         self.retrieve_calls += 1
         raise RuntimeError("temporary retrieve failure")
+
+
+class SyncSubmissionOutcomeUnknownProvider(FakeProvider):
+    async def create_sync(self, model_input: str, **request):
+        self.sync_calls += 1
+        raise TimeoutError("response timed out after request submission")
 
 
 class CancelFailureThenObserveProvider(FakeProvider):
@@ -349,7 +362,7 @@ def test_non_openai_default_provider_creates_no_openai_work(
 
 def test_contract_path_supports_source_image_and_explicit_layouts(tmp_path):
     source_module = tmp_path / "repo" / "backend" / "app" / "integrations" / "option_pro" / "contract.py"
-    source_contract = tmp_path / "repo" / "contracts" / "macrolens-option-pro-v1.json"
+    source_contract = tmp_path / "repo" / "contracts" / "macrolens-option-pro-v2.json"
     source_module.parent.mkdir(parents=True)
     source_contract.parent.mkdir(parents=True)
     source_module.write_text("", encoding="utf-8")
@@ -357,7 +370,7 @@ def test_contract_path_supports_source_image_and_explicit_layouts(tmp_path):
     assert resolve_contract_path(source_module) == source_contract
 
     image_module = tmp_path / "image" / "app" / "integrations" / "option_pro" / "contract.py"
-    image_contract = tmp_path / "image" / "contracts" / "macrolens-option-pro-v1.json"
+    image_contract = tmp_path / "image" / "contracts" / "macrolens-option-pro-v2.json"
     image_module.parent.mkdir(parents=True)
     image_contract.parent.mkdir(parents=True)
     image_module.write_text("", encoding="utf-8")
@@ -515,6 +528,183 @@ def test_background_job_recovers_by_response_id_and_records_usage(isolated_integ
             assert finished["usage_output_tokens"] == 80
             async with db.execute("SELECT COUNT(*) FROM analysis_stock_impacts WHERE news_id=?", (news_id,)) as cursor:
                 assert (await cursor.fetchone())[0] == 1
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_model_tickers_are_validated_before_trusted_projection(isolated_integration_db):
+    stocks = [
+        {
+            "ticker": ticker,
+            "company": company,
+            "impact_score": 30,
+            "confidence": 70,
+            "horizon": "days",
+            "mechanism": "direct_company",
+            "reason": "The supplied news directly names the company.",
+        }
+        for ticker, company in (
+            ("NVDA", "NVIDIA"),
+            ("AMD", "Advanced Micro Devices"),
+            ("AI", "C3.ai"),
+            ("XYZ", "Unknown Issuer"),
+        )
+    ]
+    provider = FakeProvider(
+        created=ResponseResult(
+            "resp_private",
+            "completed",
+            output_text=json.dumps(valid_analysis(affected_stocks=stocks), ensure_ascii=False),
+        )
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            context = FocusContext.model_validate_json(json.dumps({
+                "schema_version": "option-pro-macrolens-focus-v2",
+                "schema_sha256": FOCUS_SCHEMA_SHA256,
+                "revision": 7,
+                "as_of": now,
+                "data_through": now,
+                "market_session": "regular",
+                "universe_version": "universe-7",
+                "symbols": [{
+                    "ticker": "NVDA",
+                    "validation_status": "canonical",
+                    "universe_reasons": ["dollar_volume_top20"],
+                    "as_of": now,
+                    "data_quality": 0.9,
+                    "data_status": "active",
+                }],
+                "major_market_symbols": ["SPY"],
+                "warnings": [],
+            }))
+            await persist_focus_context(db, context)
+            record = news_record(220)
+            news_id = await database.insert_news_item(db, record)
+            event_group_id = await ingest_event_evidence(db, record, news_id=news_id)
+            await create_or_get_job(db, news_id)
+        finally:
+            await db.close()
+
+        assert await run_worker_once(provider=provider, worker_id="ticker-validation") is True
+        db = await database.get_db()
+        try:
+            impacts = await (await db.execute(
+                """SELECT ticker,validation_status,focus_revision,universe_version,
+                          association_method FROM analysis_stock_impacts
+                   WHERE news_id=? ORDER BY ticker""",
+                (news_id,),
+            )).fetchall()
+            assert [tuple(row) for row in impacts] == [
+                ("AMD", "valid_external", 7, "universe-7", "llm_inference"),
+                ("NVDA", "canonical", 7, "universe-7", "llm_inference"),
+            ]
+            mentions = await (await db.execute(
+                """SELECT ticker,validation_status FROM news_ticker_mentions
+                   WHERE news_id=? AND association_method='llm_inference'
+                   ORDER BY ticker""",
+                (news_id,),
+            )).fetchall()
+            assert [tuple(row) for row in mentions] == [
+                ("AI", "ambiguous"),
+                ("AMD", "valid_external"),
+                ("NVDA", "canonical"),
+                ("XYZ", "unverified"),
+            ]
+            detail = await (await db.execute(
+                "SELECT payload_json FROM analysis_revisions WHERE news_id=?", (news_id,)
+            )).fetchone()
+            assert {item["ticker"] for item in json.loads(detail[0])["affected_stocks"]} == {
+                "AI", "AMD", "NVDA", "XYZ",
+            }
+            trusted, *_ = await query_ticker(
+                db,
+                ticker="AMD",
+                as_of=datetime.now(timezone.utc),
+                window_hours=72,
+                limit=20,
+                cursor=None,
+                min_confidence=0,
+                include_neutral=True,
+                include_unanalyzed=True,
+            )
+            ambiguous, *_ = await query_ticker(
+                db,
+                ticker="AI",
+                as_of=datetime.now(timezone.utc),
+                window_hours=72,
+                limit=20,
+                cursor=None,
+                min_confidence=0,
+                include_neutral=True,
+                include_unanalyzed=True,
+            )
+            assert len(trusted) == 1
+            assert ambiguous == []
+            assert {
+                (item.ticker, item.validation_status)
+                for item in trusted[0].analysis.stock_validations
+            } == {
+                ("AI", "ambiguous"),
+                ("AMD", "valid_external"),
+                ("NVDA", "canonical"),
+                ("XYZ", "unverified"),
+            }
+            event = await (await db.execute(
+                """SELECT version,validated_tickers_json FROM news_event_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert event[0] == 2
+            assert json.loads(event[1]) == ["AMD", "NVDA"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_invalid_model_ticker_is_counted_but_never_persisted(isolated_integration_db):
+    invalid = valid_analysis()
+    invalid["affected_stocks"][0]["ticker"] = "DROP TABLE news_items"
+    provider = FakeProvider(
+        created=ResponseResult(
+            "resp_private",
+            "completed",
+            output_text=json.dumps(invalid, ensure_ascii=False),
+        )
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            news_id = await database.insert_news_item(db, news_record(221))
+            await create_or_get_job(db, news_id)
+        finally:
+            await db.close()
+        assert await run_worker_once(provider=provider, worker_id="invalid-ticker") is True
+        db = await database.get_db()
+        try:
+            job = await (await db.execute(
+                "SELECT status,error_code FROM analysis_jobs WHERE news_id=?", (news_id,)
+            )).fetchone()
+            counter = await (await db.execute(
+                "SELECT count FROM projection_safety_counters WHERE counter_key='invalid_model_ticker'"
+            )).fetchone()
+            revisions = await (await db.execute(
+                "SELECT COUNT(*) FROM analysis_revisions WHERE news_id=?", (news_id,)
+            )).fetchone()
+            mentions = await (await db.execute(
+                "SELECT COUNT(*) FROM news_ticker_mentions WHERE news_id=?", (news_id,)
+            )).fetchone()
+            assert tuple(job) == ("failed", "invalid_structured_output")
+            assert counter[0] == 1
+            assert revisions[0] == 0
+            assert mentions[0] == 0
         finally:
             await db.close()
 
@@ -1268,9 +1458,62 @@ def test_unknown_background_submission_outcome_is_not_requeued(isolated_integrat
     run(scenario())
 
 
+def test_unknown_worker_sync_submission_outcome_is_not_retried(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "openai_execution_mode", "worker_sync")
+    provider = SyncSubmissionOutcomeUnknownProvider(
+        created=ResponseResult(None, "failed")
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            news_id = await database.insert_news_item(db, news_record(330))
+            created = await create_or_get_job(db, news_id)
+        finally:
+            await db.close()
+
+        assert await run_worker_once(provider=provider, worker_id="sync-unknown") is True
+        db = await database.get_db()
+        try:
+            row = await (await db.execute(
+                "SELECT status,error_code,next_attempt_at FROM analysis_jobs WHERE job_id=?",
+                (created.job["job_id"],),
+            )).fetchone()
+            assert tuple(row) == ("failed", "submission_outcome_unknown", None)
+            assert await retry_failed_jobs(db, news_id=news_id) == []
+        finally:
+            await db.close()
+        assert provider.sync_calls == 1
+
+    run(scenario())
+
+
 def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tmp_path, monkeypatch):
     path = tmp_path / "legacy.db"
     monkeypatch.setattr(database, "DB_PATH", str(path))
+    backfill_calls = {"legacy": 0, "impacts": 0, "events": 0}
+
+    original_legacy = catalyst_database._backfill_legacy_analyses
+    original_impacts = catalyst_database._backfill_stock_impact_validation
+    original_events = catalyst_database._backfill_event_evidence_fingerprints
+
+    async def counted_legacy(db):
+        backfill_calls["legacy"] += 1
+        await original_legacy(db)
+
+    async def counted_impacts(db):
+        backfill_calls["impacts"] += 1
+        await original_impacts(db)
+
+    async def counted_events(db):
+        backfill_calls["events"] += 1
+        await original_events(db)
+
+    monkeypatch.setattr(catalyst_database, "_backfill_legacy_analyses", counted_legacy)
+    monkeypatch.setattr(catalyst_database, "_backfill_stock_impact_validation", counted_impacts)
+    monkeypatch.setattr(catalyst_database, "_backfill_event_evidence_fingerprints", counted_events)
 
     async def scenario():
         async with aiosqlite.connect(path) as db:
@@ -1284,6 +1527,17 @@ def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tm
                     next_attempt_at TEXT,error_code TEXT,updated_at TEXT NOT NULL
                 )"""
             )
+            legacy_jobs_sql = catalyst_database.CREATE_ANALYSIS_JOBS.replace(
+                ",'incomplete_output'", ""
+            ).replace(
+                "    source_input_hash TEXT NOT NULL,\n", ""
+            ).replace(
+                "    content_hash TEXT NOT NULL,\n", ""
+            ).replace(
+                "    UNIQUE(news_id, input_hash, model, prompt_version, schema_version)\n",
+                "    UNIQUE(news_id, input_hash, model, prompt_version, schema_version)\n",
+            )
+            await db.execute(legacy_jobs_sql)
             await db.execute(
                 """INSERT INTO news_items
                    (id,source,title,summary,url,published_at,fetched_at,content_hash,analysis_status)
@@ -1305,6 +1559,15 @@ def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tm
                 ),
             )
             await db.execute("INSERT INTO settings(key,value) VALUES ('default_llm_model','\"gpt-4o-mini\"')")
+            await db.execute(
+                """INSERT INTO analysis_jobs
+                   (job_id,news_id,input_hash,status,model,reasoning_effort,prompt_version,
+                    schema_version,created_at,updated_at)
+                   VALUES ('legacy-job',1,?,'failed','legacy-model','none','legacy-v1',
+                           'legacy-v1','2026-07-10T10:02:00+00:00',
+                           '2026-07-10T10:02:00+00:00')""",
+                ("a" * 64,),
+            )
             await db.commit()
 
         await database.init_db()
@@ -1317,8 +1580,16 @@ def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tm
             assert revision[1] == 1
             assert payload["causal_summary"] == "旧版分析未保存可安全公开的因果摘要。"
             assert "private step" not in revision[0]
-            async with db.execute("SELECT confidence,horizon,mechanism FROM analysis_stock_impacts") as cursor:
-                assert tuple(await cursor.fetchone()) == (0, "uncertain", "other")
+            async with db.execute(
+                """SELECT confidence,horizon,mechanism,validation_status,
+                          association_method,validated_at
+                   FROM analysis_stock_impacts"""
+            ) as cursor:
+                impact = await cursor.fetchone()
+            assert tuple(impact[:5]) == (
+                0, "uncertain", "other", "unverified", "llm_inference",
+            )
+            assert impact[5] is not None
             async with db.execute("SELECT COUNT(*) FROM analysis_revisions") as cursor:
                 assert (await cursor.fetchone())[0] == 1
             async with db.execute(
@@ -1329,9 +1600,25 @@ def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tm
                 assert await cursor.fetchall() == []
             async with db.execute("PRAGMA table_info(source_health)") as cursor:
                 source_columns = {row[1] for row in await cursor.fetchall()}
-            assert {"raw_count", "inserted_count", "duplicates_count"} <= source_columns
+            assert {
+                "raw_count",
+                "inserted_count",
+                "duplicates_count",
+                "source_fetch_status",
+                "news_persistence_status",
+                "event_projection_status",
+            } <= source_columns
+            async with db.execute("PRAGMA user_version") as cursor:
+                assert (await cursor.fetchone())[0] == 3
+            async with db.execute(
+                "SELECT source_input_hash,content_hash FROM analysis_jobs WHERE job_id='legacy-job'"
+            ) as cursor:
+                legacy_job = await cursor.fetchone()
+            assert tuple(legacy_job) == ("a" * 64, "f" * 64)
         finally:
             await db.close()
+
+        assert backfill_calls == {"legacy": 1, "impacts": 1, "events": 1}
 
     run(scenario())
 
@@ -1371,6 +1658,51 @@ def test_point_in_time_hides_analysis_until_available_at(isolated_integration_db
             assert before[0].classification if hasattr(before[0], "classification") else True
             assert after[0].analysis is not None
             assert after[0].analysis.available_at == datetime.fromisoformat(analyzed)
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_failed_schema_migration_rolls_back_and_restores_foreign_keys(tmp_path, monkeypatch):
+    path = tmp_path / "migration-failure.db"
+
+    async def scenario():
+        db = await aiosqlite.connect(path)
+        try:
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute(
+                """CREATE TABLE news_items (
+                       id INTEGER PRIMARY KEY,
+                       fetched_at TEXT NOT NULL,
+                       analysis_status TEXT NOT NULL DEFAULT 'pending'
+                   )"""
+            )
+            await db.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+            await db.commit()
+
+            original_add_column = catalyst_database._add_column
+            calls = 0
+
+            async def fail_during_migration(connection, table, column, definition):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("injected_migration_failure")
+                await original_add_column(connection, table, column, definition)
+
+            monkeypatch.setattr(catalyst_database, "_add_column", fail_during_migration)
+            with pytest.raises(RuntimeError, match="injected_migration_failure"):
+                await catalyst_database.init_catalyst_schema(db)
+
+            assert not db.in_transaction
+            async with db.execute("PRAGMA foreign_keys") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+            async with db.execute("PRAGMA user_version") as cursor:
+                assert (await cursor.fetchone())[0] == 0
+            async with db.execute("PRAGMA table_info(news_items)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            assert "updated_at" not in columns
         finally:
             await db.close()
 
@@ -1942,7 +2274,7 @@ def test_hmac_scope_rotation_replay_and_expired_timestamp(isolated_integration_d
         headers = _signed_headers("GET", target, b"", "read-key", "read-current-secret", "nonce-current-0001")
         response = client.get(target, headers=headers)
         assert response.status_code == 200
-        assert response.json()["schema_version"] == "macrolens-option-pro-v1"
+        assert response.json()["schema_version"] == "macrolens-option-pro-v2"
         assert response.json()["analysis_queue"]["status"] == "unavailable"
         assert response.json()["analysis_trigger_enabled"] is False
         assert "analysis_worker_heartbeat_missing" in response.json()["warnings"]
@@ -2068,7 +2400,7 @@ def test_signed_integration_endpoints_match_committed_contract(isolated_integrat
             )
             response = client.get(target, headers=headers)
             assert response.status_code == 200, (target, response.text)
-            assert response.json()["schema_version"] == "macrolens-option-pro-v1"
+            assert response.json()["schema_version"] == "macrolens-option-pro-v2"
             assert response.json()["schema_sha256"] == hashlib.sha256(CONTRACT_PATH.read_bytes()).hexdigest()
             assert "openai_response_id" not in response.text
 

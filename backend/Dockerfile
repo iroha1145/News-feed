@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY backend/app ./app
 COPY backend/tests ./tests
 COPY contracts ./contracts
-RUN MACROLENS_OPTION_PRO_CONTRACT_PATH=/app/contracts/macrolens-option-pro-v1.json \
+RUN MACROLENS_OPTION_PRO_CONTRACT_PATH=/app/contracts/macrolens-option-pro-v2.json \
     python -m app.integrations.option_pro.contract --check
 
 CMD ["python", "-m", "pytest", "-q", "tests"]
@@ -32,7 +32,7 @@ RUN groupadd --gid 10001 macrolens \
 
 COPY --chown=macrolens:macrolens backend/app ./app
 COPY --chown=macrolens:macrolens contracts ./contracts
-RUN MACROLENS_OPTION_PRO_CONTRACT_PATH=/app/contracts/macrolens-option-pro-v1.json \
+RUN MACROLENS_OPTION_PRO_CONTRACT_PATH=/app/contracts/macrolens-option-pro-v2.json \
     python -m app.integrations.option_pro.contract --check
 RUN mkdir -p data && chown -R macrolens:macrolens /app/data
 

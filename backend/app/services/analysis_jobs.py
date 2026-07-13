@@ -206,6 +206,13 @@ async def _budget_error(
     *,
     request_origin: Literal["manual", "automatic"],
 ) -> str | None:
+    capability = (
+        settings.automatic_news_analysis_capability
+        if request_origin == "automatic"
+        else settings.manual_news_analysis_capability
+    )
+    if capability != "enabled":
+        return capability
     async with db.execute(
         "SELECT COUNT(*) FROM analysis_jobs WHERE status IN ('pending','queued','in_progress')"
     ) as cursor:
@@ -308,21 +315,72 @@ async def _publish_analysis_locked(
     )
     analysis_id = int(cursor.lastrowid)
 
+    from app.services.market_focus import record_ticker_mentions
+
+    source_tickers = _source_tickers(news.get("source_tickers"))
+    if source_tickers:
+        await record_ticker_mentions(
+            db,
+            news_id=int(news["id"]),
+            tickers=source_tickers,
+            association_method="provider_tag",
+            source=str(news["source"]),
+        )
+    async with db.execute(
+        """SELECT DISTINCT ticker FROM news_ticker_mentions
+           WHERE news_id=? AND association_method<>'llm_inference'
+             AND validation_status IN ('canonical','valid_external')""",
+        (news["id"],),
+    ) as trusted_cursor:
+        trusted_external = {str(row[0]) for row in await trusted_cursor.fetchall()}
+    # A new analysis revision replaces the current model-derived associations.
+    # Provider/company evidence remains append-only and the raw model output is
+    # still retained in analysis_revisions for audit.
+    await db.execute(
+        "DELETE FROM news_ticker_mentions WHERE news_id=? AND association_method='llm_inference'",
+        (news["id"],),
+    )
+    model_mentions = await record_ticker_mentions(
+        db,
+        news_id=int(news["id"]),
+        tickers=[stock.ticker for stock in payload.affected_stocks],
+        association_method="llm_inference",
+        source="model_output",
+        trusted_external_symbols=trusted_external,
+    )
+    validation_by_ticker = {
+        row["ticker"]: row["validation_status"] for row in model_mentions if row["ticker"]
+    }
+    async with db.execute(
+        "SELECT revision,universe_version FROM focus_context_snapshots ORDER BY revision DESC LIMIT 1"
+    ) as focus_cursor:
+        focus_row = await focus_cursor.fetchone()
+
     for stock in payload.affected_stocks:
+        validation_status = validation_by_ticker.get(stock.ticker, "unverified")
+        if validation_status not in {"canonical", "valid_external"}:
+            continue
         await db.execute(
             """INSERT INTO analysis_stock_impacts
                (analysis_id, news_id, ticker, company, impact_score, confidence, horizon,
                 mechanism, reason, source, content_hash, published_at, fetched_at,
-                analyzed_at, available_at, model, reasoning_effort, prompt_version, schema_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                analyzed_at, available_at, model, reasoning_effort, prompt_version, schema_version,
+                validation_status,validated_at,focus_revision,universe_version,association_method)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'llm_inference')""",
             (
                 analysis_id, news["id"], stock.ticker, stock.company, stock.impact_score,
                 stock.confidence, stock.horizon.value, stock.mechanism.value, stock.reason,
                 str(news["source"]), str(news["content_hash"]), news.get("published_at"),
                 str(news["fetched_at"]), analyzed_at, available_at, model,
-                reasoning_effort, prompt_version, schema_version,
+                reasoning_effort, prompt_version, schema_version, validation_status, analyzed_at,
+                int(focus_row[0]) if focus_row else None,
+                str(focus_row[1]) if focus_row else None,
             ),
         )
+
+    from app.services.market_focus import refresh_event_groups_for_news
+
+    await refresh_event_groups_for_news(db, int(news["id"]))
 
     legacy_stocks = [
         {
@@ -332,6 +390,7 @@ async def _publish_analysis_locked(
             "reason": stock.reason,
         }
         for stock in payload.affected_stocks
+        if validation_by_ticker.get(stock.ticker) in {"canonical", "valid_external"}
     ]
     legacy_commodities = [
         {"name": value.name, "impact_score": value.impact_score, "reason": value.reason}
@@ -467,14 +526,17 @@ async def create_or_get_job(
 
         budget_error = (
             await _budget_error(db, now, request_origin=request_origin)
-            if sufficient and provider_supported
+            if provider_supported and (sufficient or request_origin == "manual")
             else None
         )
         if existing_row and dict(existing_row)["status"] == "budget_blocked" and budget_error:
             existing = dict(existing_row)
             await db.commit()
             return CreateJobResult(existing, created=False)
-        if not sufficient:
+        if request_origin == "manual" and budget_error:
+            status = "budget_blocked"
+            job_error = budget_error
+        elif not sufficient:
             status = "insufficient_context"
             job_error = None
         elif not provider_supported:
@@ -636,6 +698,11 @@ async def claim_next_job(db: aiosqlite.Connection, worker_id: str) -> dict[str, 
         submission_clause = (
             "" if inflight < concurrency_limit else "AND openai_response_id IS NOT NULL"
         )
+        cost_gate_clause = """AND (
+            openai_response_id IS NOT NULL
+            OR (request_origin='manual' AND ?)
+            OR (request_origin='automatic' AND ?)
+        )"""
         response_priority = "CASE WHEN openai_response_id IS NOT NULL THEN 0 ELSE 1 END,"
         async with db.execute(
             f"""SELECT * FROM analysis_jobs
@@ -646,12 +713,18 @@ async def claim_next_job(db: aiosqlite.Connection, worker_id: str) -> dict[str, 
                )
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+               {cost_gate_clause}
                {submission_clause}
                ORDER BY CASE WHEN status='cancelled' THEN 1 ELSE 0 END DESC,
                         {response_priority}
                         priority DESC, created_at, job_id
                LIMIT 1""",
-            (utc_text(now), utc_text(now)),
+            (
+                utc_text(now),
+                utc_text(now),
+                settings.manual_news_analysis_capability == "enabled",
+                settings.automatic_news_analysis_capability == "enabled",
+            ),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
@@ -700,6 +773,11 @@ async def _fail_claimed(
     usage_input = max(0, int(result.usage_input_tokens)) if result else 0
     usage_cached = max(0, int(result.usage_cached_input_tokens)) if result else 0
     usage_output = max(0, int(result.usage_output_tokens)) if result else 0
+    next_attempt_at = (
+        None
+        if error_code == "submission_outcome_unknown"
+        else utc_text(now + timedelta(seconds=settings.analysis_job_retry_cooldown_seconds))
+    )
     updated = await _update_claimed(
         db,
         job,
@@ -713,7 +791,7 @@ async def _fail_claimed(
         "lease_owner=NULL, lease_expires_at=NULL",
         (
             error_code[:100],
-            utc_text(now + timedelta(seconds=settings.analysis_job_retry_cooldown_seconds)),
+            next_attempt_at,
             utc_text(now),
             utc_text(now),
             usage_input,
@@ -943,6 +1021,29 @@ async def _handle_provider_result(
     try:
         payload = validate_output(result.output_text or "")
     except (ValueError, ValidationError):
+        invalid_tickers = 0
+        try:
+            raw_payload = json.loads(result.output_text or "")
+            stocks = raw_payload.get("affected_stocks", []) if isinstance(raw_payload, dict) else []
+            if isinstance(stocks, list):
+                from app.services.market_focus import normalize_ticker
+
+                invalid_tickers = sum(
+                    1
+                    for stock in stocks
+                    if isinstance(stock, dict) and not normalize_ticker(stock.get("ticker"))
+                )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            invalid_tickers = 0
+        if invalid_tickers:
+            await db.execute(
+                """INSERT INTO projection_safety_counters(counter_key,count,updated_at)
+                   VALUES ('invalid_model_ticker',?,?)
+                   ON CONFLICT(counter_key) DO UPDATE SET
+                     count=projection_safety_counters.count+excluded.count,
+                     updated_at=excluded.updated_at""",
+                (invalid_tickers, utc_text()),
+            )
         await _fail_claimed(db, job, "invalid_structured_output", result)
         return
 
@@ -1066,7 +1167,8 @@ async def process_claimed_job(
         try:
             await _update_claimed(
                 db, job,
-                "status='in_progress', submitted_at=COALESCE(submitted_at,?), attempt_count=attempt_count+1, updated_at=?",
+                "status='in_progress',error_code='submission_in_progress',"
+                "submitted_at=COALESCE(submitted_at,?),attempt_count=attempt_count+1,updated_at=?",
                 (utc_text(), utc_text()),
             )
             request_started = time.monotonic()
@@ -1079,7 +1181,7 @@ async def process_claimed_job(
             if result.latency_ms is None:
                 result = replace(result, latency_ms=round((time.monotonic() - request_started) * 1000))
         except Exception:
-            await _fail_claimed(db, job, "worker_sync_request_failed")
+            await _fail_claimed(db, job, "submission_outcome_unknown")
             return
         await _handle_provider_result(db, job, news, result)
         return

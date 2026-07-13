@@ -27,6 +27,8 @@ class FocusTickerAssessment(StrictModel):
             raise ValueError("insufficient evidence requires a null catalyst bias")
         if not self.insufficient_evidence and self.catalyst_bias is None:
             raise ValueError("supported assessment requires a catalyst bias")
+        if set(self.supporting_event_ids) & set(self.conflicting_event_ids):
+            raise ValueError("supporting and conflicting evidence must be disjoint")
         return self
 
 
@@ -70,6 +72,10 @@ class MarketFocusCycleAnalysis(StrictModel):
 
 
 class PublicFocusTickerAssessment(FocusTickerAssessment):
+    supporting_weight: float = Field(default=0.0, ge=0)
+    conflicting_weight: float = Field(default=0.0, ge=0)
+    conflict_ratio: float = Field(default=0.0, ge=0, le=1)
+    effective_reliability: float = Field(default=0.0, ge=0, le=1)
     weighted_catalyst_context: Optional[float] = Field(default=None, ge=-100, le=100)
 
     @model_validator(mode="after")

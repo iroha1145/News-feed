@@ -35,7 +35,7 @@ from app.models.catalysts import (
 from app.models.market_focus import MarketFocusCyclePublicAnalysis
 
 
-CONTRACT_FILENAME = "macrolens-option-pro-v1.json"
+CONTRACT_FILENAME = "macrolens-option-pro-v2.json"
 
 
 def resolve_contract_path(

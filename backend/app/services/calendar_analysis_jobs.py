@@ -726,11 +726,7 @@ async def process_claimed_calendar_job(
         return
 
     execution_mode = str(job.get("execution_mode") or settings.openai_execution_mode)
-    execution_marker = (
-        "worker_sync_in_progress"
-        if execution_mode == "worker_sync"
-        else "submission_in_progress"
-    )
+    execution_marker = "submission_in_progress"
     marked = await _update_claimed(
         db,
         job,
@@ -745,7 +741,7 @@ async def process_claimed_calendar_job(
         try:
             result = await provider.create_sync(model_input, **request_options)
         except Exception:
-            await _fail_claimed(db, job, "calendar_worker_sync_request_failed")
+            await _fail_claimed(db, job, "submission_outcome_unknown")
             return
         await _handle_provider_result(db, job, events, result)
         return

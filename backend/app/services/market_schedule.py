@@ -15,6 +15,13 @@ def _observed(day: date) -> date:
     return day
 
 
+def _observed_new_year(day: date) -> date:
+    # NYSE does not close on the preceding Friday when January 1 is Saturday.
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     current = date(year, month, 1)
     shift = (weekday - current.weekday()) % 7
@@ -44,7 +51,7 @@ def _easter_sunday(year: int) -> date:
 
 def nyse_holidays(year: int) -> set[date]:
     holidays = {
-        _observed(date(year, 1, 1)),
+        _observed_new_year(date(year, 1, 1)),
         _nth_weekday(year, 1, 0, 3),
         _nth_weekday(year, 2, 0, 3),
         _easter_sunday(year) - timedelta(days=2),
@@ -56,21 +63,11 @@ def nyse_holidays(year: int) -> set[date]:
     }
     if year >= 2022:
         holidays.add(_observed(date(year, 6, 19)))
-    next_new_year_observed = _observed(date(year + 1, 1, 1))
-    if next_new_year_observed.year == year:
-        holidays.add(next_new_year_observed)
     return holidays
 
 
 def is_nyse_trading_day(day: date) -> bool:
     return day.weekday() < 5 and day not in nyse_holidays(day.year)
-
-
-def _previous_trading_day(day: date) -> date:
-    current = day - timedelta(days=1)
-    while not is_nyse_trading_day(current):
-        current -= timedelta(days=1)
-    return current
 
 
 def is_nyse_early_close(day: date) -> bool:
@@ -79,7 +76,7 @@ def is_nyse_early_close(day: date) -> bool:
     thanksgiving = _nth_weekday(day.year, 11, 3, 4)
     if day == thanksgiving + timedelta(days=1):
         return True
-    if day == _previous_trading_day(date(day.year, 7, 4)):
+    if day == date(day.year, 7, 3):
         return True
     christmas_eve = date(day.year, 12, 24)
     return day == christmas_eve and is_nyse_trading_day(christmas_eve)

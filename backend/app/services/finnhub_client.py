@@ -4,6 +4,7 @@ import logging
 import time
 from datetime import date, datetime, timezone
 from typing import Optional, Sequence
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -13,7 +14,15 @@ from app.utils.news_text import clean_news_text
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://finnhub.io/api/v1"
+EASTERN = ZoneInfo("America/New_York")
 _last_focus_fetch_monotonic: Optional[float] = None
+
+
+def finnhub_company_news_date(now: datetime | None = None) -> date:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("finnhub_company_news_date_requires_timezone")
+    return current.astimezone(EASTERN).date()
 
 
 def _parse_item(item: dict, *, queried_ticker: str | None = None) -> Optional[dict]:
@@ -137,7 +146,7 @@ async def fetch_finnhub_news(api_key: str) -> list[dict]:
 
         # Company news is driven by the last successful option-pro focus
         # snapshot; there is no hard-coded stock list.
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = finnhub_company_news_date().isoformat()
         try:
             from app.config import settings
             from app.models.database import get_db

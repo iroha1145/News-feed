@@ -122,6 +122,28 @@ SELECT n.id AS news_id, n.content_hash, n.source, n.title, n.summary, n.url,
        r.id AS revision_id, r.revision, r.payload_json, r.model AS revision_model,
        r.reasoning_effort AS revision_reasoning, r.prompt_version AS revision_prompt,
        r.schema_version AS revision_schema, r.analyzed_at, r.available_at,
+       COALESCE((
+         SELECT json_group_array(json_object(
+           'ticker',latest.ticker,
+           'validation_status',latest.validation_status,
+           'validated_at',latest.validated_at,
+           'focus_revision',latest.focus_revision,
+           'universe_version',latest.universe_version,
+           'association_method',latest.association_method
+         ))
+         FROM (
+           SELECT m.ticker,m.validation_status,m.validated_at,m.focus_revision,
+                  m.universe_version,m.association_method
+           FROM news_ticker_mentions m
+           WHERE m.news_id=n.id AND m.association_method='llm_inference'
+             AND m.id=(
+               SELECT MAX(newest.id) FROM news_ticker_mentions newest
+               WHERE newest.news_id=m.news_id AND newest.ticker=m.ticker
+                 AND newest.association_method='llm_inference'
+             )
+           ORDER BY m.ticker
+         ) latest
+       ),'[]') AS stock_validations_json,
        j.status AS job_status,
        sh.status AS source_health_status,
        sh.last_success_at AS source_last_success_at,
@@ -178,6 +200,7 @@ def _item_from_row(row: aiosqlite.Row | dict[str, Any]) -> CatalystItem | None:
                 schema_version=record["revision_schema"],
                 analyzed_at=record["analyzed_at"],
                 available_at=record["available_at"],
+                stock_validations=_json_list(record.get("stock_validations_json")),
             )
             analysis_status = (
                 AnalysisStatus.insufficient_context
@@ -270,7 +293,8 @@ async def query_feed(
     if min_abs_impact:
         conditions.append(
             "r.id IS NOT NULL AND EXISTS (SELECT 1 FROM analysis_stock_impacts si "
-            "WHERE si.analysis_id=r.id AND ABS(si.impact_score)>=:min_abs_impact)"
+            "WHERE si.analysis_id=r.id AND si.validation_status IN ('canonical','valid_external') "
+            "AND ABS(si.impact_score)>=:min_abs_impact)"
         )
         params["min_abs_impact"] = min_abs_impact
     if analysis_status:
@@ -353,8 +377,10 @@ async def query_ticker(
         "datetime(n.fetched_at)<=datetime(:as_of)",
         "(n.published_at IS NULL OR datetime(n.published_at)<=datetime(:as_of))",
         "datetime(COALESCE(n.published_at,n.fetched_at))>=datetime(:window_start)",
-        "(EXISTS (SELECT 1 FROM json_each(n.source_tickers) st WHERE UPPER(st.value)=:ticker) "
-        "OR EXISTS (SELECT 1 FROM analysis_stock_impacts si WHERE si.analysis_id=r.id AND si.ticker=:ticker))",
+        "(EXISTS (SELECT 1 FROM news_ticker_mentions tm WHERE tm.news_id=n.id "
+        "AND tm.ticker=:ticker AND tm.validation_status IN ('canonical','valid_external')) "
+        "OR EXISTS (SELECT 1 FROM analysis_stock_impacts si WHERE si.analysis_id=r.id "
+        "AND si.ticker=:ticker AND si.validation_status IN ('canonical','valid_external')))",
     ]
     params: dict[str, Any] = {
         "as_of": utc_text(as_of),
@@ -365,7 +391,9 @@ async def query_ticker(
     if min_confidence:
         conditions.append(
             "(r.id IS NOT NULL AND EXISTS (SELECT 1 FROM analysis_stock_impacts si "
-            "WHERE si.analysis_id=r.id AND si.ticker=:ticker AND si.confidence>=:min_confidence))"
+            "WHERE si.analysis_id=r.id AND si.ticker=:ticker "
+            "AND si.validation_status IN ('canonical','valid_external') "
+            "AND si.confidence>=:min_confidence))"
         )
         params["min_confidence"] = min_confidence
     elif not include_unanalyzed:
@@ -624,18 +652,28 @@ async def upsert_source_health(
     inserted_count: int | None,
     duplicates_count: int | None,
     error_code: str | None,
+    source_fetch_status: str | None = None,
+    news_persistence_status: str | None = None,
+    event_projection_status: str | None = None,
 ) -> None:
+    source_fetch_status = source_fetch_status or status
+    news_persistence_status = news_persistence_status or status
+    event_projection_status = event_projection_status or status
     await db.execute(
         """INSERT INTO source_health
            (source,status,last_attempt_at,last_success_at,data_through,consecutive_failures,
-            next_attempt_at,raw_count,inserted_count,duplicates_count,error_code,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            next_attempt_at,raw_count,inserted_count,duplicates_count,error_code,
+            source_fetch_status,news_persistence_status,event_projection_status,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(source) DO UPDATE SET status=excluded.status,
              last_attempt_at=excluded.last_attempt_at,last_success_at=excluded.last_success_at,
              data_through=excluded.data_through,consecutive_failures=excluded.consecutive_failures,
              next_attempt_at=excluded.next_attempt_at,raw_count=excluded.raw_count,
              inserted_count=excluded.inserted_count,duplicates_count=excluded.duplicates_count,
              error_code=excluded.error_code,
+             source_fetch_status=excluded.source_fetch_status,
+             news_persistence_status=excluded.news_persistence_status,
+             event_projection_status=excluded.event_projection_status,
              updated_at=excluded.updated_at""",
         (
             source, status, last_attempt_at, last_success_at, data_through,
@@ -643,7 +681,11 @@ async def upsert_source_health(
             max(0, raw_count) if raw_count is not None else None,
             max(0, inserted_count) if inserted_count is not None else None,
             max(0, duplicates_count) if duplicates_count is not None else None,
-            error_code[:100] if error_code else None, utc_text(),
+            error_code[:100] if error_code else None,
+            source_fetch_status,
+            news_persistence_status,
+            event_projection_status,
+            utc_text(),
         ),
     )
     await db.commit()

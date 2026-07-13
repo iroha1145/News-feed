@@ -6,9 +6,13 @@
 
 ## MacroLens
 
+本轮数据库迁移号为 `PRAGMA user_version=2`。程序拒绝打开高于自身支持版本的数据库，迁移完成并校验后才写入版本号。
+
 新增 analysis_jobs、analysis_revisions、analysis_stock_impacts、calendar_analysis_jobs、calendar_snapshots、calendar_event_revisions、integration_changes、integration_nonces、analysis_worker_state 和持久来源健康。
 
-本次增量新增 `focus_context_snapshots`、`news_ticker_mentions`、`news_event_groups`、`news_event_members`、`hotspot_preparation_sets`、`hotspot_preparation_state`、`market_focus_cycles` 与 `market_focus_cycle_events`。`analysis_revisions` 继续只保存逐条新闻分析版本，禁止复用、重命名或迁移为热点/周期表。
+本次增量新增 `focus_context_snapshots`、`news_ticker_mentions`、`news_event_groups`、`news_event_members`、`hotspot_preparation_sets`、`hotspot_preparation_state`、`market_focus_cycles`、`market_focus_cycle_events`、`event_projection_retries`、`projection_safety_counters` 与 `market_focus_cycle_archives`。`analysis_revisions` 继续只保存逐条新闻分析版本，禁止复用、重命名或迁移为热点/周期表。
+
+`analysis_stock_impacts` 增加 validation_status、validated_at、focus_revision、universe_version 和 association_method。历史股票影响按最近焦点快照与可信来源标记回填；无法确认的记录设为 unverified，不伪造 canonical。来源健康拆成抓取、新闻保存和事件投影三段状态。
 
 现有 analyses 继续作为旧界面最新投影；新分析追加 revision。旧 affected_stocks JSON 幂等回填，坏 JSON 跳过并记录。旧记录缺失 confidence、horizon 和 mechanism 时使用 0、uncertain、other，并标记 legacy schema，不假装来自 Terra/max。
 

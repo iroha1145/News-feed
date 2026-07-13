@@ -37,6 +37,22 @@ async def _job_analyze_news() -> None:
         logger.error("[Scheduler] Analysis job failed: %s", type(exc).__name__)
 
 
+async def _job_retry_event_projections() -> None:
+    try:
+        from app.services.news_aggregator import process_projection_retry_queue
+
+        result = await process_projection_retry_queue()
+        if result["attempted"]:
+            logger.info(
+                "[Scheduler] Event projection retries: attempted=%s completed=%s failed=%s",
+                result["attempted"],
+                result["completed"],
+                result["failed"],
+            )
+    except Exception as exc:
+        logger.error("[Scheduler] Event projection retry failed: %s", type(exc).__name__)
+
+
 async def _job_x_sentiment() -> None:
     try:
         from app.services.grok_x_monitor import run_x_sentiment_analysis
@@ -174,6 +190,14 @@ async def start_scheduler() -> None:
         seconds=60,
         job_id="analyze_news",
         name="Analyze unanalyzed news",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_retry_event_projections,
+        seconds=60,
+        job_id="retry_event_projections",
+        name="Retry local event projections",
     )
 
     _add_interval_job(

@@ -20,7 +20,7 @@ from pydantic import (
 from app.models.market_focus import MarketFocusCyclePublicAnalysis
 
 
-SCHEMA_VERSION = "macrolens-option-pro-v1"
+SCHEMA_VERSION = "macrolens-option-pro-v2"
 
 BoundedText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
@@ -150,6 +150,19 @@ class AffectedCommodityImpact(StrictModel):
     reason: BoundedText
 
 
+class PublicTickerValidation(UTCModel):
+    ticker: Ticker
+    validation_status: Literal[
+        "canonical", "valid_external", "ambiguous", "invalid", "unverified"
+    ]
+    validated_at: Optional[datetime] = None
+    focus_revision: Optional[StrictInt] = Field(default=None, ge=1)
+    universe_version: Optional[
+        Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    ] = None
+    association_method: Literal["llm_inference"] = "llm_inference"
+
+
 class NewsImpactAnalysis(StrictModel):
     title_zh: ShortText
     headline_summary: BoundedText
@@ -185,6 +198,7 @@ class PublicAnalysis(NewsImpactAnalysis, UTCModel):
     schema_version: Annotated[str, StringConstraints(min_length=1, max_length=100)]
     analyzed_at: datetime
     available_at: datetime
+    stock_validations: list[PublicTickerValidation] = Field(default_factory=list, max_length=50)
 
 
 class ContractResponse(UTCModel):
@@ -311,6 +325,15 @@ class ComponentHealth(UTCModel):
     raw_count: Optional[StrictInt] = Field(default=None, ge=0)
     inserted_count: Optional[StrictInt] = Field(default=None, ge=0)
     duplicates_count: Optional[StrictInt] = Field(default=None, ge=0)
+    source_fetch_status: Optional[
+        Literal["ok", "degraded", "unavailable", "not_configured", "disabled"]
+    ] = None
+    news_persistence_status: Optional[
+        Literal["ok", "degraded", "unavailable", "not_configured", "disabled"]
+    ] = None
+    event_projection_status: Optional[
+        Literal["ok", "degraded", "unavailable", "not_configured", "disabled"]
+    ] = None
     detail: Optional[Annotated[str, StringConstraints(max_length=500)]] = None
 
 

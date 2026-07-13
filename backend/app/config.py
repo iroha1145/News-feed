@@ -73,13 +73,14 @@ class Settings(BaseSettings):
 
     # Persistent analysis queue and cost gates.
     news_llm_auto_analyze_enabled: bool = False
+    news_llm_manual_enabled: bool = False
     news_item_max_output_tokens: int = Field(default=32768, ge=256, le=128000)
     news_llm_max_inflight: int = Field(default=2, ge=1, le=16)
     news_llm_max_queued: int = Field(default=200, ge=1, le=10_000)
     news_llm_daily_job_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     news_llm_daily_output_token_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000_000)
-    news_llm_manual_daily_job_limit: int = Field(default=50, ge=1, le=1_000_000)
-    news_llm_manual_daily_output_token_limit: int = Field(default=1_638_400, ge=1, le=1_000_000_000)
+    news_llm_manual_daily_job_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000)
+    news_llm_manual_daily_output_token_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000_000)
     news_llm_min_context_chars: int = Field(default=100, ge=1, le=10_000)
     news_llm_min_market_relevance: int = Field(default=35, ge=0, le=100)
     analysis_worker_poll_seconds: int = Field(default=5, ge=1, le=300)
@@ -94,18 +95,30 @@ class Settings(BaseSettings):
     option_pro_focus_verify_tls: bool = True
     option_pro_focus_ca_bundle: str = ""
     option_pro_focus_interval_seconds: int = Field(default=1800, ge=60, le=86400)
+    option_pro_focus_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    option_pro_focus_read_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    # Bounds the complete pull, including retries and backoff.
     option_pro_focus_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    option_pro_focus_max_response_bytes: int = Field(
+        default=1_048_576,
+        ge=1_024,
+        le=8_388_608,
+    )
+    option_pro_focus_max_attempts: int = Field(default=3, ge=1, le=5)
+    option_pro_focus_retry_backoff_seconds: float = Field(default=0.25, ge=0, le=5)
+    option_pro_focus_circuit_failure_threshold: int = Field(default=3, ge=1, le=20)
+    option_pro_focus_circuit_reset_seconds: int = Field(default=60, ge=1, le=3600)
 
     # Deterministic hotspot preparation and bounded market-focus cycles.
     hotspot_direct_threshold: float = Field(default=75.0, ge=0, le=100)
     hotspot_conditional_threshold: float = Field(default=60.0, ge=0, le=100)
-    hotspot_gate_version: str = Field(default="hotspot-bootstrap-v1", min_length=1, max_length=100)
+    hotspot_gate_version: str = Field(default="hotspot-gate-v2", min_length=1, max_length=100)
     hotspot_market_data_quality_min: float = Field(default=0.6, ge=0, le=1)
     hot_cycle_enabled: bool = False
     hot_cycle_schedule_enabled: bool = False
     hot_cycle_times_et: str = "08:00,12:00,16:00"
     hot_cycle_optional_20_et: bool = False
-    hot_cycle_manual_enabled: bool = True
+    hot_cycle_manual_enabled: bool = False
     hot_cycle_manual_cooldown_seconds: int = Field(default=900, ge=0, le=86400)
     hot_cycle_max_events: int = Field(default=8, ge=1, le=20)
     hot_cycle_max_focus_symbols: int = Field(default=20, ge=1, le=40)
@@ -189,6 +202,12 @@ class Settings(BaseSettings):
     analysis_cycle_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
     calendar_revision_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
     integration_change_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    hotspot_preparation_retention_days: int = Field(default=90, ge=1, le=3650)
+    market_focus_completed_retention_days: int = Field(default=365, ge=1, le=3650)
+    market_focus_failed_retention_days: int = Field(default=30, ge=1, le=3650)
+    event_member_retention_days: int = Field(default=90, ge=1, le=3650)
+    projection_retry_retention_days: int = Field(default=30, ge=1, le=3650)
+    projection_retry_max_attempts: int = Field(default=6, ge=1, le=100)
     retention_batch_size: int = Field(default=500, ge=1, le=10000)
 
     @field_validator(
@@ -315,8 +334,19 @@ class Settings(BaseSettings):
                 or focus.password
                 or focus.query
                 or focus.fragment
+                or focus.params
+                or focus.path not in {"", "/"}
             ):
                 raise ValueError("OPTION_PRO_FOCUS_BASE_URL must be an HTTPS origin without credentials, query, or fragment")
+            if not self.option_pro_focus_verify_tls:
+                raise ValueError("OPTION_PRO_FOCUS_VERIFY_TLS must remain enabled")
+            if self.option_pro_focus_timeout_seconds < max(
+                self.option_pro_focus_connect_timeout_seconds,
+                self.option_pro_focus_read_timeout_seconds,
+            ):
+                raise ValueError(
+                    "OPTION_PRO_FOCUS_TIMEOUT_SECONDS must cover connect and read timeouts"
+                )
         return self
 
     @property
@@ -324,6 +354,17 @@ class Settings(BaseSettings):
         if not self.news_llm_auto_analyze_enabled:
             return "disabled"
         if self.news_llm_daily_job_limit is None or self.news_llm_daily_output_token_limit is None:
+            return "budget_configuration_required"
+        return "enabled"
+
+    @property
+    def manual_news_analysis_capability(self) -> str:
+        if not self.news_llm_manual_enabled:
+            return "disabled"
+        if (
+            self.news_llm_manual_daily_job_limit is None
+            or self.news_llm_manual_daily_output_token_limit is None
+        ):
             return "budget_configuration_required"
         return "enabled"
 

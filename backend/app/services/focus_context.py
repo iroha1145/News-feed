@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import secrets
+import socket
+import ssl
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional, Union
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 import aiosqlite
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 
 from app.config import settings
 from app.integrations.option_pro.auth import (
@@ -26,34 +39,67 @@ from app.models.database import get_db
 
 
 FOCUS_CONTEXT_PATH = "/api/integrations/macrolens/v1/focus-context"
-FOCUS_SCHEMA_VERSION = "option-pro-macrolens-focus-v1"
-FOCUS_SCHEMA_SHA256 = "43e3e90b8436cc4dff54262222ec3bf4655c2357273cd01ba2f5a3305a889a19"
+FOCUS_SCHEMA_VERSION = "option-pro-macrolens-focus-v2"
+FOCUS_SCHEMA_SHA256 = "fbc646433375bc5657ec1dcaf0f980c14191390dabe8468129fdf71f78d5cade"
+
+logger = logging.getLogger(__name__)
+
+
+class FocusClientError(RuntimeError):
+    """A redacted failure safe to expose in worker logs and health details."""
+
+    def __init__(self, category: str, *, retryable: bool = False) -> None:
+        self.category = category
+        self.retryable = retryable
+        super().__init__(f"focus_context_{category}")
+
+
+@dataclass
+class _CircuitState:
+    failures: int = 0
+    opened_at: float | None = None
+
+
+_CIRCUIT_LOCK = threading.Lock()
+_CIRCUITS: dict[str, _CircuitState] = {}
 
 
 class FocusSymbol(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
     ticker: str = Field(pattern=r"^[A-Z0-9][A-Z0-9.^/_-]{0,19}$")
     validation_status: Literal["canonical", "valid_external", "unverified"]
     universe_reasons: list[str] = Field(min_length=1, max_length=12)
     dollar_volume_rank: Optional[int] = Field(default=None, ge=1)
+    dollar_volume: Optional[float] = Field(default=None, ge=0)
+    dollar_volume_basis: Literal[
+        "intraday_completed_bars",
+        "previous_complete_session",
+        "adv20_completed_sessions",
+        "unavailable",
+    ] = "unavailable"
     session_change_pct: Optional[float] = None
     rvol_time_of_day: Optional[float] = Field(default=None, ge=0)
     breakout_state: Optional[str] = Field(default=None, max_length=60)
     sector_id: Optional[str] = Field(default=None, max_length=120)
-    as_of: datetime
+    as_of: AwareDatetime
+    data_through: Optional[AwareDatetime] = None
     data_quality: Optional[float] = Field(default=None, ge=0, le=1)
     data_status: Literal["active", "stale"] = "active"
+    source_status: Literal[
+        "active", "degraded", "fallback", "unavailable", "stale"
+    ] = "unavailable"
+    data_source: Optional[str] = Field(default=None, max_length=80)
 
 
 class FocusContext(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
-    schema_version: Literal["option-pro-macrolens-focus-v1"] = FOCUS_SCHEMA_VERSION
+    schema_version: Literal["option-pro-macrolens-focus-v2"] = FOCUS_SCHEMA_VERSION
     schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     revision: int = Field(ge=1)
-    as_of: datetime
-    data_through: Optional[datetime] = None
+    as_of: AwareDatetime
+    data_through: Optional[AwareDatetime] = None
     market_session: Literal["premarket", "regular", "after_hours", "closed", "unknown"]
     universe_version: str = Field(min_length=1, max_length=200)
     symbols: list[FocusSymbol] = Field(default_factory=list, max_length=200)
@@ -103,6 +149,200 @@ def _signed_headers(*, timestamp: int | None = None, nonce: str | None = None) -
     }
 
 
+def _focus_origin() -> str:
+    # Settings validation guarantees that this is a credential-free HTTPS
+    # origin. Keeping URL construction here prevents redirects or request data
+    # from changing the configured destination.
+    return settings.option_pro_focus_base_url.rstrip("/")
+
+
+def _tls_context() -> ssl.SSLContext:
+    if not settings.option_pro_focus_verify_tls:
+        raise FocusClientError("tls_configuration")
+    try:
+        return ssl.create_default_context(
+            cafile=settings.option_pro_focus_ca_bundle or None
+        )
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        raise FocusClientError("tls_configuration") from None
+
+
+def _create_focus_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=_focus_origin(),
+        timeout=httpx.Timeout(
+            connect=settings.option_pro_focus_connect_timeout_seconds,
+            read=settings.option_pro_focus_read_timeout_seconds,
+            write=settings.option_pro_focus_connect_timeout_seconds,
+            pool=settings.option_pro_focus_connect_timeout_seconds,
+        ),
+        verify=_tls_context(),
+        trust_env=False,
+        follow_redirects=False,
+    )
+
+
+def _exception_chain_contains(exc: BaseException, kind: type[BaseException]) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, kind):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _transport_error(exc: BaseException) -> FocusClientError:
+    if _exception_chain_contains(exc, ssl.SSLError):
+        return FocusClientError("tls", retryable=True)
+    if _exception_chain_contains(exc, socket.gaierror):
+        return FocusClientError("dns", retryable=True)
+    if isinstance(exc, httpx.TimeoutException):
+        return FocusClientError("timeout", retryable=True)
+    if isinstance(exc, httpx.ConnectError):
+        return FocusClientError("connect", retryable=True)
+    if isinstance(exc, httpx.RequestError):
+        return FocusClientError("transport", retryable=True)
+    return FocusClientError("transport")
+
+
+def _status_error(status_code: int) -> FocusClientError | None:
+    if 300 <= status_code < 400:
+        return FocusClientError("redirect")
+    if status_code == 401:
+        return FocusClientError("auth_401")
+    if status_code == 403:
+        return FocusClientError("auth_403")
+    if status_code == 429:
+        return FocusClientError("rate_limited", retryable=True)
+    if 500 <= status_code < 600:
+        return FocusClientError("upstream_5xx", retryable=True)
+    if status_code != 200:
+        return FocusClientError("http_4xx")
+    return None
+
+
+async def _read_focus_response(
+    client: httpx.AsyncClient,
+) -> bytes:
+    timeout = httpx.Timeout(
+        connect=settings.option_pro_focus_connect_timeout_seconds,
+        read=settings.option_pro_focus_read_timeout_seconds,
+        write=settings.option_pro_focus_connect_timeout_seconds,
+        pool=settings.option_pro_focus_connect_timeout_seconds,
+    )
+    try:
+        async with client.stream(
+            "GET",
+            f"{_focus_origin()}{FOCUS_CONTEXT_PATH}",
+            headers=_signed_headers(),
+            timeout=timeout,
+            follow_redirects=False,
+        ) as response:
+            if error := _status_error(response.status_code):
+                raise error
+            media_type = response.headers.get("content-type", "").split(";", 1)[0]
+            if media_type.strip().lower() != "application/json":
+                raise FocusClientError("content_type")
+            content_length = response.headers.get("content-length")
+            if content_length:
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    raise FocusClientError("content_length") from None
+                if declared_length < 0:
+                    raise FocusClientError("content_length")
+                if declared_length > settings.option_pro_focus_max_response_bytes:
+                    raise FocusClientError("oversized_response")
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > settings.option_pro_focus_max_response_bytes:
+                    raise FocusClientError("oversized_response")
+            return bytes(body)
+    except FocusClientError:
+        raise
+    except (httpx.RequestError, httpx.TimeoutException) as exc:
+        raise _transport_error(exc) from None
+
+
+async def _fetch_focus_context(
+    client: httpx.AsyncClient,
+    *,
+    sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> FocusContext:
+    async def attempts() -> FocusContext:
+        last_error: FocusClientError | None = None
+        for attempt in range(1, settings.option_pro_focus_max_attempts + 1):
+            try:
+                body = await _read_focus_response(client)
+                try:
+                    return FocusContext.model_validate_json(body)
+                except (ValidationError, ValueError):
+                    raise FocusClientError("schema") from None
+            except FocusClientError as exc:
+                last_error = exc
+                if (
+                    not exc.retryable
+                    or attempt >= settings.option_pro_focus_max_attempts
+                ):
+                    raise
+                logger.warning(
+                    "focus_context_pull_retry category=%s attempt=%d",
+                    exc.category,
+                    attempt,
+                )
+                delay = settings.option_pro_focus_retry_backoff_seconds * (
+                    2 ** (attempt - 1)
+                )
+                if delay:
+                    await sleeper(delay)
+        raise last_error or FocusClientError("transport")
+
+    try:
+        return await asyncio.wait_for(
+            attempts(),
+            timeout=settings.option_pro_focus_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise FocusClientError("total_timeout", retryable=True) from None
+
+
+def _circuit_permits(origin: str, *, now: float | None = None) -> bool:
+    observed = time.monotonic() if now is None else now
+    with _CIRCUIT_LOCK:
+        state = _CIRCUITS.get(origin)
+        if state is None or state.opened_at is None:
+            return True
+        if observed - state.opened_at < settings.option_pro_focus_circuit_reset_seconds:
+            return False
+        state.failures = 0
+        state.opened_at = None
+        return True
+
+
+def _record_circuit_failure(origin: str, *, now: float | None = None) -> None:
+    observed = time.monotonic() if now is None else now
+    with _CIRCUIT_LOCK:
+        state = _CIRCUITS.setdefault(origin, _CircuitState())
+        state.failures += 1
+        if state.failures >= settings.option_pro_focus_circuit_failure_threshold:
+            state.opened_at = observed
+
+
+def _record_circuit_success(origin: str) -> None:
+    with _CIRCUIT_LOCK:
+        _CIRCUITS.pop(origin, None)
+
+
+def _reset_focus_circuits() -> None:
+    """Reset process state for isolated tests."""
+
+    with _CIRCUIT_LOCK:
+        _CIRCUITS.clear()
+
+
 async def latest_focus_context(db: aiosqlite.Connection) -> dict[str, Any] | None:
     async with db.execute(
         "SELECT * FROM focus_context_snapshots ORDER BY revision DESC LIMIT 1"
@@ -132,6 +372,7 @@ async def persist_focus_context(
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     now = (fetched_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    inserted = False
     await db.execute("BEGIN IMMEDIATE")
     try:
         async with db.execute(
@@ -149,33 +390,50 @@ async def persist_focus_context(
                 (now, context.revision),
             )
             await db.commit()
-            return False
-        await db.execute("UPDATE focus_context_snapshots SET status='stale' WHERE status='current'")
-        await db.execute(
-            """INSERT INTO focus_context_snapshots
-               (revision,schema_version,as_of,data_through,market_session,universe_version,
-                payload_json,payload_hash,status,fetched_at,created_at)
-               VALUES (?,?,?,?,?,?,?,?,'current',?,?)""",
-            (
-                context.revision,
-                context.schema_version,
-                context.as_of.astimezone(timezone.utc).isoformat(),
-                context.data_through.astimezone(timezone.utc).isoformat()
-                if context.data_through
-                else None,
-                context.market_session,
-                context.universe_version,
-                encoded,
-                digest,
-                now,
-                now,
-            ),
-        )
-        await db.commit()
-        return True
+        else:
+            await db.execute("UPDATE focus_context_snapshots SET status='stale' WHERE status='current'")
+            await db.execute(
+                """INSERT INTO focus_context_snapshots
+                   (revision,schema_version,as_of,data_through,market_session,universe_version,
+                    payload_json,payload_hash,status,fetched_at,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,'current',?,?)""",
+                (
+                    context.revision,
+                    context.schema_version,
+                    context.as_of.astimezone(timezone.utc).isoformat(),
+                    context.data_through.astimezone(timezone.utc).isoformat()
+                    if context.data_through
+                    else None,
+                    context.market_session,
+                    context.universe_version,
+                    encoded,
+                    digest,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+            inserted = True
     except Exception:
         await db.rollback()
         raise
+    # Event and model-association revalidation may touch many historical rows.
+    # It runs only after the small snapshot transaction has released its write
+    # lock, and commits bounded batches inside the service.
+    try:
+        from app.services.market_focus import revalidate_events_for_focus_context
+
+        await revalidate_events_for_focus_context(db, payload)
+    except Exception as exc:
+        await db.rollback()
+        await db.execute(
+            "UPDATE focus_context_snapshots SET status='stale' WHERE revision=?",
+            (context.revision,),
+        )
+        await db.commit()
+        logger.exception("Focus context persisted but association revalidation failed")
+        raise RuntimeError("focus_association_revalidation_failed") from exc
+    return inserted
 
 
 async def pull_focus_context(*, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
@@ -184,26 +442,29 @@ async def pull_focus_context(*, client: httpx.AsyncClient | None = None) -> dict
     if focus_capability() != "enabled":
         return {"status": "not_configured", "updated": False}
     owned = client is None
-    if client is None:
-        verify: Union[bool, str] = settings.option_pro_focus_verify_tls
-        if settings.option_pro_focus_ca_bundle:
-            verify = settings.option_pro_focus_ca_bundle
-        client = httpx.AsyncClient(
-            base_url=settings.option_pro_focus_base_url.rstrip("/"),
-            timeout=settings.option_pro_focus_timeout_seconds,
-            verify=verify,
-        )
+    origin = _focus_origin()
     db = await get_db()
     try:
-        response = await client.get(FOCUS_CONTEXT_PATH, headers=_signed_headers())
-        response.raise_for_status()
-        context = FocusContext.model_validate_json(response.content)
-        changed = await persist_focus_context(db, context)
+        try:
+            if not _circuit_permits(origin):
+                raise FocusClientError("circuit_open")
+            if client is None:
+                client = _create_focus_client()
+            context = await _fetch_focus_context(client)
+        except FocusClientError as exc:
+            if exc.category != "circuit_open":
+                _record_circuit_failure(origin)
+            await mark_focus_context_stale(db)
+            logger.error("focus_context_pull_failed category=%s", exc.category)
+            raise
+        _record_circuit_success(origin)
+        try:
+            changed = await persist_focus_context(db, context)
+        except Exception:
+            await mark_focus_context_stale(db)
+            raise
         return {"status": "ok", "updated": changed, "revision": context.revision}
-    except Exception:
-        await mark_focus_context_stale(db)
-        raise
     finally:
         await db.close()
-        if owned:
+        if owned and client is not None:
             await client.aclose()

@@ -1,7 +1,9 @@
-# Catalyst Integration v1 契约
+# Catalyst Integration v2 契约
 
 路径前缀：/api/integrations/option-pro/v1  
-契约文件：contracts/macrolens-option-pro-v1.json  
+当前契约文件：contracts/macrolens-option-pro-v2.json
+
+保留的旧版契约：contracts/macrolens-option-pro-v1.json
 所有模型 extra=forbid、allow_inf_nan=false，时间带时区并统一为 UTC。
 
 ## 端点
@@ -27,13 +29,15 @@ GET /feed 支持 as_of、window_hours、limit、cursor、source、classification
 
 ## Health 与来源状态
 
-GET /health 的 sources 每项固定包含 status、last_attempt_at、last_success_at、data_through、consecutive_failures、next_attempt_at、raw_count、inserted_count、duplicates_count 和 detail。计数字段表示最近一次真实抓取；disabled、not_configured 或从未尝试时为 null，不用 0 假装已执行。
+GET /health 的 sources 每项固定包含 status、last_attempt_at、last_success_at、data_through、consecutive_failures、next_attempt_at、raw_count、inserted_count、duplicates_count、source_fetch_status、news_persistence_status、event_projection_status 和 detail。计数字段表示最近一次真实抓取；disabled、not_configured 或从未尝试时为 null，不用 0 假装已执行。本地事件投影失败只会把 event_projection_status 标为 degraded，并进入持久重试队列，不会增加远端来源失败次数或推迟下一次抓取。
 
 ## 单股与批量
 
 GET /catalysts/{ticker} 支持 as_of、window_hours、limit、cursor、min_confidence 和 include_neutral。
 
 POST /catalysts/batch 最多 50 个股票代码，整批共用 as_of，每只股票返回独立 active、empty、stale 或 unavailable 状态。批量查询是只读操作，使用 read key。
+
+模型产生的股票代码使用 canonical、valid_external、ambiguous、invalid、unverified 验证状态。公开分析通过 `stock_validations` 返回代码、状态、验证时间、焦点版本、股票池版本和 `llm_inference` 关联方式。按股票聚合、热点准备和股票影响榜只读取 canonical 与 valid_external；ambiguous 和 unverified 只保留在单篇分析详情，invalid 只增加安全计数，不保存非法原文。
 
 ## 增量同步
 

@@ -39,6 +39,14 @@ HARD_EVENT_TYPES = {
     "clinical_regulatory", "regulatory_trade", "cyber_operational", "executive_departure",
     "major_litigation", "macro_release", "geopolitical_policy",
 }
+LOW_SEVERITY_EVENT_TYPES = {
+    "analyst_action",
+    "ordinary_price_target",
+    "market_commentary",
+    "market_recap",
+    "opinion",
+    "promotional",
+}
 SEVERITY_BY_EVENT = {
     "earnings_guidance": 82.0,
     "merger_acquisition": 92.0,
@@ -52,7 +60,11 @@ SEVERITY_BY_EVENT = {
     "macro_release": 92.0,
     "geopolitical_policy": 92.0,
     "analyst_action": 35.0,
+    "ordinary_price_target": 25.0,
     "market_commentary": 20.0,
+    "market_recap": 18.0,
+    "opinion": 15.0,
+    "promotional": 10.0,
     "other": 45.0,
 }
 SOURCE_QUALITY = {
@@ -124,33 +136,57 @@ def validate_ticker_association(
     *,
     association_method: str,
     focus_symbols: set[str],
+    trusted_external_symbols: set[str] | None = None,
 ) -> str:
     ticker = normalize_ticker(ticker)
     if not ticker or association_method not in VALID_ASSOCIATION_METHODS:
         return "invalid"
+    trusted_external_symbols = trusted_external_symbols or set()
     trusted_native = association_method in {"provider_tag", "company_endpoint"}
-    if ticker in AMBIGUOUS_TICKERS and not trusted_native and ticker not in focus_symbols:
-        return "ambiguous"
     if ticker in focus_symbols:
         return "canonical"
-    if trusted_native:
+    if ticker in trusted_external_symbols or trusted_native:
         return "valid_external"
+    if ticker in AMBIGUOUS_TICKERS:
+        return "ambiguous"
     return "unverified"
 
 
-async def _focus_payload(db: aiosqlite.Connection) -> tuple[dict[str, Any] | None, set[str]]:
+def _focus_symbol_sets(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Return trusted canonical and external symbols without promoting unknown rows."""
+
+    canonical: set[str] = set()
+    valid_external: set[str] = set()
+    for item in payload.get("symbols", []):
+        if not isinstance(item, dict):
+            continue
+        ticker = normalize_ticker(item.get("ticker"))
+        if not ticker:
+            continue
+        validation_status = str(item.get("validation_status") or "unverified")
+        if validation_status == "canonical":
+            canonical.add(ticker)
+        elif validation_status == "valid_external":
+            valid_external.add(ticker)
+    # The focus contract reserves this list for canonical market benchmarks.
+    canonical.update(
+        ticker
+        for value in payload.get("major_market_symbols", [])
+        if (ticker := normalize_ticker(value))
+    )
+    valid_external.difference_update(canonical)
+    return canonical, valid_external
+
+
+async def _focus_payload(
+    db: aiosqlite.Connection,
+) -> tuple[dict[str, Any] | None, set[str], set[str]]:
     snapshot = await latest_focus_context(db)
     if not snapshot:
-        return None, set()
+        return None, set(), set()
     payload = snapshot["payload"]
-    tickers = {
-        ticker
-        for item in payload.get("symbols", [])
-        if isinstance(item, dict) and (ticker := normalize_ticker(item.get("ticker")))
-    }
-    tickers.update(normalize_ticker(item) for item in payload.get("major_market_symbols", []))
-    tickers.discard("")
-    return payload, tickers
+    canonical, valid_external = _focus_symbol_sets(payload)
+    return payload, canonical, valid_external
 
 
 async def record_ticker_mentions(
@@ -160,14 +196,21 @@ async def record_ticker_mentions(
     tickers: list[str],
     association_method: str,
     source: str,
+    trusted_external_symbols: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    focus, focus_symbols = await _focus_payload(db)
+    focus, focus_symbols, focus_external_symbols = await _focus_payload(db)
+    trusted_external_symbols = (
+        set(trusted_external_symbols or set()) | focus_external_symbols
+    )
     now = utc_text()
     rows: list[dict[str, Any]] = []
     for raw in tickers:
         ticker = normalize_ticker(raw)
         state = validate_ticker_association(
-            ticker, association_method=association_method, focus_symbols=focus_symbols
+            ticker,
+            association_method=association_method,
+            focus_symbols=focus_symbols,
+            trusted_external_symbols=trusted_external_symbols,
         )
         confidence = {
             "company_endpoint": 1.0,
@@ -176,14 +219,26 @@ async def record_ticker_mentions(
             "event_propagation": 0.7,
             "llm_inference": 0.5,
         }.get(association_method, 0.0)
+        if state == "invalid":
+            await db.execute(
+                """INSERT INTO projection_safety_counters(counter_key,count,updated_at)
+                   VALUES ('invalid_ticker_association',1,?)
+                   ON CONFLICT(counter_key) DO UPDATE SET
+                     count=projection_safety_counters.count+1,
+                     updated_at=excluded.updated_at""",
+                (now,),
+            )
+            rows.append(
+                {"ticker": "", "validation_status": state, "association_confidence": 0.0}
+            )
+            continue
         await db.execute(
             """INSERT INTO news_ticker_mentions
                (news_id,ticker,association_method,association_confidence,validation_status,
                 validated_at,focus_revision,universe_version,source,created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
-                news_id, ticker or str(raw)[:20], association_method, confidence, state,
-                now if state != "unverified" else None,
+                news_id, ticker, association_method, confidence, state, now,
                 focus.get("revision") if focus else None,
                 focus.get("universe_version") if focus else None,
                 str(source)[:200], now,
@@ -195,6 +250,20 @@ async def record_ticker_mentions(
 
 def classify_event_type(title: str, summary: str | None = None) -> str:
     text = f"{title} {summary or ''}".lower()
+    low_severity_rules = (
+        ("ordinary_price_target", ("price target", "target price", "目标价")),
+        ("analyst_action", ("upgrade", "downgrade", "initiates coverage", "outperform", "underperform", "评级")),
+        ("market_recap", ("market recap", "closing bell", "markets today", "市场复盘")),
+        ("market_commentary", ("stocks today", "what to watch", "market outlook", "市场评论")),
+        ("opinion", ("opinion:", "column:", "why i think", "观点")),
+        ("promotional", ("sponsored", "advertorial", "paid promotion", "推广")),
+    )
+    # A headline explicitly framed as analyst/editorial content remains low
+    # severity even when its body mentions earnings or another harder topic.
+    padded_title = f" {title.lower()} "
+    for event_type, terms in low_severity_rules:
+        if any(term in padded_title for term in terms):
+            return event_type
     rules = (
         ("bankruptcy_default", ("bankrupt", "chapter 11", "default on", "破产", "违约")),
         ("merger_acquisition", ("acquire", "acquisition", "merger", "takeover", "buyout", "并购", "收购", "私有化")),
@@ -207,11 +276,12 @@ def classify_event_type(title: str, summary: str | None = None) -> str:
         ("macro_release", ("fomc", "consumer price index", " cpi ", "nonfarm payroll", "非农", "美联储")),
         ("regulatory_trade", ("sanction", "export restriction", "antitrust", "regulator", "制裁", "出口限制", "监管")),
         ("geopolitical_policy", ("war", "tariff", "ceasefire", "invasion", "战争", "关税", "政策")),
-        ("analyst_action", ("price target", "upgrade", "downgrade", "目标价", "评级")),
-        ("market_commentary", ("market recap", "stocks today", "what to watch", "市场复盘")),
     )
     padded = f" {text} "
     for event_type, terms in rules:
+        if any(term in padded for term in terms):
+            return event_type
+    for event_type, terms in low_severity_rules:
         if any(term in padded for term in terms):
             return event_type
     return "other"
@@ -233,6 +303,46 @@ def calculate_hot_score(components: dict[str, float | None]) -> HotScore:
     return HotScore(round(score, 4), {key: components.get(key) for key in HOT_WEIGHTS}, normalized)
 
 
+def calculate_weighted_catalyst_context(
+    assessment: dict[str, Any],
+    event_weights: dict[str, float],
+) -> dict[str, float | None]:
+    """Apply conflict only as a reliability discount, never as positive evidence."""
+
+    supporting_ids = list(dict.fromkeys(assessment.get("supporting_event_ids") or []))
+    conflicting_ids = list(dict.fromkeys(assessment.get("conflicting_event_ids") or []))
+    supporting_weight = sum(max(0.0, event_weights.get(event_id, 0.0)) for event_id in supporting_ids)
+    conflicting_weight = sum(max(0.0, event_weights.get(event_id, 0.0)) for event_id in conflicting_ids)
+    total_weight = supporting_weight + conflicting_weight
+    conflict_ratio = conflicting_weight / total_weight if total_weight > 0 else 0.0
+    effective_reliability = (
+        max(0.0, 1.0 - conflict_ratio) if supporting_weight > 0 else 0.0
+    )
+    weighted: float | None = None
+    if (
+        not assessment.get("insufficient_evidence")
+        and assessment.get("catalyst_bias") is not None
+        and supporting_weight > 0
+        and total_weight > 0
+    ):
+        weighted = max(
+            -100.0,
+            min(
+                100.0,
+                float(assessment["catalyst_bias"])
+                * (float(assessment.get("confidence") or 0.0) / 100.0)
+                * effective_reliability,
+            ),
+        )
+    return {
+        "supporting_weight": round(supporting_weight, 4),
+        "conflicting_weight": round(conflicting_weight, 4),
+        "conflict_ratio": round(conflict_ratio, 6),
+        "effective_reliability": round(effective_reliability, 6),
+        "weighted_catalyst_context": round(weighted, 4) if weighted is not None else None,
+    }
+
+
 def hotspot_qualifies(
     hot_score: float,
     *,
@@ -242,6 +352,11 @@ def hotspot_qualifies(
     market_confirmation: float | None,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
+    if event_type in LOW_SEVERITY_EVENT_TYPES:
+        if source_count < 2 or market_confirmation is None or market_confirmation < 70:
+            return False, reasons
+        reasons.extend(("independent_sources", "material_market_confirmation"))
+        return hot_score >= settings.hotspot_conditional_threshold, reasons
     if hot_score >= settings.hotspot_direct_threshold:
         reasons.append("score_at_or_above_direct_threshold")
         return True, reasons
@@ -288,11 +403,173 @@ def _source_quality(names: list[str]) -> float:
     return round(max(values) * 100, 4)
 
 
-def _source_identity(value: str) -> str:
+def normalize_source_identity(value: str) -> str:
     normalized = " ".join(str(value or "unknown").strip().lower().split())
+    normalized = normalized.replace("_breaking", "/breaking").replace("_daily", "/daily")
+    if normalized.startswith("seekingalpha/") or normalized == "seekingalpha":
+        return "seekingalpha"
     if "/" in normalized:
-        normalized = normalized.rsplit("/", 1)[-1]
+        adapter, publisher = normalized.split("/", 1)
+        publisher = publisher.strip()
+        if publisher and publisher not in {"unknown", "general", "news"}:
+            normalized = publisher
+        else:
+            normalized = adapter
     return normalized or "unknown"
+
+
+def _important_numbers(text: str) -> list[str]:
+    return sorted(
+        {
+            value.lower().replace(",", "")
+            for value in re.findall(
+                r"(?<![A-Za-z0-9])(?:[$€£]?\d[\d,]*(?:\.\d+)?%?|\d+(?:\.\d+)?x)(?![A-Za-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            )
+        }
+    )
+
+
+def event_evidence_fingerprint(
+    *,
+    title: str,
+    summary: str | None,
+    event_type: str,
+    validated_tickers: set[str],
+) -> str:
+    """Hash stable facts, not adapter identity or URL, for syndication-safe updates."""
+
+    summary_text = normalize_title(str(summary or ""))
+    title_terms = sorted(_topic_terms(title))
+    summary_terms = sorted(
+        term for term in summary_text.split() if len(term) >= 3 and term not in _TOPIC_STOP
+    )
+    payload = {
+        "event_type": event_type,
+        "tickers": sorted(validated_tickers),
+        "numbers": _important_numbers(f"{title} {summary or ''}"),
+        "facts": summary_terms[:80] if summary_terms else title_terms[:40],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+async def event_group_evidence_state(
+    db: aiosqlite.Connection,
+    event_group_id: str,
+) -> dict[str, Any]:
+    async with db.execute(
+        """SELECT publisher_identity,evidence_fingerprint,event_type,
+                  validated_tickers_json,source_tickers_json
+           FROM news_event_members WHERE event_group_id=? ORDER BY id""",
+        (event_group_id,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    publishers = sorted(
+        {
+            normalize_source_identity(str(row[0]))
+            for row in rows
+            if normalize_source_identity(str(row[0])) != "unknown"
+        }
+    )
+    fact_fingerprints = sorted({str(row[1]) for row in rows if row[1]})
+    event_types = [str(row[2] or "other") for row in rows]
+    event_type = next((value for value in reversed(event_types) if value != "other"), "other")
+    validated = sorted(
+        {
+            ticker
+            for row in rows
+            for value in _json_list(row[3])
+            if (ticker := normalize_ticker(value))
+        }
+    )
+    source_tickers = sorted(
+        {
+            ticker
+            for row in rows
+            for value in _json_list(row[4])
+            if (ticker := normalize_ticker(value))
+        }
+    )
+    aggregate = hashlib.sha256(
+        json.dumps(
+            {
+                "publishers": publishers,
+                "facts": fact_fingerprints,
+                "event_type": event_type,
+                "validated_tickers": validated,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    return {
+        "publishers": publishers,
+        "fact_fingerprints": fact_fingerprints,
+        "event_type": event_type,
+        "validated_tickers": validated,
+        "source_tickers": source_tickers,
+        "evidence_fingerprint": aggregate,
+    }
+
+
+# Kept as an internal alias for older imports while callers migrate to the
+# clearer publisher-oriented name.
+_source_identity = normalize_source_identity
+
+
+async def novelty_against_recent_events(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    event_type: str,
+    validated_tickers: set[str],
+    evidence_fingerprint: str,
+    available_at: str,
+    exclude_event_group_id: str | None = None,
+) -> float:
+    available = parse_utc(available_at) or utc_now()
+    cutoff = utc_text(available - timedelta(hours=72))
+    params: list[Any] = [cutoff, utc_text(available)]
+    exclusion = ""
+    if exclude_event_group_id:
+        exclusion = " AND g.event_group_id<>?"
+        params.append(exclude_event_group_id)
+    async with db.execute(
+        """SELECT g.event_group_id,g.representative_title,g.event_type,
+                  g.validated_tickers_json,m.evidence_fingerprint
+           FROM news_event_groups g
+           LEFT JOIN news_event_members m ON m.event_group_id=g.event_group_id
+           WHERE datetime(g.available_at)>=datetime(?)
+             AND datetime(g.available_at)<=datetime(?)"""
+        + exclusion,
+        tuple(params),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        return 85.0
+    score = 85.0
+    incoming_terms = _topic_terms(title)
+    for row in rows:
+        prior_tickers = {
+            ticker for value in _json_list(row[3]) if (ticker := normalize_ticker(value))
+        }
+        same_identity = bool(validated_tickers & prior_tickers) or not (
+            validated_tickers or prior_tickers
+        )
+        if str(row[4] or "") == evidence_fingerprint and same_identity:
+            score = min(score, 20.0)
+            continue
+        prior_terms = _topic_terms(str(row[1]))
+        union = incoming_terms | prior_terms
+        overlap = len(incoming_terms & prior_terms) / len(union) if union else 0.0
+        if str(row[2]) == event_type and same_identity and overlap >= 0.6:
+            score = min(score, 40.0)
+        elif str(row[2]) == event_type and same_identity and overlap >= 0.35:
+            score = min(score, 60.0)
+    return score
 
 
 def _market_confirmation(group: dict[str, Any], focus: dict[str, Any] | None) -> float | None:
@@ -307,8 +584,12 @@ def _market_confirmation(group: dict[str, Any], focus: dict[str, Any] | None) ->
     for item in focus.get("symbols", []):
         if not isinstance(item, dict) or normalize_ticker(item.get("ticker")) not in tickers:
             continue
+        if item.get("validation_status") not in {"canonical", "valid_external"}:
+            continue
         symbol_as_of = parse_utc(item.get("as_of"))
         if not symbol_as_of or symbol_as_of < available or item.get("data_status", "active") != "active":
+            continue
+        if item.get("source_status", "unavailable") in {"unavailable", "stale"}:
             continue
         quality = item.get("data_quality")
         if not isinstance(quality, (int, float)) or quality < settings.hotspot_market_data_quality_min:
@@ -320,7 +601,22 @@ def _market_confirmation(group: dict[str, Any], focus: dict[str, Any] | None) ->
     return max(scores) if scores else None
 
 
-async def _gate_group(db: aiosqlite.Connection, event_group_id: str) -> int | None:
+def _crossed_threshold(
+    previous: float | None,
+    current: float | None,
+    threshold: float,
+) -> bool:
+    if previous is None or current is None:
+        return False
+    return (previous < threshold <= current) or (current < threshold <= previous)
+
+
+async def _gate_group(
+    db: aiosqlite.Connection,
+    event_group_id: str,
+    *,
+    version_already_advanced: bool = False,
+) -> int | None:
     async with db.execute(
         "SELECT * FROM news_event_groups WHERE event_group_id=?", (event_group_id,)
     ) as cursor:
@@ -328,11 +624,17 @@ async def _gate_group(db: aiosqlite.Connection, event_group_id: str) -> int | No
     if row is None:
         return None
     group = dict(row)
-    focus, focus_symbols = await _focus_payload(db)
+    focus, canonical_symbols, external_symbols = await _focus_payload(db)
+    focus_symbols = canonical_symbols | external_symbols
     validated = set(_json_list(group["validated_tickers_json"]))
     focus_relevance = 100.0 if validated & focus_symbols else (65.0 if validated else 45.0 if group["event_type"] in {"macro_release", "geopolitical_policy"} else 0.0)
     source_count = int(group["source_count"])
     confirmation = _market_confirmation(group, focus)
+    prior_confirmation = (
+        float(group["market_confirmation_score"])
+        if group.get("market_confirmation_score") is not None
+        else None
+    )
     components = {
         "severity": SEVERITY_BY_EVENT.get(group["event_type"], 45.0),
         "focus_relevance": focus_relevance,
@@ -342,6 +644,15 @@ async def _gate_group(db: aiosqlite.Connection, event_group_id: str) -> int | No
         "market_confirmation": confirmation,
     }
     score = calculate_hot_score(components)
+    if (
+        str(group["event_type"]) in LOW_SEVERITY_EVENT_TYPES
+        and (confirmation is None or confirmation < 70)
+    ):
+        score = HotScore(
+            min(score.score, max(0.0, settings.hotspot_conditional_threshold - 0.0001)),
+            score.components,
+            score.active_weights,
+        )
     qualifies, reasons = hotspot_qualifies(
         score.score,
         source_count=source_count,
@@ -349,10 +660,51 @@ async def _gate_group(db: aiosqlite.Connection, event_group_id: str) -> int | No
         event_type=str(group["event_type"]),
         market_confirmation=confirmation,
     )
-    await db.execute(
-        "UPDATE news_event_groups SET status=?,updated_at=? WHERE event_group_id=?",
-        ("GATED" if not qualifies else "PREPARED", utc_text(), event_group_id),
+    prior_hot_score = (
+        float(group["last_hot_score"])
+        if group.get("last_hot_score") is not None
+        else None
     )
+    prior_gate_state = str(group.get("status"))
+    has_gate_baseline = (
+        prior_hot_score is not None or prior_gate_state in {"GATED", "PREPARED"}
+    )
+    confirmation_transition = has_gate_baseline and (
+        (prior_confirmation is None) != (confirmation is None)
+        or _crossed_threshold(prior_confirmation, confirmation, 70.0)
+    )
+    score_transition = any(
+        _crossed_threshold(prior_hot_score, score.score, threshold)
+        for threshold in (
+            settings.hotspot_conditional_threshold,
+            settings.hotspot_direct_threshold,
+        )
+    )
+    qualification_transition = (
+        prior_gate_state in {"GATED", "PREPARED"}
+        and (prior_gate_state == "PREPARED") != qualifies
+    )
+    advance_version = bool(
+        not version_already_advanced
+        and (confirmation_transition or score_transition or qualification_transition)
+    )
+    updated_at = utc_text()
+    await db.execute(
+        """UPDATE news_event_groups SET status=?,market_confirmation_score=?,
+           last_hot_score=?,version=version+?,updated_at=? WHERE event_group_id=?""",
+        (
+            "GATED" if not qualifies else "PREPARED",
+            confirmation,
+            score.score,
+            1 if advance_version else 0,
+            updated_at,
+            event_group_id,
+        ),
+    )
+    if advance_version:
+        group["version"] = int(group["version"]) + 1
+    group["market_confirmation_score"] = confirmation
+    group["last_hot_score"] = score.score
     if not qualifies:
         return None
     async with db.execute(
@@ -378,6 +730,7 @@ async def _gate_group(db: aiosqlite.Connection, event_group_id: str) -> int | No
         "source_count": source_count,
         "source_names": _json_list(group["source_names_json"]),
         "validated_tickers": sorted(validated),
+        "evidence_fingerprint": group.get("evidence_fingerprint") or "",
         "hot_score": score.score,
         "component_scores": score.components,
         "active_weights": score.active_weights,
@@ -436,11 +789,16 @@ async def ingest_event_evidence(
     published_at = utc_text(published_dt)
     available_at = utc_text(max(fetched_dt, published_dt))
     source = str(item.get("source") or "unknown")[:200]
+    publisher_identity = normalize_source_identity(source)
+    event_type = classify_event_type(title, item.get("summary"))
     association_method = str(item.get("ticker_association_method") or "provider_tag")
-    raw_tickers = [ticker for value in _json_list(item.get("source_tickers")) if (ticker := normalize_ticker(value))]
+    raw_ticker_values = _json_list(item.get("source_tickers"))
+    raw_tickers = [
+        ticker for value in raw_ticker_values if (ticker := normalize_ticker(value))
+    ]
     if news_id is not None:
         mentions = await record_ticker_mentions(
-            db, news_id=news_id, tickers=raw_tickers,
+            db, news_id=news_id, tickers=raw_ticker_values,
             association_method=association_method, source=source,
         )
         validated = {
@@ -448,12 +806,24 @@ async def ingest_event_evidence(
             if row["validation_status"] in {"canonical", "valid_external"}
         }
     else:
-        _, focus_symbols = await _focus_payload(db)
+        _, focus_symbols, focus_external_symbols = await _focus_payload(db)
         validated = {
             ticker for ticker in raw_tickers
-            if validate_ticker_association(ticker, association_method=association_method, focus_symbols=focus_symbols)
+            if validate_ticker_association(
+                ticker,
+                association_method=association_method,
+                focus_symbols=focus_symbols,
+                trusted_external_symbols=focus_external_symbols,
+            )
             in {"canonical", "valid_external"}
         }
+    item_fingerprint = event_evidence_fingerprint(
+        title=title,
+        summary=str(item.get("summary") or ""),
+        event_type=event_type,
+        validated_tickers=validated,
+    )
+    normalized_item_url = normalize_url(str(item.get("url") or ""))
     cutoff = utc_text((parse_utc(available_at) or utc_now()) - timedelta(hours=24))
     upper = utc_text((parse_utc(available_at) or utc_now()) + timedelta(hours=24))
     async with db.execute(
@@ -462,7 +832,34 @@ async def ingest_event_evidence(
         (cutoff, upper),
     ) as cursor:
         candidates = [dict(row) for row in await cursor.fetchall()]
-    group = next(
+    direct_group: dict[str, Any] | None = None
+    if news_id is not None:
+        async with db.execute(
+            """SELECT g.* FROM news_event_groups g
+               JOIN news_event_members m ON m.event_group_id=g.event_group_id
+               WHERE m.news_id=? ORDER BY m.id DESC LIMIT 1""",
+            (news_id,),
+        ) as direct_cursor:
+            direct_row = await direct_cursor.fetchone()
+        if direct_row is not None:
+            direct_group = dict(direct_row)
+    if direct_group is None and normalized_item_url:
+        async with db.execute(
+            """SELECT g.*,m.title AS prior_member_title FROM news_event_groups g
+               JOIN news_event_members m ON m.event_group_id=g.event_group_id
+               WHERE m.normalized_url=? AND datetime(g.available_at)>=datetime(?)
+                 AND datetime(g.available_at)<=datetime(?)
+               ORDER BY m.id DESC LIMIT 1""",
+            (normalized_item_url, cutoff, upper),
+        ) as direct_cursor:
+            direct_row = await direct_cursor.fetchone()
+        if direct_row is not None and similar_titles(
+            normalize_title(title),
+            normalize_title(str(direct_row["prior_member_title"])),
+            threshold=0.98,
+        ):
+            direct_group = dict(direct_row)
+    group = direct_group or next(
         (
             candidate for candidate in candidates
             if _event_matches(
@@ -473,6 +870,8 @@ async def ingest_event_evidence(
         None,
     )
     now = utc_text()
+    prior_fact_fingerprints: set[str] = set()
+    prior_group_fingerprint = ""
     if group is None:
         event_group_id = f"evg_{uuid.uuid4().hex}"
         await db.execute(
@@ -480,55 +879,73 @@ async def ingest_event_evidence(
                (event_group_id,representative_news_id,representative_title,event_type,
                 first_published_at,last_published_at,first_fetched_at,last_fetched_at,
                 available_at,member_count,source_count,source_names_json,source_tickers_json,
-                validated_tickers_json,novelty_score,status,version,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,0,0,?,?,?,?, 'CLUSTERED',1,?,?)""",
+                validated_tickers_json,novelty_score,evidence_fingerprint,status,version,
+                created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,'CLUSTERED',1,?,?)""",
             (
-                event_group_id, news_id, title, classify_event_type(title, item.get("summary")),
+                event_group_id, news_id, title, event_type,
                 published_at, published_at, fetched_at, fetched_at, available_at,
-                json.dumps([source]), json.dumps(raw_tickers), json.dumps(sorted(validated)),
-                100.0, now, now,
+                json.dumps([publisher_identity]), json.dumps(raw_tickers),
+                json.dumps(sorted(validated)), 85.0, "", now, now,
             ),
         )
     else:
         event_group_id = str(group["event_group_id"])
-    content_hash = str(item.get("content_hash") or hashlib.sha256(f"{source}\n{title}\n{published_at}".encode()).hexdigest())
-    material_update = False
-    if group is not None:
+        prior_group_fingerprint = str(group.get("evidence_fingerprint") or "")
         async with db.execute(
-            """SELECT 1 FROM news_event_members
-               WHERE event_group_id=? AND source=? AND content_hash<>? LIMIT 1""",
-            (event_group_id, source, content_hash),
+            "SELECT DISTINCT evidence_fingerprint FROM news_event_members WHERE event_group_id=?",
+            (event_group_id,),
         ) as prior_cursor:
-            material_update = await prior_cursor.fetchone() is not None
+            prior_fact_fingerprints = {
+                str(row[0]) for row in await prior_cursor.fetchall() if row[0]
+            }
+    source_content_hash = str(
+        item.get("content_hash")
+        or hashlib.sha256(f"{source}\n{title}\n{published_at}".encode()).hexdigest()
+    )
+    # The upstream article hash may ignore summary corrections.  Couple it to
+    # the stable fact fingerprint so a changed number or fact becomes a new
+    # immutable member while an exact replay remains idempotent.
+    content_hash = hashlib.sha256(
+        f"{source_content_hash}\n{item_fingerprint}".encode()
+    ).hexdigest()
     cursor = await db.execute(
         """INSERT OR IGNORE INTO news_event_members
            (event_group_id,news_id,source,normalized_url,title,published_at,fetched_at,
-            source_tickers_json,content_hash,created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            source_tickers_json,validated_tickers_json,publisher_identity,event_type,
+            evidence_fingerprint,content_hash,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            event_group_id, news_id, source, normalize_url(str(item.get("url") or "")),
-            title, published_at, fetched_at, json.dumps(raw_tickers), content_hash, now,
+            event_group_id, news_id, source, normalized_item_url,
+            title, published_at, fetched_at, json.dumps(raw_tickers),
+            json.dumps(sorted(validated)), publisher_identity, event_type,
+            item_fingerprint, content_hash, now,
         ),
     )
     if cursor.rowcount:
-        async with db.execute(
-            "SELECT DISTINCT source FROM news_event_members WHERE event_group_id=?",
-            (event_group_id,),
-        ) as sources_cursor:
-            sources = sorted({_source_identity(str(row[0])) for row in await sources_cursor.fetchall()})
-        async with db.execute(
-            "SELECT source_tickers_json FROM news_event_members WHERE event_group_id=?",
-            (event_group_id,),
-        ) as ticker_cursor:
-            ticker_rows = await ticker_cursor.fetchall()
-        all_tickers = sorted({normalize_ticker(t) for row in ticker_rows for t in _json_list(row[0]) if normalize_ticker(t)})
-        async with db.execute(
-            """SELECT DISTINCT m.ticker FROM news_ticker_mentions m
-               JOIN news_event_members em ON em.news_id=m.news_id
-               WHERE em.event_group_id=? AND m.validation_status IN ('canonical','valid_external')""",
-            (event_group_id,),
-        ) as validated_cursor:
-            all_validated = sorted(str(row[0]) for row in await validated_cursor.fetchall())
+        state = await event_group_evidence_state(db, event_group_id)
+        material_update = bool(
+            group is not None
+            and prior_group_fingerprint
+            and state["evidence_fingerprint"] != prior_group_fingerprint
+        )
+        recent_novelty = await novelty_against_recent_events(
+            db,
+            title=title,
+            event_type=state["event_type"],
+            validated_tickers=set(state["validated_tickers"]),
+            evidence_fingerprint=item_fingerprint,
+            available_at=available_at,
+            exclude_event_group_id=event_group_id,
+        )
+        if group is None:
+            novelty = recent_novelty
+        elif material_update and item_fingerprint in prior_fact_fingerprints:
+            novelty = min(35.0, recent_novelty)
+        elif material_update:
+            novelty = min(80.0, recent_novelty)
+        else:
+            novelty = float(group.get("novelty_score") or 85.0)
         await db.execute(
             """UPDATE news_event_groups SET
                  representative_news_id=COALESCE(representative_news_id,?),
@@ -537,16 +954,291 @@ async def ingest_event_evidence(
                  available_at=MAX(available_at,?),
                  member_count=(SELECT COUNT(*) FROM news_event_members WHERE event_group_id=?),
                  source_count=?,source_names_json=?,source_tickers_json=?,validated_tickers_json=?,
+                 event_type=?,novelty_score=?,evidence_fingerprint=?,
                  version=version+?,updated_at=? WHERE event_group_id=?""",
             (
                 news_id, published_at, published_at, fetched_at, fetched_at, available_at,
-                event_group_id, len(sources), json.dumps(sources), json.dumps(all_tickers),
-                json.dumps(all_validated), 1 if material_update else 0, now, event_group_id,
+                event_group_id, len(state["publishers"]), json.dumps(state["publishers"]),
+                json.dumps(state["source_tickers"]), json.dumps(state["validated_tickers"]),
+                state["event_type"], novelty, state["evidence_fingerprint"],
+                1 if material_update else 0, now, event_group_id,
             ),
         )
-    await _gate_group(db, event_group_id)
+    await _gate_group(
+        db,
+        event_group_id,
+        version_already_advanced=bool(cursor.rowcount and group is not None and material_update),
+    )
     await db.commit()
     return event_group_id
+
+
+async def revalidate_events_for_focus_context(
+    db: aiosqlite.Connection,
+    focus_payload: dict[str, Any],
+) -> int:
+    """Revalidate associations in bounded commits, then re-gate recent events."""
+
+    focus_symbols, focus_external_symbols = _focus_symbol_sets(focus_payload)
+    focus_revision = focus_payload.get("revision")
+    universe_version = focus_payload.get("universe_version")
+    now = utc_text()
+    await db.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS focus_revalidation_news(news_id INTEGER PRIMARY KEY)"
+    )
+    await db.execute("DELETE FROM focus_revalidation_news")
+    await db.commit()
+
+    last_news_id = 0
+    while True:
+        async with db.execute(
+            """SELECT DISTINCT news_id FROM news_ticker_mentions
+               WHERE news_id>? ORDER BY news_id LIMIT 200""",
+            (last_news_id,),
+        ) as cursor:
+            news_rows = await cursor.fetchall()
+        if not news_rows:
+            break
+        batch_news_ids = [int(row[0]) for row in news_rows]
+        last_news_id = batch_news_ids[-1]
+        placeholders = ",".join("?" for _ in batch_news_ids)
+        async with db.execute(
+            f"""SELECT id,news_id,ticker,association_method,validation_status,
+                       focus_revision,universe_version
+               FROM news_ticker_mentions
+               WHERE news_id IN ({placeholders}) AND validation_status<>'invalid'
+               ORDER BY news_id,id""",
+            tuple(batch_news_ids),
+        ) as cursor:
+            mention_rows = await cursor.fetchall()
+        trusted_by_news: dict[int, set[str]] = {news_id: set() for news_id in batch_news_ids}
+        async with db.execute(
+            f"""SELECT news_id,ticker,association_method,validation_status
+                FROM news_ticker_mentions
+                WHERE news_id IN ({placeholders})
+                  AND association_method<>'llm_inference'""",
+            tuple(batch_news_ids),
+        ) as trusted_cursor:
+            for trusted_row in await trusted_cursor.fetchall():
+                if (
+                    str(trusted_row[2]) in {"provider_tag", "company_endpoint"}
+                    or str(trusted_row[3]) in {"canonical", "valid_external"}
+                ):
+                    trusted_by_news[int(trusted_row[0])].add(str(trusted_row[1]))
+        for row in mention_rows:
+            news_id = int(row[1])
+            state = validate_ticker_association(
+                str(row[2]),
+                association_method=str(row[3]),
+                focus_symbols=focus_symbols,
+                trusted_external_symbols=(
+                    trusted_by_news.get(news_id, set()) | focus_external_symbols
+                ),
+            )
+            metadata_changed = (
+                row[5] != focus_revision or str(row[6] or "") != str(universe_version or "")
+            )
+            if state != str(row[4]) or metadata_changed:
+                await db.execute(
+                    """UPDATE news_ticker_mentions SET validation_status=?,validated_at=?,
+                       focus_revision=?,universe_version=? WHERE id=?""",
+                    (state, now, focus_revision, universe_version, row[0]),
+                )
+            if str(row[3]) == "llm_inference" and (state != str(row[4]) or metadata_changed):
+                await db.execute(
+                    """UPDATE analysis_stock_impacts SET validation_status=?,validated_at=?,
+                       focus_revision=?,universe_version=? WHERE news_id=? AND ticker=?""",
+                    (state, now, focus_revision, universe_version, news_id, str(row[2])),
+                )
+        await db.executemany(
+            "INSERT OR IGNORE INTO focus_revalidation_news(news_id) VALUES (?)",
+            [(news_id,) for news_id in batch_news_ids],
+        )
+        await db.commit()
+
+    # Legacy dashboards are synchronized in the same bounded news-id pages.
+    last_news_id = 0
+    while True:
+        async with db.execute(
+            """SELECT news_id FROM focus_revalidation_news
+               WHERE news_id>? ORDER BY news_id LIMIT 200""",
+            (last_news_id,),
+        ) as cursor:
+            news_rows = await cursor.fetchall()
+        if not news_rows:
+            break
+        batch_news_ids = [int(row[0]) for row in news_rows]
+        last_news_id = batch_news_ids[-1]
+        for news_id in batch_news_ids:
+            async with db.execute(
+                """SELECT si.ticker,si.company,si.impact_score,si.reason
+                   FROM analysis_stock_impacts si
+                   WHERE si.analysis_id=(
+                     SELECT r.id FROM analysis_revisions r WHERE r.news_id=?
+                     ORDER BY r.revision DESC,r.id DESC LIMIT 1
+                   ) AND si.validation_status IN ('canonical','valid_external')
+                   ORDER BY si.ticker""",
+                (news_id,),
+            ) as cursor:
+                trusted_impacts = await cursor.fetchall()
+            legacy_stocks = [
+                {
+                    "ticker": str(value[0]),
+                    "company": str(value[1]),
+                    "impact_score": int(value[2]),
+                    "reason": str(value[3]),
+                }
+                for value in trusted_impacts
+            ]
+            await db.execute(
+                "UPDATE analyses SET affected_stocks=? WHERE news_id=?",
+                (json.dumps(legacy_stocks, ensure_ascii=False), news_id),
+            )
+        await db.commit()
+
+    recent_cutoff = utc_text(utc_now() - timedelta(hours=72))
+    changed_groups = 0
+    last_group_id = ""
+    while True:
+        async with db.execute(
+            """SELECT g.event_group_id FROM news_event_groups g
+               WHERE g.event_group_id>?
+                 AND (
+                   datetime(g.available_at)>=datetime(?)
+                   OR EXISTS (
+                     SELECT 1 FROM news_event_members em
+                     JOIN focus_revalidation_news f ON f.news_id=em.news_id
+                     WHERE em.event_group_id=g.event_group_id
+                   )
+                 )
+               ORDER BY g.event_group_id LIMIT 100""",
+            (last_group_id, recent_cutoff),
+        ) as cursor:
+            group_rows = await cursor.fetchall()
+        if not group_rows:
+            break
+        group_ids = [str(row[0]) for row in group_rows]
+        last_group_id = group_ids[-1]
+        for event_group_id in group_ids:
+            async with db.execute(
+                "SELECT evidence_fingerprint FROM news_event_groups WHERE event_group_id=?",
+                (event_group_id,),
+            ) as cursor:
+                prior = await cursor.fetchone()
+            async with db.execute(
+                "SELECT id,news_id FROM news_event_members WHERE event_group_id=?",
+                (event_group_id,),
+            ) as cursor:
+                members = await cursor.fetchall()
+            for member in members:
+                if member[1] is None:
+                    continue
+                async with db.execute(
+                    """SELECT DISTINCT ticker FROM news_ticker_mentions
+                       WHERE news_id=?
+                         AND validation_status IN ('canonical','valid_external')""",
+                    (member[1],),
+                ) as cursor:
+                    validated = sorted(str(value[0]) for value in await cursor.fetchall())
+                await db.execute(
+                    "UPDATE news_event_members SET validated_tickers_json=? WHERE id=?",
+                    (json.dumps(validated), member[0]),
+                )
+            state = await event_group_evidence_state(db, event_group_id)
+            material = bool(
+                prior and prior[0] and str(prior[0]) != state["evidence_fingerprint"]
+            )
+            await db.execute(
+                """UPDATE news_event_groups SET source_count=?,source_names_json=?,
+                   source_tickers_json=?,validated_tickers_json=?,event_type=?,
+                   evidence_fingerprint=?,version=version+?,updated_at=?
+                   WHERE event_group_id=?""",
+                (
+                    len(state["publishers"]),
+                    json.dumps(state["publishers"]),
+                    json.dumps(state["source_tickers"]),
+                    json.dumps(state["validated_tickers"]),
+                    state["event_type"],
+                    state["evidence_fingerprint"],
+                    1 if material else 0,
+                    now,
+                    event_group_id,
+                ),
+            )
+            await _gate_group(
+                db,
+                event_group_id,
+                version_already_advanced=material,
+            )
+            changed_groups += int(material)
+        await db.commit()
+    await db.execute("DROP TABLE IF EXISTS focus_revalidation_news")
+    await db.commit()
+    return changed_groups
+
+
+async def refresh_event_groups_for_news(
+    db: aiosqlite.Connection,
+    news_id: int,
+) -> int:
+    """Apply newly trusted ticker associations to existing immutable event versions."""
+
+    async with db.execute(
+        """SELECT DISTINCT event_group_id FROM news_event_members
+           WHERE news_id=?""",
+        (news_id,),
+    ) as cursor:
+        group_ids = [str(row[0]) for row in await cursor.fetchall()]
+    if not group_ids:
+        return 0
+    async with db.execute(
+        """SELECT DISTINCT ticker FROM news_ticker_mentions
+           WHERE news_id=? AND validation_status IN ('canonical','valid_external')""",
+        (news_id,),
+    ) as cursor:
+        validated = sorted(str(row[0]) for row in await cursor.fetchall())
+    await db.execute(
+        "UPDATE news_event_members SET validated_tickers_json=? WHERE news_id=?",
+        (json.dumps(validated), news_id),
+    )
+    now = utc_text()
+    changed = 0
+    for event_group_id in group_ids:
+        async with db.execute(
+            "SELECT evidence_fingerprint FROM news_event_groups WHERE event_group_id=?",
+            (event_group_id,),
+        ) as cursor:
+            previous = await cursor.fetchone()
+        state = await event_group_evidence_state(db, event_group_id)
+        material = bool(
+            previous
+            and previous[0]
+            and str(previous[0]) != state["evidence_fingerprint"]
+        )
+        await db.execute(
+            """UPDATE news_event_groups SET source_count=?,source_names_json=?,
+               source_tickers_json=?,validated_tickers_json=?,event_type=?,
+               evidence_fingerprint=?,version=version+?,updated_at=?
+               WHERE event_group_id=?""",
+            (
+                len(state["publishers"]),
+                json.dumps(state["publishers"]),
+                json.dumps(state["source_tickers"]),
+                json.dumps(state["validated_tickers"]),
+                state["event_type"],
+                state["evidence_fingerprint"],
+                1 if material else 0,
+                now,
+                event_group_id,
+            ),
+        )
+        await _gate_group(
+            db,
+            event_group_id,
+            version_already_advanced=material,
+        )
+        changed += int(material)
+    return changed
 
 
 async def get_hotspot_status(db: aiosqlite.Connection, *, now: datetime | None = None) -> dict[str, Any]:
@@ -998,28 +1690,7 @@ async def _finish_cycle(
             for item in snapshot.get("events", [])
         }
         for assessment in output_payload["focus_ticker_assessments"]:
-            evidence_ids = list(
-                dict.fromkeys(
-                    assessment["supporting_event_ids"]
-                    + assessment["conflicting_event_ids"]
-                )
-            )
-            if (
-                assessment["insufficient_evidence"]
-                or assessment["catalyst_bias"] is None
-                or not evidence_ids
-            ):
-                assessment["weighted_catalyst_context"] = None
-                continue
-            weighted = sum(
-                (event_weights.get(event_id, 0.0) / 100.0)
-                * float(assessment["catalyst_bias"])
-                * (float(assessment["confidence"]) / 100.0)
-                for event_id in evidence_ids
-            )
-            assessment["weighted_catalyst_context"] = round(
-                max(-100.0, min(100.0, weighted)), 4
-            )
+            assessment.update(calculate_weighted_catalyst_context(assessment, event_weights))
         output_payload["display_only"] = True
         public_output = MarketFocusCyclePublicAnalysis.model_validate_json(
             json.dumps(
@@ -1174,6 +1845,10 @@ async def retry_market_focus_cycle(
         state = await get_hotspot_status(db, now=now)
         if state["active_cycle_id"]:
             raise CycleConflict("cycle_already_active")
+        if not settings.hot_cycle_manual_enabled:
+            raise CycleConflict("manual_cycle_disabled")
+        if settings.automatic_hot_cycle_capability != "enabled":
+            raise CycleConflict(settings.automatic_hot_cycle_capability)
         updated = parse_utc(parent["updated_at"]) or now
         retry_at = updated + timedelta(seconds=settings.hot_cycle_manual_cooldown_seconds)
         if now < retry_at:
@@ -1297,8 +1972,19 @@ async def run_market_focus_worker_once(
                WHERE status IN ('pending','queued','in_progress')
                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
                  AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+                 AND (
+                   openai_response_id IS NOT NULL
+                   OR (trigger_type='manual' AND ?)
+                   OR (trigger_type<>'manual' AND ?)
+                 )
                ORDER BY created_at LIMIT 1""",
-            (now_text, now_text),
+            (
+                now_text,
+                now_text,
+                settings.hot_cycle_manual_enabled
+                and settings.automatic_hot_cycle_capability == "enabled",
+                settings.automatic_hot_cycle_capability == "enabled",
+            ),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:

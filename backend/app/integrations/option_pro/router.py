@@ -105,6 +105,20 @@ async def job_response(request: Request, db, job: dict) -> AnalysisJobResponse:
         revision = await cursor.fetchone()
     result = None
     if revision is not None:
+        async with db.execute(
+            """SELECT m.ticker,m.validation_status,m.validated_at,m.focus_revision,
+                      m.universe_version,m.association_method
+               FROM news_ticker_mentions m
+               WHERE m.news_id=? AND m.association_method='llm_inference'
+                 AND m.id=(
+                   SELECT MAX(newest.id) FROM news_ticker_mentions newest
+                   WHERE newest.news_id=m.news_id AND newest.ticker=m.ticker
+                     AND newest.association_method='llm_inference'
+                 )
+               ORDER BY m.ticker""",
+            (job["news_id"],),
+        ) as validation_cursor:
+            stock_validations = [dict(row) for row in await validation_cursor.fetchall()]
         payload = NewsImpactAnalysis.model_validate_json(revision["payload_json"])
         result = PublicAnalysis(
             **payload.model_dump(),
@@ -116,6 +130,7 @@ async def job_response(request: Request, db, job: dict) -> AnalysisJobResponse:
             schema_version=revision["schema_version"],
             analyzed_at=revision["analyzed_at"],
             available_at=revision["available_at"],
+            stock_validations=stock_validations,
         )
     retry_after = None
     if job.get("next_attempt_at"):
@@ -164,6 +179,11 @@ async def integration_health(
             "ORDER BY heartbeat_at DESC LIMIT 1"
         ) as cursor:
             worker_row = await cursor.fetchone()
+        async with db.execute(
+            """SELECT COUNT(*) FROM market_focus_cycles
+               WHERE status='failed' AND error_code='submission_outcome_unknown'"""
+        ) as cursor:
+            unknown_cycle_count = int((await cursor.fetchone())[0])
     finally:
         await db.close()
 
@@ -187,6 +207,7 @@ async def integration_health(
         and settings.default_llm_provider == "openai"
         and provider_configured
         and capabilities.status == "ok"
+        and settings.manual_news_analysis_capability == "enabled"
     )
     budget_status: Literal["ok", "budget_configuration_required", "budget_blocked"] = "ok"
     if settings.news_llm_auto_analyze_enabled and settings.automatic_news_analysis_capability != "enabled":
@@ -199,6 +220,10 @@ async def integration_health(
     warnings: list[str] = []
     if warnings_auto_budget:
         warnings.append("automatic_analysis_budget_configuration_required")
+    if settings.manual_news_analysis_capability == "budget_configuration_required":
+        warnings.append("manual_analysis_budget_configuration_required")
+    if unknown_cycle_count:
+        warnings.append(f"market_focus_submission_outcome_unknown:{unknown_cycle_count}")
     if not action_configured:
         warnings.append("analysis_action_key_not_configured")
     if not provider_configured:
@@ -228,6 +253,9 @@ async def integration_health(
             raw_count=row.get("raw_count"),
             inserted_count=row.get("inserted_count"),
             duplicates_count=row.get("duplicates_count"),
+            source_fetch_status=row.get("source_fetch_status"),
+            news_persistence_status=row.get("news_persistence_status"),
+            event_projection_status=row.get("event_projection_status"),
             detail=row.get("error_code"),
         )
         for row in source_rows

@@ -32,6 +32,9 @@ def run(coro):
 def isolated_calendar_db(tmp_path, monkeypatch):
     path = tmp_path / "calendar-jobs.db"
     monkeypatch.setattr(database, "DB_PATH", str(path))
+    monkeypatch.setattr(settings, "news_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 50)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", 1_638_400)
     run(database.init_db())
     return path
 
@@ -95,6 +98,55 @@ class FakeCalendarProvider:
         self.sync_calls += 1
         self.options = options
         return self.result
+
+
+class SyncCalendarSubmissionOutcomeUnknownProvider(FakeCalendarProvider):
+    async def create_sync(self, model_input: str, **options):
+        self.create_calls += 1
+        self.sync_calls += 1
+        raise TimeoutError("response timed out after request submission")
+
+
+def test_calendar_worker_sync_unknown_outcome_is_not_retried(
+    isolated_calendar_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "openai_execution_mode", "worker_sync")
+    event = calendar_event(8)
+    provider = SyncCalendarSubmissionOutcomeUnknownProvider(
+        ResponseResult(None, "failed")
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            created = await create_or_get_calendar_job(
+                db, [event], provider="openai", model=settings.default_llm_model
+            )
+        finally:
+            await db.close()
+
+        assert await run_calendar_worker_once(
+            provider=provider, worker_id="calendar-sync-unknown"
+        ) is True
+        db = await database.get_db()
+        try:
+            row = await get_calendar_job(db, created.job["job_id"])
+            assert row["status"] == "failed"
+            assert row["error_code"] == "submission_outcome_unknown"
+            replay = await create_or_get_calendar_job(
+                db,
+                [event],
+                provider="openai",
+                model=settings.default_llm_model,
+                force=True,
+            )
+            assert replay.created is False
+            assert replay.job["job_id"] == created.job["job_id"]
+        finally:
+            await db.close()
+        assert provider.sync_calls == 1
+
+    run(scenario())
 
 
 def test_calendar_post_creates_job_and_get_only_polls_storage(

@@ -25,6 +25,9 @@ def run(coro):
 def isolated_db(tmp_path, monkeypatch):
     path = tmp_path / "macrolens-test.db"
     monkeypatch.setattr(database, "DB_PATH", str(path))
+    monkeypatch.setattr(settings, "news_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 50)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", 1_638_400)
     run(database.init_db())
     return path
 
