@@ -202,7 +202,7 @@ async def _consume_nonce(db: aiosqlite.Connection, key_id: str, nonce: str, now:
         await db.commit()
     except aiosqlite.IntegrityError as exc:
         await db.rollback()
-        raise IntegrationAPIError(401, "nonce_replayed", "The request nonce has already been used.") from exc
+        raise IntegrationAPIError(409, "nonce_replayed", "The request nonce has already been used.") from exc
     except Exception:
         await db.rollback()
         raise
