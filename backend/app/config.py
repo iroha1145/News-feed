@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     option_pro_focus_retry_backoff_seconds: float = Field(default=0.25, ge=0, le=5)
     option_pro_focus_circuit_failure_threshold: int = Field(default=3, ge=1, le=20)
     option_pro_focus_circuit_reset_seconds: int = Field(default=60, ge=1, le=3600)
+    # Every focus persistence call performs at most one bounded revalidation
+    # slice.  A durable cursor resumes the same round on the next pull.
+    focus_revalidation_max_rows_per_run: int = Field(default=1000, ge=1, le=10000)
+    focus_revalidation_max_seconds_per_run: float = Field(default=2.0, gt=0, le=30)
+    focus_revalidation_batch_size: int = Field(default=200, ge=1, le=1000)
+    focus_revalidation_resume_interval_seconds: int = Field(default=60, ge=5, le=3600)
 
     # Deterministic hotspot preparation and bounded market-focus cycles.
     hotspot_direct_threshold: float = Field(default=75.0, ge=0, le=100)
@@ -134,6 +140,9 @@ class Settings(BaseSettings):
     hot_cycle_daily_output_token_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000_000)
     hot_cycle_prompt_version: str = Field(default="market-focus-v1", min_length=1, max_length=100)
     hot_cycle_schema_version: str = Field(default="market-focus-schema-v1", min_length=1, max_length=100)
+    # Bootstrap calibration for display-only Catalyst context.  This does not
+    # participate in the formal stock score.
+    catalyst_context_support_target: float = Field(default=80.0, gt=0, le=1000)
 
     # Option Pro Integration API. Empty keys keep the remote surface disabled
     # while the ordinary MacroLens application remains fully operational.
@@ -214,6 +223,9 @@ class Settings(BaseSettings):
     hotspot_preparation_retention_days: int = Field(default=90, ge=1, le=3650)
     market_focus_completed_retention_days: int = Field(default=365, ge=1, le=3650)
     market_focus_failed_retention_days: int = Field(default=30, ge=1, le=3650)
+    focus_snapshot_retention_days: int = Field(default=90, ge=1, le=3650)
+    focus_snapshot_full_resolution_days: int = Field(default=30, ge=1, le=3650)
+    focus_snapshot_daily_rollup_enabled: bool = True
     event_member_retention_days: int = Field(default=90, ge=1, le=3650)
     projection_retry_retention_days: int = Field(default=30, ge=1, le=3650)
     projection_retry_max_attempts: int = Field(default=6, ge=1, le=100)
@@ -275,6 +287,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_sensitive_endpoints_and_credentials(self):
+        if self.focus_snapshot_full_resolution_days > self.focus_snapshot_retention_days:
+            raise ValueError(
+                "FOCUS_SNAPSHOT_FULL_RESOLUTION_DAYS must not exceed "
+                "FOCUS_SNAPSHOT_RETENTION_DAYS"
+            )
         if any(
             value > self.openai_max_output_tokens
             for value in (

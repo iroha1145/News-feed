@@ -10,7 +10,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-CATALYST_SCHEMA_MIGRATION = 3
+CATALYST_SCHEMA_MIGRATION = 4
 
 
 CREATE_ANALYSIS_JOBS = """
@@ -92,6 +92,8 @@ CREATE_ANALYSIS_STOCK_IMPACTS = """
 CREATE TABLE IF NOT EXISTS analysis_stock_impacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     analysis_id INTEGER NOT NULL REFERENCES analysis_revisions(id) ON DELETE CASCADE,
+    analysis_revision_id INTEGER REFERENCES analysis_revisions(id) ON DELETE CASCADE,
+    mention_id INTEGER REFERENCES news_ticker_mentions(id) ON DELETE SET NULL,
     news_id INTEGER NOT NULL REFERENCES news_items(id) ON DELETE CASCADE,
     ticker TEXT NOT NULL CHECK(length(ticker) BETWEEN 1 AND 20),
     company TEXT NOT NULL CHECK(length(company) BETWEEN 1 AND 200),
@@ -275,7 +277,101 @@ CREATE TABLE IF NOT EXISTS news_ticker_mentions (
     focus_revision INTEGER,
     universe_version TEXT,
     source TEXT NOT NULL,
+    analysis_revision_id INTEGER REFERENCES analysis_revisions(id) ON DELETE CASCADE,
+    last_checked_at TEXT,
+    current_validation_status TEXT NOT NULL DEFAULT 'unverified' CHECK(current_validation_status IN (
+        'canonical','valid_external','ambiguous','invalid','unverified'
+    )),
+    current_validation_revision_id INTEGER REFERENCES ticker_validation_revisions(id) ON DELETE SET NULL,
+    legacy_association INTEGER NOT NULL DEFAULT 0 CHECK(legacy_association IN (0,1)),
     created_at TEXT NOT NULL
+)
+"""
+
+CREATE_TICKER_VALIDATION_REVISIONS = """
+CREATE TABLE IF NOT EXISTS ticker_validation_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mention_id INTEGER NOT NULL REFERENCES news_ticker_mentions(id) ON DELETE CASCADE,
+    validation_status TEXT NOT NULL CHECK(validation_status IN (
+        'canonical','valid_external','ambiguous','invalid','unverified'
+    )),
+    available_at TEXT NOT NULL,
+    focus_revision INTEGER,
+    universe_version TEXT,
+    reason_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    legacy_backfill INTEGER NOT NULL DEFAULT 0 CHECK(legacy_backfill IN (0,1)),
+    validation_basis_hash TEXT NOT NULL CHECK(length(validation_basis_hash)=64),
+    UNIQUE(mention_id, validation_basis_hash, validation_status, available_at)
+)
+"""
+
+CREATE_FOCUS_VALIDATION_STATE = """
+CREATE TABLE IF NOT EXISTS focus_validation_state (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    last_focus_revision INTEGER,
+    validation_basis_hash TEXT,
+    canonical_symbols_hash TEXT,
+    external_symbols_hash TEXT,
+    universe_version TEXT,
+    validation_rules_version TEXT,
+    last_run_at TEXT,
+    rows_scanned INTEGER NOT NULL DEFAULT 0 CHECK(rows_scanned >= 0),
+    rows_changed INTEGER NOT NULL DEFAULT 0 CHECK(rows_changed >= 0),
+    duration_ms INTEGER NOT NULL DEFAULT 0 CHECK(duration_ms >= 0),
+    validation_revisions_created INTEGER NOT NULL DEFAULT 0 CHECK(validation_revisions_created >= 0),
+    event_groups_regated INTEGER NOT NULL DEFAULT 0 CHECK(event_groups_regated >= 0),
+    pending_run_key TEXT,
+    pending_focus_revision INTEGER,
+    pending_validation_basis_hash TEXT,
+    pending_canonical_symbols_hash TEXT,
+    pending_external_symbols_hash TEXT,
+    pending_universe_version TEXT,
+    pending_validation_rules_version TEXT,
+    pending_rules_changed INTEGER NOT NULL DEFAULT 0 CHECK(pending_rules_changed IN (0,1)),
+    pending_phase TEXT CHECK(pending_phase IS NULL OR pending_phase IN (
+        'mentions','refresh_validation','collect_market','regate'
+    )),
+    pending_mention_cursor INTEGER NOT NULL DEFAULT 0 CHECK(pending_mention_cursor >= 0),
+    pending_mention_max_id INTEGER NOT NULL DEFAULT 0 CHECK(pending_mention_max_id >= 0),
+    pending_group_cursor TEXT NOT NULL DEFAULT '',
+    pending_active_group_id TEXT NOT NULL DEFAULT '',
+    pending_group_member_cursor INTEGER NOT NULL DEFAULT 0 CHECK(pending_group_member_cursor >= 0),
+    pending_group_fact_publishers_json TEXT NOT NULL DEFAULT '{}',
+    pending_group_fact_fingerprints_json TEXT NOT NULL DEFAULT '[]',
+    pending_group_event_type TEXT NOT NULL DEFAULT 'other',
+    pending_group_validated_tickers_json TEXT NOT NULL DEFAULT '[]',
+    pending_group_source_tickers_json TEXT NOT NULL DEFAULT '[]',
+    pending_group_prior_fingerprint TEXT NOT NULL DEFAULT '',
+    pending_started_at TEXT,
+    pending_revision_available_at TEXT,
+    pending_validation_tickers_json TEXT NOT NULL DEFAULT '[]',
+    pending_market_tickers_json TEXT NOT NULL DEFAULT '[]',
+    pending_rows_scanned INTEGER NOT NULL DEFAULT 0 CHECK(pending_rows_scanned >= 0),
+    pending_rows_changed INTEGER NOT NULL DEFAULT 0 CHECK(pending_rows_changed >= 0),
+    pending_duration_ms INTEGER NOT NULL DEFAULT 0 CHECK(pending_duration_ms >= 0),
+    pending_validation_revisions_created INTEGER NOT NULL DEFAULT 0 CHECK(pending_validation_revisions_created >= 0),
+    pending_event_groups_regated INTEGER NOT NULL DEFAULT 0 CHECK(pending_event_groups_regated >= 0),
+    revalidation_lease_owner TEXT,
+    revalidation_lease_expires_at TEXT,
+    revalidation_fencing_token INTEGER NOT NULL DEFAULT 0 CHECK(revalidation_fencing_token >= 0)
+)
+"""
+
+CREATE_FOCUS_REVALIDATION_CHANGED_NEWS = """
+CREATE TABLE IF NOT EXISTS focus_revalidation_changed_news (
+    run_key TEXT NOT NULL,
+    news_id INTEGER NOT NULL REFERENCES news_items(id) ON DELETE CASCADE,
+    PRIMARY KEY(run_key, news_id)
+)
+"""
+
+CREATE_FOCUS_REVALIDATION_GROUPS = """
+CREATE TABLE IF NOT EXISTS focus_revalidation_groups (
+    run_key TEXT NOT NULL,
+    event_group_id TEXT NOT NULL REFERENCES news_event_groups(event_group_id) ON DELETE CASCADE,
+    version_advanced INTEGER NOT NULL DEFAULT 0 CHECK(version_advanced IN (0,1)),
+    PRIMARY KEY(run_key, event_group_id)
 )
 """
 
@@ -457,8 +553,12 @@ TABLES = [
     CREATE_ANALYSIS_WORKER_STATE,
     CREATE_FOCUS_CONTEXT_SNAPSHOTS,
     CREATE_NEWS_TICKER_MENTIONS,
+    CREATE_TICKER_VALIDATION_REVISIONS,
+    CREATE_FOCUS_VALIDATION_STATE,
     CREATE_NEWS_EVENT_GROUPS,
     CREATE_NEWS_EVENT_MEMBERS,
+    CREATE_FOCUS_REVALIDATION_CHANGED_NEWS,
+    CREATE_FOCUS_REVALIDATION_GROUPS,
     CREATE_HOTSPOT_PREPARATION_SETS,
     CREATE_HOTSPOT_PREPARATION_STATE,
     CREATE_MARKET_FOCUS_CYCLES,
@@ -478,13 +578,23 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_stock_impacts_news ON analysis_stock_impacts(news_id)",
     "CREATE INDEX IF NOT EXISTS idx_stock_impacts_analyzed ON analysis_stock_impacts(analyzed_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_stock_impacts_validated ON analysis_stock_impacts(ticker,validation_status,available_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_stock_impacts_mention ON analysis_stock_impacts(mention_id,analysis_revision_id)",
+    "CREATE INDEX IF NOT EXISTS idx_stock_impacts_focus_revision ON analysis_stock_impacts(focus_revision)",
     "CREATE INDEX IF NOT EXISTS idx_calendar_events_scheduled_available ON calendar_event_revisions(scheduled_at, available_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_integration_changes_updated ON integration_changes(updated_at, change_sequence)",
     "CREATE INDEX IF NOT EXISTS idx_integration_changes_entity ON integration_changes(entity_type, entity_id, change_sequence DESC)",
     "CREATE INDEX IF NOT EXISTS idx_integration_nonces_expires ON integration_nonces(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_focus_context_latest ON focus_context_snapshots(revision DESC)",
     "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_news ON news_ticker_mentions(news_id, ticker, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_validated ON news_ticker_mentions(ticker, validation_status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_validated ON news_ticker_mentions(ticker, current_validation_status, created_at DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ticker_mentions_natural_key ON news_ticker_mentions(news_id,ticker,association_method,source,COALESCE(analysis_revision_id,0))",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_analysis_revision ON news_ticker_mentions(analysis_revision_id,ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_focus_revision ON news_ticker_mentions(focus_revision)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_validation_as_of ON ticker_validation_revisions(mention_id,available_at DESC,id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_validation_status_as_of ON ticker_validation_revisions(validation_status,available_at DESC,mention_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_validation_focus_revision ON ticker_validation_revisions(focus_revision)",
+    "CREATE INDEX IF NOT EXISTS idx_focus_revalidation_changed_news ON focus_revalidation_changed_news(run_key,news_id)",
+    "CREATE INDEX IF NOT EXISTS idx_focus_revalidation_groups ON focus_revalidation_groups(run_key,event_group_id)",
     "CREATE INDEX IF NOT EXISTS idx_event_groups_available ON news_event_groups(available_at DESC, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_event_members_group ON news_event_members(event_group_id, fetched_at)",
     "CREATE INDEX IF NOT EXISTS idx_event_members_retention ON news_event_members(created_at,event_group_id)",
@@ -499,6 +609,19 @@ INDEXES = [
 
 TRIGGERS = [
     """
+    CREATE TRIGGER IF NOT EXISTS trg_ticker_validation_basis_consistency
+    BEFORE INSERT ON ticker_validation_revisions
+    WHEN EXISTS (
+      SELECT 1 FROM ticker_validation_revisions prior
+      WHERE prior.mention_id=NEW.mention_id
+        AND prior.validation_basis_hash=NEW.validation_basis_hash
+        AND prior.validation_status<>NEW.validation_status
+    )
+    BEGIN
+      SELECT RAISE(ABORT,'validation_basis_status_conflict');
+    END
+    """,
+    """
     CREATE TRIGGER IF NOT EXISTS trg_news_integration_insert
     AFTER INSERT ON news_items
     BEGIN
@@ -512,6 +635,15 @@ TRIGGERS = [
     BEGIN
       INSERT INTO integration_changes(entity_type, entity_id, operation, payload_hash, updated_at)
       VALUES('analysis', CAST(NEW.news_id AS TEXT), 'upsert', NEW.input_hash, NEW.available_at);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_ticker_validation_integration_insert
+    AFTER INSERT ON ticker_validation_revisions
+    BEGIN
+      INSERT INTO integration_changes(entity_type, entity_id, operation, payload_hash, updated_at)
+      SELECT 'analysis', CAST(m.news_id AS TEXT), 'upsert', NEW.validation_basis_hash, NEW.created_at
+      FROM news_ticker_mentions m WHERE m.id=NEW.mention_id;
     END
     """,
     """
@@ -890,6 +1022,292 @@ async def _backfill_event_evidence_fingerprints(db: aiosqlite.Connection) -> Non
         )
 
 
+async def _migrate_ticker_lineage_v4(
+    db: aiosqlite.Connection,
+    *,
+    migration_at: str | None = None,
+) -> dict[str, int]:
+    """Split immutable mention identity from append-only point-in-time validation."""
+
+    from app.services.ticker_lineage import legacy_validation_basis_hash, utc_text
+
+    migration_at = utc_text(migration_at or _utc_now())
+    await db.execute("DROP INDEX IF EXISTS idx_ticker_mentions_natural_key")
+    await db.execute("DROP INDEX IF EXISTS idx_ticker_mentions_validated")
+    await db.execute(
+        """UPDATE news_ticker_mentions SET
+             last_checked_at=COALESCE(last_checked_at,validated_at,?),
+             current_validation_status=COALESCE(current_validation_status,validation_status,'unverified')""",
+        (migration_at,),
+    )
+
+    # A legacy model association can be bound without guesswork only when the
+    # news item has exactly one analysis revision. Multi-revision legacy rows
+    # remain explicitly marked and are not projected into a guessed revision.
+    await db.execute(
+        """UPDATE news_ticker_mentions SET analysis_revision_id=(
+               SELECT MIN(r.id) FROM analysis_revisions r
+               WHERE r.news_id=news_ticker_mentions.news_id
+             )
+           WHERE association_method='llm_inference' AND analysis_revision_id IS NULL
+             AND (SELECT COUNT(*) FROM analysis_revisions r
+                  WHERE r.news_id=news_ticker_mentions.news_id)=1"""
+    )
+    await db.execute(
+        """UPDATE news_ticker_mentions SET legacy_association=1
+           WHERE association_method='llm_inference' AND analysis_revision_id IS NULL"""
+    )
+
+    await db.execute("DROP TABLE IF EXISTS temp.ticker_mention_merge_v4")
+    await db.execute(
+        """CREATE TEMP TABLE ticker_mention_merge_v4(
+             old_id INTEGER PRIMARY KEY,
+             keep_id INTEGER NOT NULL
+           )"""
+    )
+    await db.execute(
+        """INSERT INTO ticker_mention_merge_v4(old_id,keep_id)
+           SELECT id,FIRST_VALUE(id) OVER (
+             PARTITION BY news_id,ticker,association_method,source,COALESCE(analysis_revision_id,0)
+             ORDER BY datetime(created_at),id
+           )
+           FROM news_ticker_mentions"""
+    )
+    # Every merge below is keyed by keep_id. Without this temporary index the
+    # six correlated aggregates turn a 100k-row production migration into an
+    # avoidable quadratic scan while the writer lock is held.
+    await db.execute(
+        "CREATE INDEX ticker_mention_merge_keep_v4 ON ticker_mention_merge_v4(keep_id)"
+    )
+    async with db.execute(
+        "SELECT COUNT(*) FROM ticker_mention_merge_v4 WHERE old_id<>keep_id"
+    ) as cursor:
+        deduplicated = int((await cursor.fetchone())[0])
+    await db.execute(
+        """UPDATE news_ticker_mentions SET
+             association_confidence=(
+               SELECT MAX(source.association_confidence)
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+             ),
+             created_at=(
+               SELECT MIN(source.created_at)
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+             ),
+             validated_at=(
+               SELECT source.validated_at
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+               ORDER BY REPLACE(source.last_checked_at,'Z','+00:00') DESC,
+                        source.id DESC LIMIT 1
+             ),
+             last_checked_at=(
+               SELECT source.last_checked_at
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+               ORDER BY REPLACE(source.last_checked_at,'Z','+00:00') DESC,
+                        source.id DESC LIMIT 1
+             ),
+             validation_status=COALESCE((
+               SELECT source.validation_status
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+               ORDER BY REPLACE(COALESCE(source.last_checked_at,source.validated_at,?),
+                                'Z','+00:00') DESC,
+                        source.id DESC LIMIT 1
+             ),'unverified'),
+             current_validation_status=COALESCE((
+               SELECT source.validation_status
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+               ORDER BY REPLACE(COALESCE(source.last_checked_at,source.validated_at,?),
+                                'Z','+00:00') DESC,
+                        source.id DESC LIMIT 1
+             ),'unverified'),
+             focus_revision=(
+               SELECT source.focus_revision
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+               ORDER BY REPLACE(source.last_checked_at,'Z','+00:00') DESC,
+                        source.id DESC LIMIT 1
+             ),
+             universe_version=(
+               SELECT source.universe_version
+               FROM ticker_mention_merge_v4 mapping
+               JOIN news_ticker_mentions source ON source.id=mapping.old_id
+               WHERE mapping.keep_id=news_ticker_mentions.id
+               ORDER BY REPLACE(source.last_checked_at,'Z','+00:00') DESC,
+                        source.id DESC LIMIT 1
+             )
+           WHERE id IN (SELECT keep_id FROM ticker_mention_merge_v4)""",
+        (migration_at, migration_at),
+    )
+    await db.execute(
+        """DELETE FROM news_ticker_mentions
+           WHERE id IN (SELECT old_id FROM ticker_mention_merge_v4 WHERE old_id<>keep_id)"""
+    )
+
+    async with db.execute(
+        "SELECT COUNT(*) FROM analysis_stock_impacts WHERE validation_status='invalid'"
+    ) as cursor:
+        invalid_impacts = int((await cursor.fetchone())[0])
+    if invalid_impacts:
+        await _increment_safety_counter(
+            db, "invalid_historical_model_ticker", invalid_impacts
+        )
+        await db.execute(
+            "DELETE FROM analysis_stock_impacts WHERE validation_status='invalid'"
+        )
+    await db.execute(
+        """UPDATE analysis_stock_impacts SET analysis_revision_id=analysis_id
+           WHERE analysis_revision_id IS NULL"""
+    )
+    await db.execute(
+        """INSERT INTO news_ticker_mentions
+           (news_id,ticker,association_method,association_confidence,validation_status,
+            validated_at,focus_revision,universe_version,source,analysis_revision_id,
+            last_checked_at,current_validation_status,current_validation_revision_id,
+            legacy_association,created_at)
+           SELECT si.news_id,si.ticker,'llm_inference',0.5,si.validation_status,
+                  COALESCE(si.validated_at,?),si.focus_revision,si.universe_version,
+                  'legacy_analysis_projection',si.analysis_id,
+                  COALESCE(si.validated_at,?),si.validation_status,NULL,1,
+                  COALESCE(si.available_at,si.analyzed_at,?)
+           FROM analysis_stock_impacts si
+           WHERE NOT EXISTS (
+             SELECT 1 FROM news_ticker_mentions m
+             WHERE m.news_id=si.news_id AND m.ticker=si.ticker
+               AND m.association_method='llm_inference'
+               AND m.analysis_revision_id=si.analysis_id
+           )""",
+        (migration_at, migration_at, migration_at),
+    )
+
+    # Backfill one honest baseline at the time the old system says validation
+    # happened. Missing timestamps use the migration instant, never news time.
+    backfilled = 0
+    last_id = 0
+    while True:
+        async with db.execute(
+            """SELECT id,validation_status,validated_at,last_checked_at,
+                      focus_revision,universe_version
+               FROM news_ticker_mentions WHERE id>? ORDER BY id LIMIT 1000""",
+            (last_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            break
+        values = []
+        for row in rows:
+            mention_id = int(row[0])
+            status = str(row[1] or "unverified")
+            available_at = utc_text(row[2] or migration_at)
+            basis_hash = legacy_validation_basis_hash(
+                mention_id=mention_id,
+                validation_status=status,
+                focus_revision=row[4],
+                universe_version=row[5],
+            )
+            values.append(
+                (
+                    mention_id,
+                    status,
+                    available_at,
+                    row[4],
+                    row[5],
+                    "legacy_current_state",
+                    migration_at,
+                    1,
+                    basis_hash,
+                )
+            )
+            last_id = mention_id
+        before = db.total_changes
+        await db.executemany(
+            """INSERT OR IGNORE INTO ticker_validation_revisions
+               (mention_id,validation_status,available_at,focus_revision,universe_version,
+                reason_code,created_at,legacy_backfill,validation_basis_hash)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            values,
+        )
+        backfilled += db.total_changes - before
+
+    await db.execute(
+        """UPDATE news_ticker_mentions SET
+             current_validation_revision_id=(
+               SELECT v.id FROM ticker_validation_revisions v
+               WHERE v.mention_id=news_ticker_mentions.id
+               ORDER BY REPLACE(v.available_at,'Z','+00:00') DESC,v.id DESC LIMIT 1
+             ),
+             current_validation_status=COALESCE((
+               SELECT v.validation_status FROM ticker_validation_revisions v
+               WHERE v.mention_id=news_ticker_mentions.id
+               ORDER BY REPLACE(v.available_at,'Z','+00:00') DESC,v.id DESC LIMIT 1
+             ),'unverified'),
+             validation_status=COALESCE((
+               SELECT v.validation_status FROM ticker_validation_revisions v
+               WHERE v.mention_id=news_ticker_mentions.id
+               ORDER BY REPLACE(v.available_at,'Z','+00:00') DESC,v.id DESC LIMIT 1
+             ),'unverified')"""
+    )
+    await db.execute(
+        """UPDATE analysis_stock_impacts SET mention_id=(
+               SELECT m.id FROM news_ticker_mentions m
+               WHERE m.news_id=analysis_stock_impacts.news_id
+                 AND m.ticker=analysis_stock_impacts.ticker
+                 AND m.association_method='llm_inference'
+                 AND m.analysis_revision_id=analysis_stock_impacts.analysis_id
+               ORDER BY m.legacy_association,m.id LIMIT 1
+             )"""
+    )
+    await db.execute(
+        """UPDATE analysis_stock_impacts SET
+             validation_status=COALESCE((
+               SELECT m.current_validation_status FROM news_ticker_mentions m
+               WHERE m.id=analysis_stock_impacts.mention_id
+             ),'unverified'),
+             validated_at=COALESCE(validated_at,(
+               SELECT v.available_at FROM ticker_validation_revisions v
+               WHERE v.mention_id=analysis_stock_impacts.mention_id
+               ORDER BY REPLACE(v.available_at,'Z','+00:00'),v.id LIMIT 1
+             ))"""
+    )
+    await db.execute(
+        """INSERT INTO integration_changes(entity_type,entity_id,operation,payload_hash,updated_at)
+           SELECT 'analysis',CAST(m.news_id AS TEXT),'upsert',
+                  'a38b0939b17ce9a5e65fc274a727454cdbcf9bc09dd6d097df3dfc2f7d323985',?
+           FROM news_ticker_mentions m
+           GROUP BY m.news_id
+           HAVING NOT EXISTS (
+             SELECT 1 FROM integration_changes c
+             WHERE c.entity_type='analysis' AND c.entity_id=CAST(m.news_id AS TEXT)
+               AND c.payload_hash='a38b0939b17ce9a5e65fc274a727454cdbcf9bc09dd6d097df3dfc2f7d323985'
+           )""",
+        (migration_at,),
+    )
+    await db.execute("DROP TABLE ticker_mention_merge_v4")
+    async with db.execute("PRAGMA integrity_check") as cursor:
+        integrity = await cursor.fetchone()
+    if integrity is None or str(integrity[0]).lower() != "ok":
+        raise RuntimeError("ticker_lineage_v4_integrity_check_failed")
+    async with db.execute("PRAGMA foreign_key_check") as cursor:
+        if await cursor.fetchone() is not None:
+            raise RuntimeError("ticker_lineage_v4_foreign_key_check_failed")
+    return {
+        "mentions_deduplicated": deduplicated,
+        "validation_revisions_backfilled": backfilled,
+        "invalid_impacts_removed": invalid_impacts,
+    }
+
+
 async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
     """Apply additive, idempotent integration migrations without rebuilding legacy tables."""
     async with db.execute("PRAGMA user_version") as cursor:
@@ -900,11 +1318,11 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
     migration_lock_held = False
     if current_migration < CATALYST_SCHEMA_MIGRATION:
         # Web and worker may start together against the same SQLite file. Hold
-        # one exclusive migration transaction, then re-read the version after
+        # one immediate migration transaction, then re-read the version after
         # waiting so a second initializer does not replay the heavy backfill.
         await db.commit()
         await db.execute("PRAGMA foreign_keys=OFF")
-        await db.execute("BEGIN EXCLUSIVE")
+        await db.execute("BEGIN IMMEDIATE")
         async with db.execute("PRAGMA user_version") as cursor:
             locked_row = await cursor.fetchone()
         locked_version = int(locked_row[0] if locked_row else 0)
@@ -915,6 +1333,8 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
         else:
             current_migration = locked_version
             migration_lock_held = True
+    needs_v3_migration = current_migration < 3
+    needs_v4_migration = current_migration < 4
     await _add_column(db, "news_items", "updated_at", "TEXT")
     await _add_column(db, "news_items", "source_tickers", "TEXT NOT NULL DEFAULT '[]'")
     await db.execute("UPDATE news_items SET updated_at = COALESCE(updated_at, fetched_at) WHERE updated_at IS NULL")
@@ -927,6 +1347,45 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
            VALUES (1,0,0,?)""",
         (_utc_now(),),
     )
+    await db.execute(
+        """INSERT OR IGNORE INTO focus_validation_state
+           (singleton_id,rows_scanned,rows_changed,duration_ms,
+            validation_revisions_created,event_groups_regated)
+           VALUES (1,0,0,0,0,0)"""
+    )
+    await _add_column(db, "focus_validation_state", "validation_rules_version", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_run_key", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_focus_revision", "INTEGER")
+    await _add_column(db, "focus_validation_state", "pending_validation_basis_hash", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_canonical_symbols_hash", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_external_symbols_hash", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_universe_version", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_validation_rules_version", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_rules_changed", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_rules_changed IN (0,1))")
+    await _add_column(db, "focus_validation_state", "pending_phase", "TEXT CHECK(pending_phase IS NULL OR pending_phase IN ('mentions','refresh_validation','collect_market','regate'))")
+    await _add_column(db, "focus_validation_state", "pending_mention_cursor", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_mention_cursor >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_mention_max_id", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_mention_max_id >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_group_cursor", "TEXT NOT NULL DEFAULT ''")
+    await _add_column(db, "focus_validation_state", "pending_active_group_id", "TEXT NOT NULL DEFAULT ''")
+    await _add_column(db, "focus_validation_state", "pending_group_member_cursor", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_group_member_cursor >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_group_fact_publishers_json", "TEXT NOT NULL DEFAULT '{}'")
+    await _add_column(db, "focus_validation_state", "pending_group_fact_fingerprints_json", "TEXT NOT NULL DEFAULT '[]'")
+    await _add_column(db, "focus_validation_state", "pending_group_event_type", "TEXT NOT NULL DEFAULT 'other'")
+    await _add_column(db, "focus_validation_state", "pending_group_validated_tickers_json", "TEXT NOT NULL DEFAULT '[]'")
+    await _add_column(db, "focus_validation_state", "pending_group_source_tickers_json", "TEXT NOT NULL DEFAULT '[]'")
+    await _add_column(db, "focus_validation_state", "pending_group_prior_fingerprint", "TEXT NOT NULL DEFAULT ''")
+    await _add_column(db, "focus_validation_state", "pending_started_at", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_revision_available_at", "TEXT")
+    await _add_column(db, "focus_validation_state", "pending_validation_tickers_json", "TEXT NOT NULL DEFAULT '[]'")
+    await _add_column(db, "focus_validation_state", "pending_market_tickers_json", "TEXT NOT NULL DEFAULT '[]'")
+    await _add_column(db, "focus_validation_state", "pending_rows_scanned", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_rows_scanned >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_rows_changed", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_rows_changed >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_duration_ms", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_duration_ms >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_validation_revisions_created", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_validation_revisions_created >= 0)")
+    await _add_column(db, "focus_validation_state", "pending_event_groups_regated", "INTEGER NOT NULL DEFAULT 0 CHECK(pending_event_groups_regated >= 0)")
+    await _add_column(db, "focus_validation_state", "revalidation_lease_owner", "TEXT")
+    await _add_column(db, "focus_validation_state", "revalidation_lease_expires_at", "TEXT")
+    await _add_column(db, "focus_validation_state", "revalidation_fencing_token", "INTEGER NOT NULL DEFAULT 0 CHECK(revalidation_fencing_token >= 0)")
     await _add_column(db, "market_focus_cycles", "retry_of_cycle_id", "TEXT")
     await _add_column(db, "market_focus_cycles", "execution_number", "INTEGER NOT NULL DEFAULT 1 CHECK(execution_number >= 1)")
     await _add_column(db, "analysis_jobs", "retrieve_error_count", "INTEGER NOT NULL DEFAULT 0 CHECK(retrieve_error_count >= 0)")
@@ -959,7 +1418,44 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
         "association_method",
         "TEXT NOT NULL DEFAULT 'llm_inference' CHECK(association_method='llm_inference')",
     )
-    if current_migration < CATALYST_SCHEMA_MIGRATION:
+    await _add_column(
+        db,
+        "analysis_stock_impacts",
+        "analysis_revision_id",
+        "INTEGER REFERENCES analysis_revisions(id) ON DELETE CASCADE",
+    )
+    await _add_column(
+        db,
+        "analysis_stock_impacts",
+        "mention_id",
+        "INTEGER REFERENCES news_ticker_mentions(id) ON DELETE SET NULL",
+    )
+    await _add_column(
+        db,
+        "news_ticker_mentions",
+        "analysis_revision_id",
+        "INTEGER REFERENCES analysis_revisions(id) ON DELETE CASCADE",
+    )
+    await _add_column(db, "news_ticker_mentions", "last_checked_at", "TEXT")
+    await _add_column(
+        db,
+        "news_ticker_mentions",
+        "current_validation_status",
+        "TEXT NOT NULL DEFAULT 'unverified' CHECK(current_validation_status IN ('canonical','valid_external','ambiguous','invalid','unverified'))",
+    )
+    await _add_column(
+        db,
+        "news_ticker_mentions",
+        "current_validation_revision_id",
+        "INTEGER REFERENCES ticker_validation_revisions(id) ON DELETE SET NULL",
+    )
+    await _add_column(
+        db,
+        "news_ticker_mentions",
+        "legacy_association",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(legacy_association IN (0,1))",
+    )
+    if needs_v3_migration:
         # Populate newly added nullable compatibility columns before rebuilding
         # the table with its final NOT NULL constraints.
         await db.execute(
@@ -1021,10 +1517,6 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
                WHEN event_projection_status='unavailable' AND status IN ('ok','disabled','not_configured') THEN status
                ELSE event_projection_status END"""
     )
-    for statement in INDEXES:
-        await db.execute(statement)
-    for statement in TRIGGERS:
-        await db.execute(statement)
     await db.execute(
         """INSERT OR IGNORE INTO source_health
            (source,status,consecutive_failures,updated_at)
@@ -1032,7 +1524,7 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
         (_utc_now(),),
     )
 
-    if current_migration < CATALYST_SCHEMA_MIGRATION:
+    if needs_v3_migration:
         # A legacy in-flight row has no durable upstream response identifier. It is
         # safe to return it to pending, but it is never submitted during migration.
         await db.execute(
@@ -1065,6 +1557,28 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
                  WHERE c.entity_type='news' AND c.entity_id=CAST(n.id AS TEXT)
                )"""
         )
+    if needs_v4_migration:
+        migration_stats = await _migrate_ticker_lineage_v4(db)
+        logger.info(
+            "ticker_lineage_v4_migration_completed "
+            "mentions_deduplicated=%s validation_revisions_backfilled=%s "
+            "invalid_impacts_removed=%s",
+            migration_stats["mentions_deduplicated"],
+            migration_stats["validation_revisions_backfilled"],
+            migration_stats["invalid_impacts_removed"],
+        )
+
+    for statement in INDEXES:
+        await db.execute(statement)
+    # This trigger changed in v4 from effective-time ordering to physical
+    # observation ordering. Recreate it even when an existing v4 database is
+    # opened so delayed historical repairs cannot fall behind /latest watermarks.
+    await db.execute(
+        "DROP TRIGGER IF EXISTS trg_ticker_validation_integration_insert"
+    )
+    for statement in TRIGGERS:
+        await db.execute(statement)
+    if needs_v3_migration or needs_v4_migration:
         await db.execute(f"PRAGMA user_version={CATALYST_SCHEMA_MIGRATION}")
     await db.commit()
     if migration_lock_held:

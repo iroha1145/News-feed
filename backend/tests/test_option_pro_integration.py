@@ -47,6 +47,11 @@ from app.routers import settings as settings_router
 from app.services import calendar_analyzer, calendar_client
 from app.services.focus_context import FOCUS_SCHEMA_SHA256, FocusContext, persist_focus_context
 from app.services.market_focus import ingest_event_evidence
+from app.services.ticker_lineage import (
+    append_validation_revision,
+    build_validation_basis_hash,
+    record_ticker_mention,
+)
 from app.services.analysis_jobs import (
     InputVersionConflict,
     claim_next_job,
@@ -602,8 +607,10 @@ def test_model_tickers_are_validated_before_trusted_projection(isolated_integrat
                 (news_id,),
             )).fetchall()
             assert [tuple(row) for row in impacts] == [
+                ("AI", "ambiguous", 7, "universe-7", "llm_inference"),
                 ("AMD", "valid_external", 7, "universe-7", "llm_inference"),
                 ("NVDA", "canonical", 7, "universe-7", "llm_inference"),
+                ("XYZ", "unverified", 7, "universe-7", "llm_inference"),
             ]
             mentions = await (await db.execute(
                 """SELECT ticker,validation_status FROM news_ticker_mentions
@@ -1610,7 +1617,7 @@ def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tm
                 "event_projection_status",
             } <= source_columns
             async with db.execute("PRAGMA user_version") as cursor:
-                assert (await cursor.fetchone())[0] == 3
+                assert (await cursor.fetchone())[0] == 4
             async with db.execute(
                 "SELECT source_input_hash,content_hash FROM analysis_jobs WHERE job_id='legacy-job'"
             ) as cursor:
@@ -2118,6 +2125,122 @@ def test_empty_latest_advances_watermark_without_losing_later_change(isolated_in
             assert [item.news_id for item in later_items] == [later_id]
             assert later_more is False
             assert next_watermark >= watermark
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_late_historical_validation_is_visible_after_latest_watermark(
+    isolated_integration_db,
+):
+    async def scenario():
+        db = await database.get_db()
+        try:
+            initial_effective_at = datetime.now(timezone.utc) - timedelta(hours=2)
+            news_id = await database.insert_news_item(
+                db,
+                news_record(293, fetched_at=initial_effective_at.isoformat()),
+            )
+            initial_basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="late-history",
+            )
+            mention = await record_ticker_mention(
+                db,
+                news_id=news_id,
+                ticker="XYZ",
+                association_method="exact_alias",
+                association_confidence=1.0,
+                source="alias_dictionary",
+                validation_status="unverified",
+                available_at=initial_effective_at,
+                focus_revision=1,
+                universe_version="late-history",
+                validation_basis_hash=initial_basis,
+            )
+            await db.commit()
+
+            _, initial_items, watermark, _, _, _ = await query_latest(
+                db,
+                updated_after=initial_effective_at - timedelta(hours=1),
+                limit=20,
+                cursor=None,
+            )
+            assert [item.news_id for item in initial_items] == [news_id]
+            assert watermark is not None
+            before, _, _, _ = await query_ticker(
+                db,
+                ticker="XYZ",
+                as_of=watermark,
+                window_hours=24,
+                limit=20,
+                cursor=None,
+                min_confidence=0,
+                include_neutral=True,
+                include_unanalyzed=True,
+            )
+            assert before == []
+
+            await asyncio.sleep(0.01)
+            observed_at = datetime.now(timezone.utc)
+            late_effective_at = watermark - timedelta(minutes=30)
+            late_basis = build_validation_basis_hash(
+                canonical_symbols={"XYZ"},
+                external_symbols=set(),
+                universe_version="late-history-corrected",
+            )
+            _, created = await append_validation_revision(
+                db,
+                mention_id=int(mention["mention_id"]),
+                validation_status="canonical",
+                available_at=late_effective_at,
+                observed_at=observed_at,
+                focus_revision=2,
+                universe_version="late-history-corrected",
+                reason_code="delayed_focus_repair",
+                validation_basis_hash=late_basis,
+            )
+            assert created is True
+            await db.commit()
+
+            current, _, _, _ = await query_ticker(
+                db,
+                ticker="XYZ",
+                as_of=observed_at + timedelta(seconds=1),
+                window_hours=24,
+                limit=20,
+                cursor=None,
+                min_confidence=0,
+                include_neutral=True,
+                include_unanalyzed=True,
+            )
+            assert [item.news_id for item in current] == [news_id]
+            _, changed_items, next_watermark, _, has_more, _ = await query_latest(
+                db,
+                updated_after=watermark,
+                limit=20,
+                cursor=None,
+            )
+            assert [item.news_id for item in changed_items] == [news_id]
+            assert has_more is False
+            assert next_watermark >= watermark
+
+            timestamps = await (await db.execute(
+                """SELECT v.available_at,v.created_at,c.updated_at
+                   FROM ticker_validation_revisions v
+                   JOIN integration_changes c
+                     ON c.entity_type='analysis'
+                    AND c.entity_id=CAST(? AS TEXT)
+                    AND c.payload_hash=v.validation_basis_hash
+                   WHERE v.mention_id=? AND v.validation_basis_hash=?""",
+                (news_id, mention["mention_id"], late_basis),
+            )).fetchone()
+            assert timestamps is not None
+            assert datetime.fromisoformat(timestamps[0]) < watermark
+            assert datetime.fromisoformat(timestamps[1]) > watermark
+            assert timestamps[2] == timestamps[1]
         finally:
             await db.close()
 
@@ -2642,3 +2765,40 @@ def test_signed_integration_endpoints_match_committed_contract(isolated_integrat
         batch = client.post(batch_target, content=batch_body, headers=batch_headers)
         assert batch.status_code == 200
         assert batch.json()["results"]["AMD"]["status"] == "active"
+
+        async def mention_available_at():
+            db = await database.get_db()
+            try:
+                async with db.execute(
+                    """SELECT v.available_at FROM ticker_validation_revisions v
+                       JOIN news_ticker_mentions m ON m.id=v.mention_id
+                       WHERE m.news_id=? AND m.ticker='AMD'
+                       ORDER BY v.available_at,v.id LIMIT 1""",
+                    (news_id,),
+                ) as cursor:
+                    return str((await cursor.fetchone())[0])
+            finally:
+                await db.close()
+
+        visible_at = datetime.fromisoformat(run(mention_available_at()))
+        for nonce, cutoff, expected_count in (
+            ("nonce-contract-batch-asof-before", visible_at - timedelta(microseconds=1), 0),
+            ("nonce-contract-batch-asof-exact", visible_at, 1),
+        ):
+            body = json.dumps(
+                {
+                    "tickers": ["AMD"],
+                    "as_of": cutoff.isoformat(),
+                    "include_neutral": True,
+                },
+                separators=(",", ":"),
+            ).encode()
+            response = client.post(
+                batch_target,
+                content=body,
+                headers=_signed_headers(
+                    "POST", batch_target, body, "read-key", "read-secret", nonce
+                ),
+            )
+            assert response.status_code == 200, response.text
+            assert len(response.json()["results"]["AMD"]["items"]) == expected_count

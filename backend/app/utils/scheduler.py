@@ -88,6 +88,22 @@ async def _job_pull_focus_context() -> None:
         logger.error("[Scheduler] Focus context pull failed: %s", type(exc).__name__)
 
 
+async def _job_resume_focus_revalidation() -> None:
+    try:
+        from app.services.focus_context import resume_focus_revalidation
+
+        result = await resume_focus_revalidation()
+        if result.get("pending"):
+            logger.info(
+                "[Scheduler] Focus revalidation pending: revision=%s phase=%s cursor=%s",
+                result.get("focus_revision"),
+                result.get("phase"),
+                result.get("mention_cursor") or result.get("group_cursor"),
+            )
+    except Exception as exc:
+        logger.error("[Scheduler] Focus revalidation resume failed: %s", type(exc).__name__)
+
+
 async def _job_market_focus_cycle() -> None:
     if not app_settings.hot_cycle_schedule_enabled:
         return
@@ -216,6 +232,14 @@ async def start_scheduler() -> None:
         seconds=app_settings.option_pro_focus_interval_seconds,
         job_id="pull_option_pro_focus_context",
         name="Pull Option Pro focus context",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_resume_focus_revalidation,
+        seconds=app_settings.focus_revalidation_resume_interval_seconds,
+        job_id="resume_focus_revalidation",
+        name="Resume bounded focus revalidation",
     )
 
     _add_interval_job(
