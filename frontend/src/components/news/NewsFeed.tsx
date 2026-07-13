@@ -123,7 +123,7 @@ export default function NewsFeed() {
   return (
     <div className="flex min-h-screen">
       {/* Main content */}
-      <main className="flex-1 xl:mr-80 p-4 md:p-6 lg:p-8 space-y-8" id="main-content">
+      <main className="min-w-0 flex-1 xl:mr-80 p-4 md:p-6 lg:p-8 space-y-8" id="main-content">
         {/* Hero header */}
         <section className="space-y-4">
           <div className="inline-flex items-center gap-2 px-3 py-1 bg-secondary-container dark:bg-violet-900/30 text-on-secondary-container dark:text-violet-300 rounded-full text-xs font-bold tracking-wide">
