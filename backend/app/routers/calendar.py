@@ -4,6 +4,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path
 
 from app.deps.auth import require_admin
+from app.config import settings
 from app.models.database import get_db
 from app.services.calendar_client import fetch_economic_calendar, get_calendar_status
 from app.services.calendar_analyzer import (
@@ -42,6 +43,7 @@ async def get_economic_calendar():
         "events": events,
         "count": len(events),
         "analyzed": len(analyzed or []),
+        "analysis_capability": settings.manual_calendar_analysis_capability,
         **get_calendar_status(),
     }
 
@@ -52,6 +54,15 @@ async def analyze_economic_calendar(
     _: None = Depends(require_admin),
 ):
     """Persist a calendar analysis job without opening a model request."""
+    capability = settings.manual_calendar_analysis_capability
+    if capability != "enabled":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": capability,
+                "message": "Calendar analysis is disabled until both daily budgets are configured.",
+            },
+        )
     events = await fetch_economic_calendar()
     provider_name, model = await get_calendar_model_identity()
     db = await get_db()

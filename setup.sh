@@ -189,7 +189,7 @@ fi
 
 case "$DEFAULT_LLM_PROVIDER" in
     openai)
-        prompt_value OPENAI_API_KEY "OpenAI API Key" "" true true
+        prompt_value OPENAI_API_KEY "OpenAI API Key" "付费能力关闭时可留空" true false
         OPENAI_BASE_URL="$(existing_value OPENAI_BASE_URL)"
         OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
         prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 gpt-5.6-terra" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
@@ -199,7 +199,7 @@ case "$DEFAULT_LLM_PROVIDER" in
         GROK_API_KEY="$(existing_value GROK_API_KEY)"
         ;;
     anthropic)
-        prompt_value ANTHROPIC_API_KEY "Anthropic API Key" "" true true
+        prompt_value ANTHROPIC_API_KEY "Anthropic API Key" "付费能力关闭时可留空" true false
         prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 claude-sonnet-4-6" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
         DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-claude-sonnet-4-6}"
         DEFAULT_LLM_API_KEY="$ANTHROPIC_API_KEY"
@@ -209,7 +209,7 @@ case "$DEFAULT_LLM_PROVIDER" in
         GROK_API_KEY="$(existing_value GROK_API_KEY)"
         ;;
     grok)
-        prompt_value GROK_API_KEY "Grok API Key" "" true true
+        prompt_value GROK_API_KEY "Grok API Key" "付费能力关闭时可留空" true false
         prompt_value DEFAULT_LLM_MODEL "模型名称" "默认 grok-4" false false "$([ "$provider_changed" = false ] && echo true || echo false)"
         DEFAULT_LLM_MODEL="${DEFAULT_LLM_MODEL:-grok-4}"
         DEFAULT_LLM_API_KEY="$GROK_API_KEY"
@@ -334,11 +334,12 @@ write_env_value ANALYSIS_WORKER_LEASE_SECONDS "$(setting_or_default ANALYSIS_WOR
 write_env_value ANALYSIS_JOB_RETRY_COOLDOWN_SECONDS "$(setting_or_default ANALYSIS_JOB_RETRY_COOLDOWN_SECONDS 300)"
 write_env_value CALENDAR_ANALYSIS_PROMPT_VERSION "$(setting_or_default CALENDAR_ANALYSIS_PROMPT_VERSION calendar-impact-v1)"
 write_env_value CALENDAR_ANALYSIS_SCHEMA_VERSION "$(setting_or_default CALENDAR_ANALYSIS_SCHEMA_VERSION calendar-impact-schema-v1)"
+write_env_value CALENDAR_LLM_MANUAL_ENABLED "$(setting_or_default CALENDAR_LLM_MANUAL_ENABLED false)"
 write_env_value CALENDAR_LLM_MAX_INFLIGHT "$(setting_or_default CALENDAR_LLM_MAX_INFLIGHT 1)"
 write_env_value CALENDAR_LLM_MAX_QUEUED "$(setting_or_default CALENDAR_LLM_MAX_QUEUED 10)"
 write_env_value CALENDAR_MAX_OUTPUT_TOKENS "$(setting_or_default CALENDAR_MAX_OUTPUT_TOKENS 16384)"
-write_env_value CALENDAR_LLM_DAILY_JOB_LIMIT "$(setting_or_default CALENDAR_LLM_DAILY_JOB_LIMIT 10)"
-write_env_value CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT "$(setting_or_default CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT 200000)"
+write_env_value CALENDAR_LLM_DAILY_JOB_LIMIT "$(existing_value CALENDAR_LLM_DAILY_JOB_LIMIT)"
+write_env_value CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT "$(existing_value CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT)"
 write_env_value ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
 write_env_value GROK_API_KEY "$GROK_API_KEY"
 write_env_value GROK_MODEL "$GROK_MODEL"
@@ -350,6 +351,7 @@ write_env_value SESSION_COOKIE_SECURE "$(setting_or_default SESSION_COOKIE_SECUR
 write_env_value SESSION_TTL_SECONDS "$(setting_or_default SESSION_TTL_SECONDS 28800)"
 write_env_value ANALYSIS_BATCH_SIZE "$(setting_or_default ANALYSIS_BATCH_SIZE 10)"
 write_env_value ANALYSIS_RETENTION_LIMIT "$(setting_or_default ANALYSIS_RETENTION_LIMIT 350)"
+write_env_value X_SENTIMENT_ENABLED "$(setting_or_default X_SENTIMENT_ENABLED false)"
 write_env_value X_SENTIMENT_INTERVAL "$(setting_or_default X_SENTIMENT_INTERVAL 21600)"
 write_env_value CALENDAR_ANALYSIS_CACHE_TTL "$(setting_or_default CALENDAR_ANALYSIS_CACHE_TTL 3600)"
 write_env_value CALENDAR_FETCH_INTERVAL_SECONDS "$(setting_or_default CALENDAR_FETCH_INTERVAL_SECONDS 600)"
@@ -363,6 +365,12 @@ write_env_value EVENT_GROUP_RETENTION_DAYS "$(existing_value EVENT_GROUP_RETENTI
 write_env_value ANALYSIS_CYCLE_RETENTION_DAYS "$(existing_value ANALYSIS_CYCLE_RETENTION_DAYS)"
 write_env_value CALENDAR_REVISION_RETENTION_DAYS "$(existing_value CALENDAR_REVISION_RETENTION_DAYS)"
 write_env_value INTEGRATION_CHANGE_RETENTION_DAYS "$(existing_value INTEGRATION_CHANGE_RETENTION_DAYS)"
+write_env_value HOTSPOT_PREPARATION_RETENTION_DAYS "$(setting_or_default HOTSPOT_PREPARATION_RETENTION_DAYS 90)"
+write_env_value MARKET_FOCUS_COMPLETED_RETENTION_DAYS "$(setting_or_default MARKET_FOCUS_COMPLETED_RETENTION_DAYS 365)"
+write_env_value MARKET_FOCUS_FAILED_RETENTION_DAYS "$(setting_or_default MARKET_FOCUS_FAILED_RETENTION_DAYS 30)"
+write_env_value EVENT_MEMBER_RETENTION_DAYS "$(setting_or_default EVENT_MEMBER_RETENTION_DAYS 90)"
+write_env_value PROJECTION_RETRY_RETENTION_DAYS "$(setting_or_default PROJECTION_RETRY_RETENTION_DAYS 30)"
+write_env_value PROJECTION_RETRY_MAX_ATTEMPTS "$(setting_or_default PROJECTION_RETRY_MAX_ATTEMPTS 6)"
 write_env_value DATABASE_URL "$(setting_or_default DATABASE_URL sqlite+aiosqlite:///data/macrolens.db)"
 write_env_value CORS_ORIGINS "$CORS_ORIGINS"
 write_env_value MACROLENS_DATA_DIR "$MACROLENS_DATA_DIR"

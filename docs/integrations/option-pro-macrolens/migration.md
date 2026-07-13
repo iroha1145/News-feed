@@ -6,7 +6,7 @@
 
 ## MacroLens
 
-本轮数据库迁移号为 `PRAGMA user_version=2`。程序拒绝打开高于自身支持版本的数据库，迁移完成并校验后才写入版本号。
+本轮数据库迁移号为 `PRAGMA user_version=3`。程序拒绝打开高于自身支持版本的数据库，迁移完成并校验后才写入版本号。迁移失败会回滚事务并恢复外键检查。
 
 新增 analysis_jobs、analysis_revisions、analysis_stock_impacts、calendar_analysis_jobs、calendar_snapshots、calendar_event_revisions、integration_changes、integration_nonces、analysis_worker_state 和持久来源健康。
 

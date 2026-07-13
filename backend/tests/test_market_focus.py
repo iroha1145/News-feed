@@ -84,6 +84,11 @@ def test_cost_defaults_and_named_persistence_tables(isolated_market_db):
     assert configured.news_llm_manual_daily_job_limit is None
     assert configured.news_llm_manual_daily_output_token_limit is None
     assert configured.hot_cycle_manual_enabled is False
+    assert configured.x_sentiment_enabled is False
+    assert configured.calendar_llm_manual_enabled is False
+    assert configured.calendar_llm_daily_job_limit is None
+    assert configured.calendar_llm_daily_output_token_limit is None
+    assert configured.manual_calendar_analysis_capability == "disabled"
     assert configured.news_item_max_output_tokens == 32768
     assert configured.hot_cycle_max_output_tokens == 49152
     assert configured.openai_max_output_tokens == 128000

@@ -2082,6 +2082,11 @@ def test_empty_latest_advances_watermark_without_losing_later_change(isolated_in
 def test_calendar_get_is_read_only_and_post_creates_persistent_job(
     isolated_integration_db, monkeypatch
 ):
+    monkeypatch.setattr(settings, "calendar_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "calendar_llm_daily_job_limit", 10)
+    monkeypatch.setattr(
+        settings, "calendar_llm_daily_output_token_limit", 200_000
+    )
     calls = {"fetch": 0}
 
     async def fake_fetch():
@@ -2322,6 +2327,65 @@ def test_hmac_scope_rotation_replay_and_expired_timestamp(isolated_integration_d
 
 def test_canonical_query_preserves_repeated_empty_values_and_rfc3986_spaces():
     assert canonical_query("z=1&a=hello+world&a=&a=%2F") == "a=&a=%2F&a=hello%20world&z=1"
+
+
+def test_signed_manual_analysis_gate_rejects_before_writing_job(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_read_key_id", "read-key")
+    monkeypatch.setattr(settings, "option_pro_read_secret", "read-secret")
+    monkeypatch.setattr(settings, "option_pro_action_key_id", "action-key")
+    monkeypatch.setattr(settings, "option_pro_action_secret", "action-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+
+    async def seed():
+        db = await database.get_db()
+        try:
+            return await database.insert_news_item(db, news_record(79))
+        finally:
+            await db.close()
+
+    news_id = run(seed())
+    target = "/api/integrations/option-pro/v1/analysis-jobs"
+    body = json.dumps(
+        {
+            "news_id": news_id,
+            "expected_content_hash": hashlib.sha256(b"news-79").hexdigest(),
+            "force": False,
+        },
+        separators=(",", ":"),
+    ).encode()
+    app = _integration_app()
+
+    monkeypatch.setattr(settings, "news_llm_manual_enabled", False)
+    with TestClient(app) as client:
+        disabled_headers = _signed_headers(
+            "POST", target, body, "action-key", "action-secret", "nonce-manual-disabled-1"
+        )
+        disabled = client.post(target, content=body, headers=disabled_headers)
+        assert disabled.status_code == 409
+        assert disabled.json()["code"] == "disabled"
+
+        monkeypatch.setattr(settings, "news_llm_manual_enabled", True)
+        monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 10)
+        monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", None)
+        budget_headers = _signed_headers(
+            "POST", target, body, "action-key", "action-secret", "nonce-manual-budget-0002"
+        )
+        unbudgeted = client.post(target, content=body, headers=budget_headers)
+        assert unbudgeted.status_code == 409
+        assert unbudgeted.json()["code"] == "budget_configuration_required"
+
+    async def count_jobs():
+        db = await database.get_db()
+        try:
+            async with db.execute("SELECT COUNT(*) FROM analysis_jobs") as cursor:
+                return int((await cursor.fetchone())[0])
+        finally:
+            await db.close()
+
+    assert run(count_jobs()) == 0
 
 
 def test_canonical_path_discards_legacy_testclient_query_suffix():

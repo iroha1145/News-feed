@@ -1,8 +1,9 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends
 
+from app.config import settings
 from app.deps.auth import require_admin
 from app.models.database import (
     get_db,
@@ -12,7 +13,7 @@ from app.models.database import (
     get_analysis_for_news,
     get_news_item_by_id,
 )
-from app.services.analysis_jobs import enqueue_auto_jobs, retry_failed_jobs
+from app.services.analysis_jobs import enqueue_manual_jobs, retry_failed_jobs
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
@@ -79,6 +80,7 @@ async def analysis_stats(days: int = Query(7, ge=1, le=365)):
     db = await get_db()
     try:
         stats = await get_analysis_stats(db, days=days)
+        stats["manual_analysis_capability"] = settings.manual_news_analysis_capability
         return stats
     finally:
         await db.close()
@@ -86,13 +88,26 @@ async def analysis_stats(days: int = Query(7, ge=1, le=365)):
 
 @router.post("/trigger")
 async def trigger_analysis(
-    background_tasks: BackgroundTasks,
     batch_size: int = Query(5, ge=1, le=50),
     _: None = Depends(require_admin),
 ):
     """Manually trigger analysis for unanalyzed news items."""
-    background_tasks.add_task(enqueue_auto_jobs, batch_size)
-    return {"status": "triggered", "batch_size": batch_size}
+    capability = settings.manual_news_analysis_capability
+    if capability != "enabled":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": capability,
+                "message": "Manual analysis is disabled until both daily budgets are configured.",
+            },
+        )
+    enqueued = await enqueue_manual_jobs(batch_size)
+    return {
+        "status": "queued" if enqueued else "no_eligible_news",
+        "batch_size": batch_size,
+        "enqueued": enqueued,
+        "capability": capability,
+    }
 
 
 @router.post("/retry-failed")
@@ -101,6 +116,15 @@ async def retry_failed_analyses(
     _: None = Depends(require_admin),
 ):
     """Reset failed analyses after an operator has corrected the underlying issue."""
+    capability = settings.manual_news_analysis_capability
+    if capability != "enabled":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": capability,
+                "message": "Manual analysis is disabled until both daily budgets are configured.",
+            },
+        )
     db = await get_db()
     try:
         jobs = await retry_failed_jobs(db, news_id=news_id)

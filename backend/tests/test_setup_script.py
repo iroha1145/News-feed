@@ -71,6 +71,22 @@ def test_setup_defaults_to_terra_without_printing_secret(tmp_path: Path):
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
 
 
+def test_setup_allows_blank_model_key_when_paid_capabilities_are_disabled(tmp_path: Path):
+    env_file = tmp_path / "readonly.env"
+    answers = "\n\n\n\n\n\n\nn\n"
+
+    result = _run_setup(tmp_path, env_file, answers)
+
+    assert result.returncode == 0, result.stderr
+    generated = env_file.read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=''" in generated
+    assert "NEWS_LLM_MANUAL_ENABLED='false'" in generated
+    assert "CALENDAR_LLM_MANUAL_ENABLED='false'" in generated
+    assert "HOT_CYCLE_ENABLED='false'" in generated
+    assert "X_SENTIMENT_ENABLED='false'" in generated
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+
 def test_setup_is_idempotent_preserves_special_values_and_future_keys(tmp_path: Path):
     env_file = tmp_path / "existing.env"
     secret = "sk-test-$value\\slash'quote"

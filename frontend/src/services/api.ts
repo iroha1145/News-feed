@@ -294,6 +294,7 @@ export interface CalendarResponse {
   as_of?: string | null
   last_success?: string | null
   last_error?: string | null
+  analysis_capability?: import('../types').PaidCapability
 }
 
 export interface CalendarAnalysisResult {

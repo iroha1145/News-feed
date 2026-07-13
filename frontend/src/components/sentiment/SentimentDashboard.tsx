@@ -10,6 +10,7 @@ import { toLocalTime } from '../../utils/time'
 import { getNewsSentimentIndex } from '../../utils/sentiment'
 import { useAdminSession } from '../../context/AdminSessionContext'
 import { safeExternalUrl } from '../../utils/url'
+import { paidCapabilityEnabled, paidCapabilityLabel } from '../../utils/paidCapability'
 
 export default function SentimentDashboard() {
   const statsApi = useApi<AnalysisStats>((signal) => getAnalysisStats(signal), [])
@@ -39,6 +40,12 @@ export default function SentimentDashboard() {
   const latestAnalysis = analysesApi.data?.[0]
   const news = newsApi.data?.items ?? []
   const sentiment = getNewsSentimentIndex(stats)
+  const calendarCapability = calendarApi.data?.analysis_capability
+  const calendarAnalysisEnabled = paidCapabilityEnabled(calendarCapability)
+  const calendarAnalysisLabel = paidCapabilityLabel(calendarCapability, {
+    enabled: '分析日历',
+    disabled: '日历分析已关闭',
+  })
 
   const handleAnalyzeCalendar = async () => {
     if (!requireAdmin('分析经济日历需要管理员登录。')) return
@@ -373,10 +380,10 @@ export default function SentimentDashboard() {
               <button
                 type="button"
                 onClick={handleAnalyzeCalendar}
-                disabled={sessionChecking || calendarAnalyzing}
+                disabled={sessionChecking || calendarAnalyzing || !calendarAnalysisEnabled}
                 className="w-full mt-2 py-2.5 bg-primary/10 dark:bg-violet-500/10 text-primary dark:text-violet-400 rounded-xl text-xs font-bold hover:bg-primary/20 dark:hover:bg-violet-500/20 transition-colors uppercase tracking-widest disabled:opacity-50"
               >
-                {calendarAnalyzing ? '分析中…' : '分析日历'}
+                {calendarAnalyzing ? '分析中…' : calendarAnalysisLabel}
               </button>
               {calendarActionError && <p className="mt-2 text-xs text-error dark:text-red-400" role="alert">{calendarActionError}</p>}
             </section>

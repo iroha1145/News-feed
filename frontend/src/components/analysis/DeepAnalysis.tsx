@@ -1,7 +1,7 @@
 import { useParams, Link } from 'react-router-dom'
 import { useApi } from '../../hooks/useApi'
-import { getAnalysisByNewsId, getAnalyses, getNews, triggerAnalysis } from '../../services/api'
-import type { Analysis, NewsItem } from '../../types'
+import { getAnalysisByNewsId, getAnalyses, getAnalysisStats, getNews, triggerAnalysis } from '../../services/api'
+import type { Analysis, AnalysisStats, NewsItem } from '../../types'
 import LoadingSpinner from '../common/LoadingSpinner'
 import SentimentChip from '../common/SentimentChip'
 import NewsImage from '../news/NewsImage'
@@ -11,6 +11,7 @@ import { parseUtcDate } from '../../utils/time'
 import { getRealImageUrl } from '../../utils/image'
 import { useAdminSession } from '../../context/AdminSessionContext'
 import { safeExternalUrl } from '../../utils/url'
+import { paidCapabilityEnabled, paidCapabilityLabel } from '../../utils/paidCapability'
 
 export default function DeepAnalysis() {
   const { id } = useParams<{ id: string }>()
@@ -42,6 +43,13 @@ export default function DeepAnalysis() {
     (signal) => selectedNewsId ? Promise.resolve({ items: [], total: 0 }) : getNews({ page: 1, page_size: 100 }, signal),
     [selectedNewsId]
   )
+  const statsApi = useApi<AnalysisStats>((signal) => getAnalysisStats(signal), [])
+  const manualCapability = statsApi.data?.manual_analysis_capability
+  const manualAnalysisEnabled = paidCapabilityEnabled(manualCapability)
+  const manualAnalysisLabel = paidCapabilityLabel(manualCapability, {
+    enabled: '提交分析任务',
+    disabled: '分析已关闭',
+  })
 
   // Detail mode uses directApi only; list mode uses analysesApi
   const selectedAnalysis = selectedNewsId
@@ -68,8 +76,10 @@ export default function DeepAnalysis() {
     setTriggerMsg(null)
     setTriggerError(null)
     try {
-      await triggerAnalysis(controller.signal)
-      setTriggerMsg('分析任务已提交，请稍后刷新页面查看结果。')
+      const result = await triggerAnalysis(controller.signal)
+      setTriggerMsg(result.enqueued > 0
+        ? `已提交 ${result.enqueued} 项分析任务，请稍后刷新页面查看结果。`
+        : '没有符合条件的新分析任务。')
       if (selectedNewsId) directApi.refetch()
       else analysesApi.refetch()
     } catch (error) {
@@ -109,11 +119,11 @@ export default function DeepAnalysis() {
           <div className="flex justify-center gap-4">
             <button
               onClick={handleTrigger}
-              disabled={sessionChecking || triggering}
+              disabled={sessionChecking || triggering || !manualAnalysisEnabled}
               className="bg-gradient-to-r from-primary to-primary-container text-white px-6 py-3 rounded-xl font-bold text-sm hover:shadow-lg hover:shadow-primary/20 active:scale-95 transition-all"
             >
               <span className="material-symbols-outlined text-sm align-middle mr-2">auto_awesome</span>
-              {triggering ? '提交中…' : '提交分析任务'}
+              {triggering ? '提交中…' : manualAnalysisLabel}
             </button>
             <Link
               to="/news"
@@ -468,11 +478,11 @@ export default function DeepAnalysis() {
           <div className="space-y-3">
             <button
               onClick={handleTrigger}
-              disabled={sessionChecking || triggering}
+              disabled={sessionChecking || triggering || !manualAnalysisEnabled}
               className="w-full py-3 bg-gradient-to-r from-primary to-primary-container text-white rounded-xl text-xs font-bold hover:shadow-lg active:scale-95 transition-all"
             >
               <span className="material-symbols-outlined text-sm align-middle mr-1">auto_awesome</span>
-              {triggering ? '提交中…' : '提交新分析'}
+              {triggering ? '提交中…' : manualAnalysisLabel}
             </button>
             {triggerMsg && <p className="text-xs text-primary dark:text-violet-400 text-center" role="status" aria-live="polite">{triggerMsg}</p>}
             {triggerError && <p className="text-xs text-error dark:text-red-400 text-center" role="alert">{triggerError}</p>}

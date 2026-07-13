@@ -38,9 +38,17 @@ def test_backend_and_worker_share_model_database_and_retention_environment():
         "OPENAI_EXECUTION_MODE",
         "NEWS_IMPACT_PROMPT_VERSION",
         "CALENDAR_ANALYSIS_SCHEMA_VERSION",
+        "CALENDAR_LLM_MANUAL_ENABLED",
+        "X_SENTIMENT_ENABLED",
         "ANALYSIS_RETENTION_LIMIT",
         "NEWS_RETENTION_DAYS",
         "X_SENTIMENT_RETENTION_DAYS",
+        "HOTSPOT_PREPARATION_RETENTION_DAYS",
+        "MARKET_FOCUS_COMPLETED_RETENTION_DAYS",
+        "MARKET_FOCUS_FAILED_RETENTION_DAYS",
+        "EVENT_MEMBER_RETENTION_DAYS",
+        "PROJECTION_RETRY_RETENTION_DAYS",
+        "PROJECTION_RETRY_MAX_ATTEMPTS",
     ):
         assert f"  {key}: ${{{key}:-" in compose
 

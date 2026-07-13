@@ -123,6 +123,8 @@ export interface ProviderInfo {
 export interface TriggerAnalysisResponse {
   status: string;
   batch_size: number;
+  enqueued: number;
+  capability: PaidCapability;
 }
 
 export interface RefreshXSentimentResponse {
@@ -156,7 +158,14 @@ export interface AnalysisStats {
   sector_breakdown?: Record<string, number>;
   sector_sentiment?: Record<string, SectorSentimentData>;
   top_affected_stocks?: TopAffectedStockStat[];
+  manual_analysis_capability?: PaidCapability;
 }
+
+export type PaidCapability =
+  | 'enabled'
+  | 'disabled'
+  | 'budget_configuration_required'
+  | 'budget_blocked';
 
 export interface NewsListResponse {
   items: NewsItem[];

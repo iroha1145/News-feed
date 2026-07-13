@@ -2,6 +2,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Depends
 
+from app.config import settings
 from app.deps.auth import require_admin
 from app.models.database import get_db, get_latest_x_sentiment, get_x_sentiment_history
 from app.services.grok_x_monitor import run_x_sentiment_analysis, get_last_error
@@ -37,6 +38,14 @@ async def refresh_x_sentiment(
     _: None = Depends(require_admin),
 ):
     """Trigger a news-grounded model market scenario via Grok."""
+    if not settings.x_sentiment_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "disabled",
+                "message": "Model market scenario refresh is disabled.",
+            },
+        )
     background_tasks.add_task(run_x_sentiment_analysis)
     return {"status": "triggered", "message": "News-grounded market scenario started in background"}
 

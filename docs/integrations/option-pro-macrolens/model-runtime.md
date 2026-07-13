@@ -51,6 +51,8 @@ Schema；不得把一种结果模型用于另一种任务，也不得用 setdefa
 
 `POST /api/calendar/analyze` 只创建独立的持久 Calendar Job 并返回 202；浏览器通过 `GET /api/calendar/analyze/{job_id}` 轮询本地状态。Calendar Job 使用独立队列、并发和每日任务／输出 Token 预算，但仍受全局 OpenAI 并发上限约束。失败后的显式重试创建新 job_id 并保留旧用量；submission_outcome_unknown 不得重提。Calendar GET 只读取原始日历和已完成结果，不触发模型，也不保持用户 HTTP 长连接。
 
+所有手动付费入口都必须显式开启。新闻使用 `NEWS_LLM_MANUAL_ENABLED`，经济日历使用 `CALENDAR_LLM_MANUAL_ENABLED`，旧版 Grok 市场情景使用 `X_SENTIMENT_ENABLED`；默认值均为 `false`。新闻与日历还必须同时配置各自的每日任务数和每日输出 Token 预算，否则接口返回能力未配置，网页按钮保持禁用。关闭能力后，Worker 只允许继续查询或取消已经保存 Response ID 的上游任务，不会领取尚未提交的新任务。
+
 每个任务在创建时冻结 `execution_mode` 与 `max_output_tokens`。进程环境后来改变，不会改变旧任务的调用方式或额度；带 OpenAI Response ID 的旧 Background 任务始终优先 retrieve／cancel，不能重新 create。新闻与 Calendar 分别按在途任务的冻结输出上限预留每日 Token 预算，完成后才按实际输出用量结算；submission_outcome_unknown 与尚未确认的取消继续保留额度。
 
 ## 低上下文
