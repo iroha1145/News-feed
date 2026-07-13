@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -36,7 +37,11 @@ from app.models.catalysts import (
     ErrorBody,
     FeedResponse,
     IntegrationHealthResponse,
+    HotspotListResponse,
+    HotspotStatusResponse,
     LatestResponse,
+    MarketFocusCycleCreateRequest,
+    MarketFocusCycleResponse,
     NewsImpactAnalysis,
     NewsResponse,
     PublicAnalysis,
@@ -54,6 +59,14 @@ from app.services.analysis_jobs import (
 )
 from app.services.responses_runtime import OpenAIResponsesProvider
 from app.services.worker_health import evaluate_worker_heartbeat
+from app.services.market_focus import (
+    CycleConflict,
+    create_market_focus_cycle,
+    get_hotspot_status,
+    list_prepared_hotspots,
+    request_market_focus_cancel,
+    retry_market_focus_cycle,
+)
 
 PREFIX = "/api/integrations/option-pro/v1"
 router = APIRouter(prefix=PREFIX, tags=["option-pro-integration"])
@@ -175,14 +188,17 @@ async def integration_health(
         and provider_configured
         and capabilities.status == "ok"
     )
-    budget_status: Literal["ok", "budget_unbounded", "budget_blocked"] = (
-        "budget_unbounded"
-        if settings.news_llm_daily_job_limit is None and settings.news_llm_daily_output_token_limit is None
-        else "ok"
-    )
+    budget_status: Literal["ok", "budget_configuration_required", "budget_blocked"] = "ok"
+    if settings.news_llm_auto_analyze_enabled and settings.automatic_news_analysis_capability != "enabled":
+        budget_status = "budget_configuration_required"
+        warnings_auto_budget = True
+    else:
+        warnings_auto_budget = False
     if counts.get("budget_blocked", 0):
         budget_status = "budget_blocked"
     warnings: list[str] = []
+    if warnings_auto_budget:
+        warnings.append("automatic_analysis_budget_configuration_required")
     if not action_configured:
         warnings.append("analysis_action_key_not_configured")
     if not provider_configured:
@@ -258,9 +274,10 @@ async def feed(
     classification: Optional[Literal["bullish", "bearish", "neutral"]] = None,
     min_confidence: Annotated[int, Query(ge=0, le=100)] = 0,
     min_abs_impact: Annotated[int, Query(ge=0, le=100)] = 0,
+    include_unanalyzed: bool = True,
     analysis_status: Optional[Literal[
         "not_requested", "pending", "queued", "in_progress", "completed", "failed",
-        "cancelled", "insufficient_context", "budget_blocked"
+        "cancelled", "insufficient_context", "budget_blocked", "incomplete_output"
     ]] = None,
     _: IntegrationPrincipal = Depends(require_read),
 ):
@@ -278,6 +295,7 @@ async def feed(
             min_confidence=min_confidence,
             min_abs_impact=min_abs_impact,
             analysis_status=analysis_status,
+            include_unanalyzed=include_unanalyzed,
         )
     finally:
         await db.close()
@@ -338,6 +356,7 @@ async def catalysts_for_ticker(
     cursor: Annotated[Optional[str], Query(max_length=4096)] = None,
     min_confidence: Annotated[int, Query(ge=0, le=100)] = 0,
     include_neutral: bool = False,
+    include_unanalyzed: bool = True,
     _: IntegrationPrincipal = Depends(require_read),
 ):
     cutoff = bounded_as_of(as_of)
@@ -353,6 +372,7 @@ async def catalysts_for_ticker(
             cursor=cursor,
             min_confidence=min_confidence,
             include_neutral=include_neutral,
+            include_unanalyzed=include_unanalyzed,
         )
         result_status = await catalyst_result_status(db, items)
     finally:
@@ -385,6 +405,7 @@ async def catalyst_batch(
                 cursor=None,
                 min_confidence=body.min_confidence,
                 include_neutral=body.include_neutral,
+                include_unanalyzed=body.include_unanalyzed,
             )
             result_status = await catalyst_result_status(db, items)
             results[ticker] = BatchTickerResult(
@@ -493,6 +514,145 @@ async def cancel_analysis_job(
         await db.close()
 
 
+def _public_cycle(row: dict) -> dict:
+    result = dict(row)
+    for key in (
+        "lease_owner", "lease_expires_at", "fencing_token", "input_json",
+        "openai_response_id", "prompt_cache_key",
+    ):
+        result.pop(key, None)
+    value = result.pop("result_json", None)
+    result["result"] = json.loads(value) if value else None
+    result["no_new_hot_events"] = bool(result["no_new_hot_events"])
+    return result
+
+
+@router.get("/hotspots/status", response_model=HotspotStatusResponse)
+async def hotspot_status(
+    request: Request,
+    _: IntegrationPrincipal = Depends(require_read),
+):
+    db = await get_db()
+    try:
+        status = await get_hotspot_status(db)
+    finally:
+        await db.close()
+    return {**metadata(request), **status}
+
+
+@router.get("/hotspots", response_model=HotspotListResponse)
+async def hotspots(
+    request: Request,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    as_of: Optional[datetime] = None,
+    _: IntegrationPrincipal = Depends(require_read),
+):
+    cutoff = bounded_as_of(as_of)
+    db = await get_db()
+    try:
+        items = await list_prepared_hotspots(db, limit=limit, as_of=cutoff)
+    finally:
+        await db.close()
+    return {**metadata(request), "as_of": cutoff, "items": items}
+
+
+@router.post(
+    "/market-focus-cycles",
+    status_code=202,
+    response_model=MarketFocusCycleResponse,
+)
+async def create_focus_cycle(
+    request: Request,
+    body: MarketFocusCycleCreateRequest,
+    _: IntegrationPrincipal = Depends(require_action),
+):
+    if body.trigger != "manual":
+        raise IntegrationAPIError(
+            403,
+            "scheduled_trigger_reserved",
+            "Scheduled cycle triggers are reserved for the server scheduler.",
+        )
+    db = await get_db()
+    try:
+        try:
+            if body.retry_cycle_id:
+                cycle = await retry_market_focus_cycle(db, body.retry_cycle_id)
+            else:
+                cycle = await create_market_focus_cycle(
+                    db,
+                    trigger_type=body.trigger,
+                    expected_prepared_revision=body.expected_prepared_revision,
+                )
+        except CycleConflict as exc:
+            status_code = 429 if exc.code in {"daily_job_limit_reached", "daily_output_token_limit_reached"} else 409
+            raise IntegrationAPIError(
+                status_code,
+                exc.code,
+                "The market-focus cycle cannot be created in the current state.",
+                retryable=exc.retry_after is not None,
+                retry_after_seconds=exc.retry_after,
+            ) from exc
+    finally:
+        await db.close()
+    return {**metadata(request), "cycle": _public_cycle(cycle)}
+
+
+@router.get("/market-focus-cycles/latest", response_model=MarketFocusCycleResponse)
+async def latest_focus_cycle(
+    request: Request,
+    _: IntegrationPrincipal = Depends(require_read),
+):
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT * FROM market_focus_cycles ORDER BY created_at DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+    finally:
+        await db.close()
+    return {**metadata(request), "cycle": _public_cycle(dict(row)) if row else None}
+
+
+@router.get(
+    "/market-focus-cycles/{cycle_id}", response_model=MarketFocusCycleResponse
+)
+async def focus_cycle(
+    request: Request,
+    cycle_id: Annotated[str, Path(pattern=r"^mfc_[a-f0-9]{32}$")],
+    _: IntegrationPrincipal = Depends(require_read),
+):
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT * FROM market_focus_cycles WHERE cycle_id=?", (cycle_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+    finally:
+        await db.close()
+    if row is None:
+        raise IntegrationAPIError(404, "cycle_not_found", "The market-focus cycle was not found.")
+    return {**metadata(request), "cycle": _public_cycle(dict(row))}
+
+
+@router.post(
+    "/market-focus-cycles/{cycle_id}/cancel",
+    response_model=MarketFocusCycleResponse,
+)
+async def cancel_focus_cycle(
+    request: Request,
+    cycle_id: Annotated[str, Path(pattern=r"^mfc_[a-f0-9]{32}$")],
+    _: IntegrationPrincipal = Depends(require_action),
+):
+    db = await get_db()
+    try:
+        cycle = await request_market_focus_cancel(db, cycle_id)
+    finally:
+        await db.close()
+    if cycle is None:
+        raise IntegrationAPIError(404, "cycle_not_found", "The market-focus cycle was not found.")
+    return {**metadata(request), "cycle": _public_cycle(cycle)}
+
+
 def error_response(request: Request, error: IntegrationAPIError) -> JSONResponse:
     body = ErrorBody(
         **metadata(request),
@@ -500,6 +660,9 @@ def error_response(request: Request, error: IntegrationAPIError) -> JSONResponse
         message=error.message,
         retryable=error.retryable,
         retry_after_seconds=error.retry_after_seconds,
+        resync_from=error.resync_from,
+        server_time=error.server_time,
+        latest_window_days=error.latest_window_days,
     )
     headers = {}
     if error.retry_after_seconds is not None:

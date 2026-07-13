@@ -20,12 +20,19 @@ from app.models.catalysts import (
     ErrorBody,
     FeedResponse,
     IntegrationHealthResponse,
+    HotspotListResponse,
+    HotspotPreparationItem,
+    HotspotStatusResponse,
     LatestResponse,
+    MarketFocusCycleCreateRequest,
+    MarketFocusCyclePublic,
+    MarketFocusCycleResponse,
     NewsImpactAnalysis,
     NewsResponse,
     PublicAnalysis,
     SCHEMA_VERSION,
 )
+from app.models.market_focus import MarketFocusCyclePublicAnalysis
 
 
 CONTRACT_FILENAME = "macrolens-option-pro-v1.json"
@@ -72,6 +79,13 @@ MODELS: tuple[Type[BaseModel], ...] = (
     AnalysisJobCreateRequest,
     AnalysisJobResponse,
     ErrorBody,
+    MarketFocusCycleCreateRequest,
+    MarketFocusCyclePublicAnalysis,
+    HotspotStatusResponse,
+    HotspotPreparationItem,
+    HotspotListResponse,
+    MarketFocusCyclePublic,
+    MarketFocusCycleResponse,
 )
 
 

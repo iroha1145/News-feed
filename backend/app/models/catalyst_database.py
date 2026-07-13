@@ -22,14 +22,16 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     execution_number INTEGER NOT NULL DEFAULT 1 CHECK(execution_number >= 1),
     status TEXT NOT NULL CHECK(status IN (
         'pending','queued','in_progress','completed','failed','cancelled',
-        'insufficient_context','budget_blocked'
+        'insufficient_context','budget_blocked','incomplete_output'
     )),
     priority INTEGER NOT NULL DEFAULT 0,
     provider TEXT NOT NULL DEFAULT 'openai',
     model TEXT NOT NULL,
     reasoning_effort TEXT NOT NULL CHECK(reasoning_effort IN ('none','low','medium','high','xhigh','max')),
     execution_mode TEXT NOT NULL DEFAULT 'background' CHECK(execution_mode IN ('background','worker_sync')),
-    max_output_tokens INTEGER NOT NULL DEFAULT 16384 CHECK(max_output_tokens >= 256),
+    max_output_tokens INTEGER NOT NULL DEFAULT 32768 CHECK(max_output_tokens BETWEEN 256 AND 128000),
+    task_type TEXT NOT NULL DEFAULT 'news_item',
+    request_origin TEXT NOT NULL DEFAULT 'manual' CHECK(request_origin IN ('manual','automatic')),
     prompt_version TEXT NOT NULL,
     schema_version TEXT NOT NULL,
     openai_response_id TEXT,
@@ -44,7 +46,11 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     cancel_requested_at TEXT,
     usage_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_input_tokens >= 0),
     usage_cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_cached_input_tokens >= 0),
+    usage_cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_cache_write_tokens >= 0),
+    usage_reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_reasoning_tokens >= 0),
     usage_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_output_tokens >= 0),
+    usage_total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_total_tokens >= 0),
+    latency_ms INTEGER CHECK(latency_ms IS NULL OR latency_ms >= 0),
     lease_owner TEXT,
     lease_expires_at TEXT,
     fencing_token INTEGER NOT NULL DEFAULT 0 CHECK(fencing_token >= 0),
@@ -192,6 +198,186 @@ CREATE TABLE IF NOT EXISTS analysis_worker_state (
 )
 """
 
+CREATE_FOCUS_CONTEXT_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS focus_context_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision INTEGER NOT NULL UNIQUE CHECK(revision >= 1),
+    schema_version TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    data_through TEXT,
+    market_session TEXT NOT NULL,
+    universe_version TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('current','stale')),
+    fetched_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+CREATE_NEWS_TICKER_MENTIONS = """
+CREATE TABLE IF NOT EXISTS news_ticker_mentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    news_id INTEGER NOT NULL REFERENCES news_items(id) ON DELETE CASCADE,
+    ticker TEXT NOT NULL CHECK(length(ticker) BETWEEN 1 AND 20),
+    association_method TEXT NOT NULL CHECK(association_method IN (
+        'provider_tag','company_endpoint','exact_alias','event_propagation','llm_inference'
+    )),
+    association_confidence REAL NOT NULL CHECK(association_confidence BETWEEN 0 AND 1),
+    validation_status TEXT NOT NULL CHECK(validation_status IN (
+        'canonical','valid_external','ambiguous','invalid','unverified'
+    )),
+    validated_at TEXT,
+    focus_revision INTEGER,
+    universe_version TEXT,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+CREATE_NEWS_EVENT_GROUPS = """
+CREATE TABLE IF NOT EXISTS news_event_groups (
+    event_group_id TEXT PRIMARY KEY,
+    representative_news_id INTEGER REFERENCES news_items(id) ON DELETE SET NULL,
+    representative_title TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    first_published_at TEXT,
+    last_published_at TEXT,
+    first_fetched_at TEXT NOT NULL,
+    last_fetched_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    member_count INTEGER NOT NULL DEFAULT 0 CHECK(member_count >= 0),
+    source_count INTEGER NOT NULL DEFAULT 0 CHECK(source_count >= 0),
+    source_names_json TEXT NOT NULL DEFAULT '[]',
+    source_tickers_json TEXT NOT NULL DEFAULT '[]',
+    validated_tickers_json TEXT NOT NULL DEFAULT '[]',
+    novelty_score REAL NOT NULL DEFAULT 100 CHECK(novelty_score BETWEEN 0 AND 100),
+    status TEXT NOT NULL CHECK(status IN ('CLUSTERED','GATED','STORED','PREPARED','LEASED','CONSUMED')),
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+CREATE_NEWS_EVENT_MEMBERS = """
+CREATE TABLE IF NOT EXISTS news_event_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_group_id TEXT NOT NULL REFERENCES news_event_groups(event_group_id) ON DELETE CASCADE,
+    news_id INTEGER REFERENCES news_items(id) ON DELETE SET NULL,
+    source TEXT NOT NULL,
+    normalized_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    published_at TEXT,
+    fetched_at TEXT NOT NULL,
+    source_tickers_json TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(event_group_id, source, normalized_url, content_hash)
+)
+"""
+
+# A preparation row is one monotonic revision. analysis_revisions remains the
+# single-news analysis history and is deliberately unrelated to this table.
+CREATE_HOTSPOT_PREPARATION_SETS = """
+CREATE TABLE IF NOT EXISTS hotspot_preparation_sets (
+    prepared_revision INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_group_id TEXT NOT NULL REFERENCES news_event_groups(event_group_id) ON DELETE CASCADE,
+    event_group_version INTEGER NOT NULL CHECK(event_group_version >= 1),
+    gate_version TEXT NOT NULL,
+    hot_score REAL NOT NULL CHECK(hot_score BETWEEN 0 AND 100),
+    component_scores_json TEXT NOT NULL,
+    active_weights_json TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    event_snapshot_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PREPARED','LEASED','CONSUMED')),
+    prepared_at TEXT NOT NULL,
+    leased_cycle_id TEXT,
+    consumed_cycle_id TEXT,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(event_group_id, event_group_version, gate_version)
+)
+"""
+
+CREATE_HOTSPOT_PREPARATION_STATE = """
+CREATE TABLE IF NOT EXISTS hotspot_preparation_state (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    prepared_revision INTEGER NOT NULL DEFAULT 0 CHECK(prepared_revision >= 0),
+    last_consumed_revision INTEGER NOT NULL DEFAULT 0 CHECK(last_consumed_revision >= 0),
+    last_cycle_at TEXT,
+    active_cycle_id TEXT,
+    cooldown_until TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+
+CREATE_MARKET_FOCUS_CYCLES = """
+CREATE TABLE IF NOT EXISTS market_focus_cycles (
+    cycle_id TEXT PRIMARY KEY,
+    scheduled_slot TEXT UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    retry_of_cycle_id TEXT REFERENCES market_focus_cycles(cycle_id) ON DELETE SET NULL,
+    execution_number INTEGER NOT NULL DEFAULT 1 CHECK(execution_number >= 1),
+    trigger_type TEXT NOT NULL CHECK(trigger_type IN ('manual','scheduled_0800','scheduled_1200','scheduled_1600','scheduled_2000')),
+    status TEXT NOT NULL CHECK(status IN (
+        'pending','queued','in_progress','completed','failed','cancelled',
+        'budget_blocked','incomplete_output','insufficient_context'
+    )),
+    no_new_hot_events INTEGER NOT NULL DEFAULT 0 CHECK(no_new_hot_events IN (0,1)),
+    prepared_revision INTEGER NOT NULL DEFAULT 0 CHECK(prepared_revision >= 0),
+    last_consumed_revision_at_start INTEGER NOT NULL DEFAULT 0 CHECK(last_consumed_revision_at_start >= 0),
+    consumes_through_revision INTEGER CHECK(consumes_through_revision IS NULL OR consumes_through_revision >= 1),
+    focus_revision INTEGER,
+    snapshot_as_of TEXT NOT NULL,
+    input_schema_version TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    event_group_count INTEGER NOT NULL CHECK(event_group_count >= 0),
+    focus_symbol_count INTEGER NOT NULL CHECK(focus_symbol_count >= 0),
+    provider TEXT NOT NULL DEFAULT 'openai',
+    model TEXT NOT NULL,
+    reasoning_effort TEXT NOT NULL,
+    execution_mode TEXT NOT NULL,
+    max_output_tokens INTEGER NOT NULL CHECK(max_output_tokens >= 256),
+    prompt_version TEXT NOT NULL,
+    output_schema_version TEXT NOT NULL,
+    prompt_cache_key TEXT NOT NULL,
+    openai_response_id TEXT,
+    result_json TEXT,
+    error_code TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    retrieve_error_count INTEGER NOT NULL DEFAULT 0 CHECK(retrieve_error_count >= 0),
+    cancel_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(cancel_attempt_count >= 0),
+    next_attempt_at TEXT,
+    cancel_requested_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0 CHECK(fencing_token >= 0),
+    latency_ms INTEGER CHECK(latency_ms IS NULL OR latency_ms >= 0),
+    usage_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_input_tokens >= 0),
+    usage_cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_cached_input_tokens >= 0),
+    usage_cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_cache_write_tokens >= 0),
+    usage_reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_reasoning_tokens >= 0),
+    usage_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_output_tokens >= 0),
+    usage_total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(usage_total_tokens >= 0),
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+
+CREATE_MARKET_FOCUS_CYCLE_EVENTS = """
+CREATE TABLE IF NOT EXISTS market_focus_cycle_events (
+    cycle_id TEXT NOT NULL REFERENCES market_focus_cycles(cycle_id) ON DELETE CASCADE,
+    prepared_revision INTEGER NOT NULL REFERENCES hotspot_preparation_sets(prepared_revision) ON DELETE RESTRICT,
+    event_group_id TEXT NOT NULL REFERENCES news_event_groups(event_group_id) ON DELETE RESTRICT,
+    event_group_version INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    PRIMARY KEY(cycle_id, prepared_revision)
+)
+"""
+
 TABLES = [
     CREATE_ANALYSIS_JOBS,
     CREATE_ANALYSIS_REVISIONS,
@@ -202,6 +388,14 @@ TABLES = [
     CREATE_INTEGRATION_NONCES,
     CREATE_SOURCE_HEALTH,
     CREATE_ANALYSIS_WORKER_STATE,
+    CREATE_FOCUS_CONTEXT_SNAPSHOTS,
+    CREATE_NEWS_TICKER_MENTIONS,
+    CREATE_NEWS_EVENT_GROUPS,
+    CREATE_NEWS_EVENT_MEMBERS,
+    CREATE_HOTSPOT_PREPARATION_SETS,
+    CREATE_HOTSPOT_PREPARATION_STATE,
+    CREATE_MARKET_FOCUS_CYCLES,
+    CREATE_MARKET_FOCUS_CYCLE_EVENTS,
 ]
 
 INDEXES = [
@@ -219,6 +413,15 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_integration_changes_updated ON integration_changes(updated_at, change_sequence)",
     "CREATE INDEX IF NOT EXISTS idx_integration_changes_entity ON integration_changes(entity_type, entity_id, change_sequence DESC)",
     "CREATE INDEX IF NOT EXISTS idx_integration_nonces_expires ON integration_nonces(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_focus_context_latest ON focus_context_snapshots(revision DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_news ON news_ticker_mentions(news_id, ticker, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ticker_mentions_validated ON news_ticker_mentions(ticker, validation_status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_event_groups_available ON news_event_groups(available_at DESC, updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_event_members_group ON news_event_members(event_group_id, fetched_at)",
+    "CREATE INDEX IF NOT EXISTS idx_hotspot_prepared_status ON hotspot_preparation_sets(status, prepared_revision)",
+    "CREATE INDEX IF NOT EXISTS idx_market_focus_cycles_status ON market_focus_cycles(status, created_at DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_market_focus_single_active ON market_focus_cycles((1)) WHERE status IN ('pending','queued','in_progress')",
+    "CREATE INDEX IF NOT EXISTS idx_market_focus_cycle_ready ON market_focus_cycles(status,next_attempt_at,created_at)",
 ]
 
 TRIGGERS = [
@@ -271,6 +474,44 @@ async def _add_column(db: aiosqlite.Connection, table: str, column: str, definit
     except aiosqlite.OperationalError as exc:
         if "duplicate column" not in str(exc).lower():
             raise
+
+
+async def _migrate_analysis_job_status_constraint(db: aiosqlite.Connection) -> None:
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='analysis_jobs'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or "incomplete_output" in str(row[0] or ""):
+        return
+    # SQLite cannot alter a CHECK constraint. Rebuild only this table while
+    # retaining its name so analysis_revisions keeps its original FK target.
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        await db.execute("DROP TABLE IF EXISTS analysis_jobs_status_v2")
+        statement = CREATE_ANALYSIS_JOBS.replace(
+            "CREATE TABLE IF NOT EXISTS analysis_jobs",
+            "CREATE TABLE analysis_jobs_status_v2",
+            1,
+        )
+        await db.execute(statement)
+        async with db.execute("PRAGMA table_info(analysis_jobs)") as cursor:
+            old_columns = {str(value[1]) for value in await cursor.fetchall()}
+        async with db.execute("PRAGMA table_info(analysis_jobs_status_v2)") as cursor:
+            new_columns = [str(value[1]) for value in await cursor.fetchall()]
+        shared = [column for column in new_columns if column in old_columns]
+        columns = ",".join(f'"{column}"' for column in shared)
+        await db.execute(
+            f"INSERT INTO analysis_jobs_status_v2 ({columns}) SELECT {columns} FROM analysis_jobs"
+        )
+        await db.execute("DROP TABLE analysis_jobs")
+        await db.execute("ALTER TABLE analysis_jobs_status_v2 RENAME TO analysis_jobs")
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        await db.execute("PRAGMA foreign_keys=ON")
 
 
 def _utc_now() -> str:
@@ -403,6 +644,14 @@ async def init_catalyst_schema(db: aiosqlite.Connection) -> None:
 
     for statement in TABLES:
         await db.execute(statement)
+    await db.execute(
+        """INSERT OR IGNORE INTO hotspot_preparation_state
+           (singleton_id,prepared_revision,last_consumed_revision,updated_at)
+           VALUES (1,0,0,?)""",
+        (_utc_now(),),
+    )
+    await _add_column(db, "market_focus_cycles", "retry_of_cycle_id", "TEXT")
+    await _add_column(db, "market_focus_cycles", "execution_number", "INTEGER NOT NULL DEFAULT 1 CHECK(execution_number >= 1)")
     await _add_column(db, "analysis_jobs", "retrieve_error_count", "INTEGER NOT NULL DEFAULT 0 CHECK(retrieve_error_count >= 0)")
     await _add_column(db, "analysis_jobs", "cancel_attempt_count", "INTEGER NOT NULL DEFAULT 0 CHECK(cancel_attempt_count >= 0)")
     await _add_column(db, "analysis_jobs", "source_input_hash", "TEXT")
@@ -411,7 +660,14 @@ async def init_catalyst_schema(db: aiosqlite.Connection) -> None:
     await _add_column(db, "analysis_jobs", "retry_of_job_id", "TEXT")
     await _add_column(db, "analysis_jobs", "execution_number", "INTEGER NOT NULL DEFAULT 1 CHECK(execution_number >= 1)")
     await _add_column(db, "analysis_jobs", "execution_mode", "TEXT NOT NULL DEFAULT 'background' CHECK(execution_mode IN ('background','worker_sync'))")
-    await _add_column(db, "analysis_jobs", "max_output_tokens", "INTEGER NOT NULL DEFAULT 16384 CHECK(max_output_tokens >= 256)")
+    await _add_column(db, "analysis_jobs", "max_output_tokens", "INTEGER NOT NULL DEFAULT 32768 CHECK(max_output_tokens >= 256)")
+    await _add_column(db, "analysis_jobs", "task_type", "TEXT NOT NULL DEFAULT 'news_item'")
+    await _add_column(db, "analysis_jobs", "request_origin", "TEXT NOT NULL DEFAULT 'manual'")
+    await _add_column(db, "analysis_jobs", "usage_cache_write_tokens", "INTEGER NOT NULL DEFAULT 0 CHECK(usage_cache_write_tokens >= 0)")
+    await _add_column(db, "analysis_jobs", "usage_reasoning_tokens", "INTEGER NOT NULL DEFAULT 0 CHECK(usage_reasoning_tokens >= 0)")
+    await _add_column(db, "analysis_jobs", "usage_total_tokens", "INTEGER NOT NULL DEFAULT 0 CHECK(usage_total_tokens >= 0)")
+    await _add_column(db, "analysis_jobs", "latency_ms", "INTEGER CHECK(latency_ms IS NULL OR latency_ms >= 0)")
+    await _migrate_analysis_job_status_constraint(db)
     await db.execute(
         "UPDATE analysis_jobs SET source_input_hash=input_hash WHERE source_input_hash IS NULL"
     )

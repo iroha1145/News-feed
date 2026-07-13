@@ -213,7 +213,9 @@ def test_terra_defaults_reasoning_validation_and_contract_file():
     assert configured.default_llm_model == "gpt-5.6-terra"
     assert configured.openai_reasoning == "max"
     assert configured.openai_execution_mode == "background"
-    assert configured.openai_max_output_tokens == 16384
+    assert configured.openai_max_output_tokens == 128000
+    assert configured.news_item_max_output_tokens == 32768
+    assert configured.news_llm_auto_analyze_enabled is False
     with pytest.raises(ValidationError):
         Settings(_env_file=None, openai_reasoning="extreme")
     with pytest.raises(ValidationError):
@@ -257,6 +259,14 @@ def test_terra_defaults_reasoning_validation_and_contract_file():
     )
     assert secured.option_pro_allowed_cidrs == "203.0.113.10/32"
     assert CONTRACT_PATH.read_bytes() == generated_bytes()
+    contract_models = json.loads(CONTRACT_PATH.read_bytes())["models"]
+    assert {
+        "HotspotStatusResponse",
+        "HotspotPreparationItem",
+        "HotspotListResponse",
+        "MarketFocusCyclePublic",
+        "MarketFocusCycleResponse",
+    }.issubset(contract_models)
 
 
 def test_installed_sdk_capabilities_are_visible_without_a_key(monkeypatch):
@@ -1060,8 +1070,7 @@ def test_retrieve_errors_are_separate_from_poll_count_and_keep_response_id(isola
 
 
 def test_budget_gate_blocks_second_paid_job_before_queue(isolated_integration_db, monkeypatch):
-    monkeypatch.setattr(settings, "news_llm_daily_job_limit", 1)
-    monkeypatch.setattr(settings, "news_llm_daily_output_token_limit", None)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
 
     async def scenario():
         db = await database.get_db()
@@ -1082,9 +1091,9 @@ def test_budget_gate_blocks_second_paid_job_before_queue(isolated_integration_db
 def test_output_token_budget_reserves_active_jobs_and_releases_unused_capacity(
     isolated_integration_db, monkeypatch
 ):
-    monkeypatch.setattr(settings, "news_llm_daily_job_limit", None)
-    monkeypatch.setattr(settings, "openai_max_output_tokens", 1024)
-    monkeypatch.setattr(settings, "news_llm_daily_output_token_limit", 1124)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 100)
+    monkeypatch.setattr(settings, "news_item_max_output_tokens", 1024)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", 1124)
 
     async def scenario():
         db = await database.get_db()
@@ -1115,7 +1124,7 @@ def test_output_token_budget_reserves_active_jobs_and_releases_unused_capacity(
     run(scenario())
 
 
-def test_auto_queue_skips_low_relevance_and_prioritizes_tagged_news(isolated_integration_db):
+def test_default_auto_queue_does_not_create_jobs_or_change_news_status(isolated_integration_db):
     async def scenario():
         db = await database.get_db()
         try:
@@ -1128,14 +1137,14 @@ def test_auto_queue_skips_low_relevance_and_prioritizes_tagged_news(isolated_int
             tagged_id = await database.insert_news_item(db, tagged)
         finally:
             await db.close()
-        assert await enqueue_auto_jobs(limit=10) == 1
+        assert await enqueue_auto_jobs(limit=10) == 0
         db = await database.get_db()
         try:
             async with db.execute("SELECT analysis_status,analysis_error FROM news_items WHERE id=?", (irrelevant_id,)) as cursor:
                 irrelevant_row = await cursor.fetchone()
-            assert tuple(irrelevant_row) == ("skipped", "deterministic_market_relevance_below_threshold")
+            assert tuple(irrelevant_row) == ("pending", "")
             async with db.execute("SELECT priority,status FROM analysis_jobs WHERE news_id=?", (tagged_id,)) as cursor:
-                assert tuple(await cursor.fetchone()) == (50, "pending")
+                assert await cursor.fetchone() is None
         finally:
             await db.close()
 
@@ -1144,7 +1153,7 @@ def test_auto_queue_skips_low_relevance_and_prioritizes_tagged_news(isolated_int
 
 def test_worker_sync_uses_no_background_response_id(isolated_integration_db, monkeypatch):
     monkeypatch.setattr(settings, "openai_execution_mode", "worker_sync")
-    monkeypatch.setattr(settings, "openai_max_output_tokens", 1024)
+    monkeypatch.setattr(settings, "news_item_max_output_tokens", 1024)
     provider = FakeProvider(
         created=ResponseResult(
             "transient_sync_id",
@@ -1163,7 +1172,7 @@ def test_worker_sync_uses_no_background_response_id(isolated_integration_db, mon
         finally:
             await db.close()
         monkeypatch.setattr(settings, "openai_execution_mode", "background")
-        monkeypatch.setattr(settings, "openai_max_output_tokens", 32768)
+        monkeypatch.setattr(settings, "news_item_max_output_tokens", 32768)
         assert await run_worker_once(provider=provider, worker_id="worker-sync") is True
         assert provider.sync_calls == 1
         assert provider.create_calls == 0
@@ -2049,6 +2058,9 @@ def test_signed_integration_endpoints_match_committed_contract(isolated_integrat
             f"{prefix}/catalysts/AMD?include_neutral=true",
             f"{prefix}/calendar?date_from=2026-07-12&date_to=2026-07-19",
             f"{prefix}/analysis-jobs/{job['job_id']}",
+            f"{prefix}/hotspots/status",
+            f"{prefix}/hotspots?limit=20",
+            f"{prefix}/market-focus-cycles/latest",
         ]
         for index, target in enumerate(targets, start=1):
             headers = _signed_headers(

@@ -8,6 +8,8 @@
 
 新增 analysis_jobs、analysis_revisions、analysis_stock_impacts、calendar_analysis_jobs、calendar_snapshots、calendar_event_revisions、integration_changes、integration_nonces、analysis_worker_state 和持久来源健康。
 
+本次增量新增 `focus_context_snapshots`、`news_ticker_mentions`、`news_event_groups`、`news_event_members`、`hotspot_preparation_sets`、`hotspot_preparation_state`、`market_focus_cycles` 与 `market_focus_cycle_events`。`analysis_revisions` 继续只保存逐条新闻分析版本，禁止复用、重命名或迁移为热点/周期表。
+
 现有 analyses 继续作为旧界面最新投影；新分析追加 revision。旧 affected_stocks JSON 幂等回填，坏 JSON 跳过并记录。旧记录缺失 confidence、horizon 和 mechanism 时使用 0、uncertain、other，并标记 legacy schema，不假装来自 Terra/max。
 
 旧 logic_chain 不作为隐藏推理继续公开；兼容读取映射为有界用户摘要，无法安全映射时留空。

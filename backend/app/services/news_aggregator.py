@@ -43,7 +43,7 @@ class SourceDefinition:
 
 SOURCE_DEFINITIONS: dict[str, SourceDefinition] = {
     "finnhub": SourceDefinition("finnhub", fetch_finnhub_news, True, 300, "finnhub_news", "finnhub_api_key"),
-    "massive": SourceDefinition("massive", fetch_massive_news, True, 300, "massive_news", "massive_api_key"),
+    "massive": SourceDefinition("massive", fetch_massive_news, True, 3600, "massive_news", "massive_api_key"),
     "google": SourceDefinition("google", fetch_google_news, True, 900, "google_news"),
     "seekingalpha_breaking": SourceDefinition(
         "seekingalpha_breaking", fetch_seekingalpha_breaking, True, 300,
@@ -321,8 +321,20 @@ async def aggregate_source(name: str, *, force: bool = False) -> dict:
             fetched = await definition.fetcher()  # type: ignore[call-arg]
 
         raw_count = len(fetched)
-        unique_items, in_batch_duplicates = deduplicate_batch(fetched)
         fetched_at = _iso(_utc_now())
+        evidence_records = [
+            {
+                **item,
+                "fetched_at": fetched_at,
+                "content_hash": compute_content_hash(
+                    str(item.get("title") or ""),
+                    str(item.get("url") or ""),
+                    item.get("published_at"),
+                ),
+            }
+            for item in fetched
+        ]
+        unique_items, in_batch_duplicates = deduplicate_batch(fetched)
         records = [
             {
                 **item,
@@ -340,6 +352,26 @@ async def aggregate_source(name: str, *, force: bool = False) -> dict:
             for item in unique_items
         ]
         inserted, database_duplicates = await _insert_records(records)
+        # Event evidence is a separate append-only projection. It receives the
+        # pre-dedup source records so a syndicated report is not silently lost
+        # merely because the representative news row already exists.
+        evidence_db = await get_db()
+        try:
+            from app.services.market_focus import ingest_event_evidence
+
+            for record in evidence_records:
+                async with evidence_db.execute(
+                    "SELECT id FROM news_items WHERE content_hash=?",
+                    (record["content_hash"],),
+                ) as cursor:
+                    stored = await cursor.fetchone()
+                await ingest_event_evidence(
+                    evidence_db,
+                    record,
+                    news_id=int(stored[0]) if stored else None,
+                )
+        finally:
+            await evidence_db.close()
         duplicates = in_batch_duplicates + database_duplicates
     except Exception as exc:
         prior_failures = int(_source_snapshot(name).get("consecutive_failures") or 0)

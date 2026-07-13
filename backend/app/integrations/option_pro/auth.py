@@ -39,6 +39,9 @@ class IntegrationAPIError(Exception):
         *,
         retryable: bool = False,
         retry_after_seconds: int | None = None,
+        resync_from: datetime | None = None,
+        server_time: datetime | None = None,
+        latest_window_days: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -46,6 +49,9 @@ class IntegrationAPIError(Exception):
         self.message = message
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
+        self.resync_from = resync_from
+        self.server_time = server_time
+        self.latest_window_days = latest_window_days
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,10 @@ from pydantic import (
     StringConstraints,
     field_serializer,
     field_validator,
+    model_validator,
 )
+
+from app.models.market_focus import MarketFocusCyclePublicAnalysis
 
 
 SCHEMA_VERSION = "macrolens-option-pro-v1"
@@ -108,6 +111,7 @@ class AnalysisJobStatus(str, Enum):
     cancelled = "cancelled"
     insufficient_context = "insufficient_context"
     budget_blocked = "budget_blocked"
+    incomplete_output = "incomplete_output"
 
 
 class AnalysisStatus(str, Enum):
@@ -120,6 +124,7 @@ class AnalysisStatus(str, Enum):
     cancelled = "cancelled"
     insufficient_context = "insufficient_context"
     budget_blocked = "budget_blocked"
+    incomplete_output = "incomplete_output"
 
 
 class PublicDataStatus(str, Enum):
@@ -245,6 +250,7 @@ class CatalystBatchRequest(UTCModel):
     limit: StrictInt = Field(default=20, ge=1, le=100)
     min_confidence: StrictInt = Field(default=0, ge=0, le=100)
     include_neutral: StrictBool = False
+    include_unanalyzed: StrictBool = True
 
     @field_validator("tickers")
     @classmethod
@@ -292,7 +298,7 @@ class QueueHealth(UTCModel):
     queued: StrictInt = Field(ge=0)
     in_progress: StrictInt = Field(ge=0)
     oldest_job_at: Optional[datetime] = None
-    budget_status: Literal["ok", "budget_unbounded", "budget_blocked"]
+    budget_status: Literal["ok", "budget_configuration_required", "budget_blocked"]
 
 
 class ComponentHealth(UTCModel):
@@ -352,3 +358,127 @@ class ErrorBody(ContractResponse):
     message: Annotated[str, StringConstraints(min_length=1, max_length=500)]
     retryable: StrictBool
     retry_after_seconds: Optional[StrictInt] = Field(default=None, ge=0)
+    resync_from: Optional[datetime] = None
+    server_time: Optional[datetime] = None
+    latest_window_days: Optional[StrictInt] = Field(default=None, ge=1, le=30)
+
+
+class MarketFocusCycleCreateRequest(StrictModel):
+    trigger: Literal["manual", "scheduled_0800", "scheduled_1200", "scheduled_1600", "scheduled_2000"] = "manual"
+    expected_prepared_revision: Optional[StrictInt] = Field(default=None, ge=0)
+    retry_cycle_id: Optional[Annotated[str, StringConstraints(pattern=r"^mfc_[a-f0-9]{32}$")]] = None
+
+    @model_validator(mode="after")
+    def validate_retry_shape(self):
+        if self.retry_cycle_id is not None and self.expected_prepared_revision is not None:
+            raise ValueError("retry_cycle_id and expected_prepared_revision are mutually exclusive")
+        return self
+
+
+class HotspotStatusResponse(ContractResponse):
+    prepared_revision: StrictInt = Field(ge=0)
+    last_consumed_revision: StrictInt = Field(ge=0)
+    prepared_hot_count: StrictInt = Field(ge=0)
+    prepared_since: Optional[datetime] = None
+    last_cycle_at: Optional[datetime] = None
+    next_scheduled_at: Optional[datetime] = None
+    active_cycle_id: Optional[
+        Annotated[str, StringConstraints(pattern=r"^mfc_[a-f0-9]{32}$")]
+    ] = None
+    cooldown_until: Optional[datetime] = None
+    manual_enabled: StrictBool
+    capability: Literal["enabled", "disabled", "budget_configuration_required"]
+    model: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    reasoning: Literal["none", "low", "medium", "high", "xhigh", "max"]
+    data_through: Optional[datetime] = None
+
+
+class HotspotPreparationItem(UTCModel):
+    prepared_revision: StrictInt = Field(ge=1)
+    event_group_id: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    event_group_version: StrictInt = Field(ge=1)
+    gate_version: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    hot_score: float = Field(ge=0, le=100)
+    component_scores: dict[str, Optional[float]]
+    active_weights: dict[str, float]
+    reasons: list[ShortText] = Field(default_factory=list, max_length=30)
+    event_snapshot_json: Annotated[str, StringConstraints(min_length=2, max_length=100_000)]
+    status: Literal["PREPARED", "LEASED", "CONSUMED"]
+    prepared_at: datetime
+    leased_cycle_id: Optional[
+        Annotated[str, StringConstraints(pattern=r"^mfc_[a-f0-9]{32}$")]
+    ] = None
+    consumed_cycle_id: Optional[
+        Annotated[str, StringConstraints(pattern=r"^mfc_[a-f0-9]{32}$")]
+    ] = None
+    consumed_at: Optional[datetime] = None
+    created_at: datetime
+    representative_title: BoundedText
+    event_type: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    available_at: datetime
+    first_published_at: Optional[datetime] = None
+    last_published_at: Optional[datetime] = None
+    source_count: StrictInt = Field(ge=1)
+    source_names: list[ShortText] = Field(default_factory=list, max_length=100)
+    validated_tickers: list[Ticker] = Field(default_factory=list, max_length=100)
+
+
+class HotspotListResponse(ContractResponse):
+    as_of: datetime
+    items: list[HotspotPreparationItem] = Field(default_factory=list, max_length=100)
+
+
+class MarketFocusCyclePublic(UTCModel):
+    cycle_id: Annotated[str, StringConstraints(pattern=r"^mfc_[a-f0-9]{32}$")]
+    scheduled_slot: Optional[Annotated[str, StringConstraints(max_length=100)]] = None
+    idempotency_key: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    retry_of_cycle_id: Optional[
+        Annotated[str, StringConstraints(pattern=r"^mfc_[a-f0-9]{32}$")]
+    ] = None
+    execution_number: StrictInt = Field(ge=1)
+    trigger_type: Literal[
+        "manual", "scheduled_0800", "scheduled_1200", "scheduled_1600", "scheduled_2000"
+    ]
+    status: Literal[
+        "pending", "queued", "in_progress", "completed", "failed", "cancelled",
+        "budget_blocked", "incomplete_output", "insufficient_context",
+    ]
+    no_new_hot_events: StrictBool
+    prepared_revision: StrictInt = Field(ge=0)
+    last_consumed_revision_at_start: StrictInt = Field(ge=0)
+    consumes_through_revision: Optional[StrictInt] = Field(default=None, ge=1)
+    focus_revision: Optional[StrictInt] = Field(default=None, ge=1)
+    snapshot_as_of: datetime
+    input_schema_version: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    input_hash: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    event_group_count: StrictInt = Field(ge=0)
+    focus_symbol_count: StrictInt = Field(ge=0)
+    provider: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    model: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"]
+    execution_mode: Literal["background", "worker_sync"]
+    max_output_tokens: StrictInt = Field(ge=256, le=128_000)
+    prompt_version: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    output_schema_version: Annotated[str, StringConstraints(min_length=1, max_length=100)]
+    result: Optional[MarketFocusCyclePublicAnalysis] = None
+    error_code: Optional[Annotated[str, StringConstraints(max_length=100)]] = None
+    attempt_count: StrictInt = Field(ge=0)
+    retrieve_error_count: StrictInt = Field(ge=0)
+    cancel_attempt_count: StrictInt = Field(ge=0)
+    next_attempt_at: Optional[datetime] = None
+    cancel_requested_at: Optional[datetime] = None
+    latency_ms: Optional[StrictInt] = Field(default=None, ge=0)
+    usage_input_tokens: StrictInt = Field(ge=0)
+    usage_cached_input_tokens: StrictInt = Field(ge=0)
+    usage_cache_write_tokens: StrictInt = Field(ge=0)
+    usage_reasoning_tokens: StrictInt = Field(ge=0)
+    usage_output_tokens: StrictInt = Field(ge=0)
+    usage_total_tokens: StrictInt = Field(ge=0)
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: datetime
+
+
+class MarketFocusCycleResponse(ContractResponse):
+    cycle: Optional[MarketFocusCyclePublic] = None

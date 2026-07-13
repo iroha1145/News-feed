@@ -60,6 +60,42 @@ async def _job_fetch_calendar() -> None:
         logger.error("[Scheduler] Economic calendar job failed: %s", type(exc).__name__)
 
 
+async def _job_pull_focus_context() -> None:
+    try:
+        from app.services.focus_context import pull_focus_context
+
+        result = await pull_focus_context()
+        logger.info("[Scheduler] Option Pro focus context: %s", result.get("status"))
+    except Exception as exc:
+        logger.error("[Scheduler] Focus context pull failed: %s", type(exc).__name__)
+
+
+async def _job_market_focus_cycle() -> None:
+    if not app_settings.hot_cycle_schedule_enabled:
+        return
+    if app_settings.automatic_hot_cycle_capability != "enabled":
+        logger.warning("[Scheduler] Market-focus cycle gated: %s", app_settings.automatic_hot_cycle_capability)
+        return
+    try:
+        from app.models.database import get_db
+        from app.services.market_focus import CycleConflict, create_market_focus_cycle
+        from app.services.market_schedule import due_cycle_trigger
+
+        trigger = due_cycle_trigger()
+        if trigger is None:
+            return
+        db = await get_db()
+        try:
+            await create_market_focus_cycle(db, trigger_type=trigger)
+        except CycleConflict as exc:
+            if exc.code not in {"no_new_hot_events", "prepared_revision_changed"}:
+                logger.warning("[Scheduler] Market-focus cycle gated: %s", exc.code)
+        finally:
+            await db.close()
+    except Exception as exc:
+        logger.error("[Scheduler] Market-focus cycle failed: %s", type(exc).__name__)
+
+
 async def _get_db_interval(key: str, fallback: int) -> int:
     try:
         from app.models.database import get_db, get_setting
@@ -146,6 +182,22 @@ async def start_scheduler() -> None:
         seconds=app_settings.calendar_fetch_interval_seconds,
         job_id="fetch_economic_calendar",
         name="Fetch economic calendar",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_pull_focus_context,
+        seconds=app_settings.option_pro_focus_interval_seconds,
+        job_id="pull_option_pro_focus_context",
+        name="Pull Option Pro focus context",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_market_focus_cycle,
+        seconds=60,
+        job_id="market_focus_cycle_schedule",
+        name="Market-focus cycle schedule",
     )
 
     x_sentiment_interval = await _get_db_interval(

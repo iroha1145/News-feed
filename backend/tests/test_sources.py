@@ -287,7 +287,7 @@ class SourceScheduleTests(unittest.TestCase):
     def test_default_source_states_and_intervals(self):
         expected = {
             "finnhub": (True, 300),
-            "massive": (True, 300),
+            "massive": (True, 3600),
             "google": (True, 900),
             "seekingalpha_breaking": (True, 300),
             "seekingalpha_daily": (True, 21600),

@@ -232,6 +232,7 @@ async def query_feed(
     min_confidence: int,
     min_abs_impact: int,
     analysis_status: str | None,
+    include_unanalyzed: bool = True,
 ) -> tuple[list[CatalystItem], str | None, bool, datetime | None]:
     filters = {
         "as_of": as_of,
@@ -241,6 +242,7 @@ async def query_feed(
         "min_confidence": min_confidence,
         "min_abs_impact": min_abs_impact,
         "analysis_status": analysis_status,
+        "include_unanalyzed": include_unanalyzed,
     }
     digest = filter_digest("feed", filters)
     cursor_payload = decode_cursor(cursor, kind="feed", filter_digest=digest) if cursor else None
@@ -263,6 +265,8 @@ async def query_feed(
     if min_confidence:
         conditions.append("r.id IS NOT NULL AND CAST(json_extract(r.payload_json,'$.confidence') AS INTEGER)>=:min_confidence")
         params["min_confidence"] = min_confidence
+    elif not include_unanalyzed:
+        conditions.append("r.id IS NOT NULL")
     if min_abs_impact:
         conditions.append(
             "r.id IS NOT NULL AND EXISTS (SELECT 1 FROM analysis_stock_impacts si "
@@ -333,6 +337,7 @@ async def query_ticker(
     cursor: str | None,
     min_confidence: int,
     include_neutral: bool,
+    include_unanalyzed: bool = True,
 ) -> tuple[list[CatalystItem], str | None, bool, datetime | None]:
     filters = {
         "ticker": ticker,
@@ -340,6 +345,7 @@ async def query_ticker(
         "window_hours": window_hours,
         "min_confidence": min_confidence,
         "include_neutral": include_neutral,
+        "include_unanalyzed": include_unanalyzed,
     }
     digest = filter_digest("ticker", filters)
     cursor_payload = decode_cursor(cursor, kind="ticker", filter_digest=digest) if cursor else None
@@ -358,10 +364,12 @@ async def query_ticker(
     }
     if min_confidence:
         conditions.append(
-            "(r.id IS NULL OR EXISTS (SELECT 1 FROM analysis_stock_impacts si "
+            "(r.id IS NOT NULL AND EXISTS (SELECT 1 FROM analysis_stock_impacts si "
             "WHERE si.analysis_id=r.id AND si.ticker=:ticker AND si.confidence>=:min_confidence))"
         )
         params["min_confidence"] = min_confidence
+    elif not include_unanalyzed:
+        conditions.append("r.id IS NOT NULL")
     if not include_neutral:
         conditions.append("(r.id IS NULL OR json_extract(r.payload_json,'$.classification')!='neutral')")
     if cursor_payload:
@@ -400,7 +408,15 @@ async def query_latest(
 ) -> tuple[str, list[CatalystItem], datetime | None, str | None, bool, datetime | None]:
     as_of = utc_now()
     if as_of - updated_after > timedelta(days=7, seconds=5):
-        raise IntegrationAPIError(400, "updated_after_too_old", "updated_after may cover at most seven days.")
+        raise IntegrationAPIError(
+            400,
+            "updated_after_too_old",
+            "updated_after may cover at most seven days.",
+            retryable=True,
+            resync_from=as_of - timedelta(days=7),
+            server_time=as_of,
+            latest_window_days=7,
+        )
     digest = filter_digest("latest", {"updated_after": updated_after})
     cursor_payload = decode_cursor(cursor, kind="latest", filter_digest=digest) if cursor else None
     if cursor_payload:
