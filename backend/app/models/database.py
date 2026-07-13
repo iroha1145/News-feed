@@ -162,6 +162,11 @@ async def init_db() -> None:
                     raise
         for statement in CREATE_INDEXES:
             await db.execute(statement)
+        from app.models.catalyst_database import init_catalyst_schema
+        from app.services.calendar_analysis_jobs import init_calendar_analysis_schema
+
+        await init_catalyst_schema(db)
+        await init_calendar_analysis_schema(db)
         await db.commit()
         await cleanup_retained_data(db)
     logger.info("Database tables initialized successfully")
@@ -268,6 +273,10 @@ async def cleanup_retained_data(db: aiosqlite.Connection) -> dict[str, int]:
 
     if any(deleted.values()):
         logger.info("Retention cleanup removed rows: %s", deleted)
+    from app.services.retention import cleanup_extended_retention
+
+    extended = await cleanup_extended_retention(db)
+    deleted.update(extended)
     return deleted
 
 
@@ -338,12 +347,33 @@ def parse_json_fields(d: dict, fields: list[str]) -> dict:
 
 # --- news_items ---
 
+def _serialize_source_tickers(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            value = []
+    if not isinstance(value, list):
+        value = []
+    tickers: list[str] = []
+    for item in value:
+        ticker = str(item or "").strip().upper().lstrip("$")[:20]
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
+    return json.dumps(tickers[:100], separators=(",", ":"))
+
 async def insert_news_item(db: aiosqlite.Connection, item: dict) -> Optional[int]:
+    params = dict(item)
+    params["source_tickers"] = _serialize_source_tickers(item.get("source_tickers"))
+    params["updated_at"] = item.get("updated_at") or item["fetched_at"]
     try:
         cursor = await db.execute(
-            """INSERT INTO news_items (source, title, summary, url, image_url, published_at, fetched_at, content_hash)
-               VALUES (:source, :title, :summary, :url, :image_url, :published_at, :fetched_at, :content_hash)""",
-            item,
+            """INSERT INTO news_items
+               (source, title, summary, url, image_url, published_at, fetched_at, content_hash,
+                source_tickers, updated_at)
+               VALUES (:source, :title, :summary, :url, :image_url, :published_at, :fetched_at,
+                       :content_hash, :source_tickers, :updated_at)""",
+            params,
         )
         await db.commit()
         return cursor.lastrowid
@@ -409,16 +439,25 @@ async def insert_news_items_batch(db: aiosqlite.Connection, items: list[dict]) -
     if not filtered_items:
         return 0
 
-    before = db.total_changes
+    prepared_items = []
+    for item in filtered_items:
+        prepared = dict(item)
+        prepared["source_tickers"] = _serialize_source_tickers(item.get("source_tickers"))
+        prepared["updated_at"] = item.get("updated_at") or item["fetched_at"]
+        prepared_items.append(prepared)
     try:
-        await db.executemany(
+        cursor = await db.executemany(
             """INSERT OR IGNORE INTO news_items
-               (source, title, summary, url, image_url, published_at, fetched_at, content_hash)
-               VALUES (:source, :title, :summary, :url, :image_url, :published_at, :fetched_at, :content_hash)""",
-            filtered_items,
+               (source, title, summary, url, image_url, published_at, fetched_at, content_hash,
+                source_tickers, updated_at)
+               VALUES (:source, :title, :summary, :url, :image_url, :published_at, :fetched_at,
+                       :content_hash, :source_tickers, :updated_at)""",
+            prepared_items,
         )
         await db.commit()
-        inserted = db.total_changes - before
+        # total_changes includes integration audit triggers; cursor.rowcount
+        # reflects only the rows inserted into news_items.
+        inserted = max(0, cursor.rowcount)
     except Exception:
         await db.rollback()
         raise
@@ -531,30 +570,10 @@ async def get_news_item_by_id(
     return item if include_internal else _without_internal_news_fields(item)
 
 
-MAX_ANALYZABLE = 50  # Only analyze the 50 most recent news items
-
-async def skip_old_news(db: aiosqlite.Connection) -> int:
-    """Mark news outside the top-50 window as 'skipped' to save LLM tokens."""
-    cursor = await db.execute(
-        """UPDATE news_items SET analysis_status = 'skipped'
-           WHERE analysis_status = 'pending'
-           AND id NOT IN (
-               SELECT id FROM news_items ORDER BY published_at DESC LIMIT ?
-           )""",
-        (MAX_ANALYZABLE,),
-    )
-    await db.commit()
-    return cursor.rowcount
-
 async def get_unanalyzed_news(db: aiosqlite.Connection, limit: int = 5) -> list[dict]:
     recovered = await recover_stale_analysis_leases(db)
     if recovered:
         logger.warning("Recovered %s expired analysis leases", recovered)
-
-    # First skip any old news outside the analysis window
-    skipped = await skip_old_news(db)
-    if skipped:
-        logger.info(f"Skipped {skipped} old news items (outside top-{MAX_ANALYZABLE} window)")
 
     async with db.execute(
         "SELECT * FROM news_items WHERE analysis_status = 'pending' ORDER BY published_at DESC LIMIT ?",

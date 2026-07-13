@@ -65,7 +65,7 @@ npm run dev
 
 ## 生产部署
 
-容器以非特权用户运行，后端只绑定本机 `127.0.0.1:8000`，外部请求统一经过前端反向代理。数据库目录可通过 `MACROLENS_DATA_DIR` 指向持久化位置。
+容器以非特权用户运行，后端只绑定本机 `127.0.0.1:8000`，前端只绑定本机 `127.0.0.1:3000`。数据库目录可通过 `MACROLENS_DATA_DIR` 指向持久化位置。
 
 ```bash
 docker compose up -d --build
@@ -73,7 +73,7 @@ docker compose ps
 curl --fail http://127.0.0.1:8000/health
 ```
 
-公开部署建议在端口 3000 前增加传输层安全协议（TLS）反向代理，并把 `SESSION_COOKIE_SECURE` 设为 `true`。
+公开部署时，边界传输层安全协议（TLS）代理把普通网页请求转发到 `127.0.0.1:3000`，把 `/api/integrations/option-pro/v1/` 直接转发到 `127.0.0.1:8000`。前端容器明确拒绝代转该服务间接口，避免浏览器伪造来源或安全协议。`OPTION_PRO_TRUSTED_PROXY_CIDRS` 只填写边界代理地址，`OPTION_PRO_ALLOWED_CIDRS` 只填写 Option Pro 服务器地址，并把 `SESSION_COOKIE_SECURE` 设为 `true`。端口 3000 和 8000 均不得直接暴露到公网。
 
 ## 技术构成
 

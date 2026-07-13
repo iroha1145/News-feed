@@ -296,8 +296,78 @@ export interface CalendarResponse {
   last_error?: string | null
 }
 
+export interface CalendarAnalysisResult {
+  event_id: string
+  title: string
+  title_zh: string
+  stock_impact: 'bullish' | 'bearish' | 'neutral'
+  commodity_impact: 'bullish' | 'bearish' | 'neutral'
+  explanation: string
+}
+
+export interface CalendarAnalysisJob {
+  job_id: string
+  status: 'pending' | 'queued' | 'in_progress' | 'completed' | 'failed' | 'insufficient_context' | 'budget_blocked'
+  model: string
+  reasoning: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  event_count: number
+  analyzed: number
+  submitted_at: string | null
+  updated_at: string
+  completed_at: string | null
+  error_code: string | null
+  retry_after: number | null
+  result: CalendarAnalysisResult[] | null
+  created?: boolean
+}
+
 export const getCalendar = (signal?: AbortSignal) =>
   request<CalendarResponse>('/api/calendar', { signal });
 
 export const analyzeCalendar = (signal?: AbortSignal) =>
-  request<CalendarResponse>('/api/calendar/analyze', { method: 'POST', signal });
+  request<CalendarAnalysisJob>('/api/calendar/analyze?force=true', { method: 'POST', signal });
+
+export const getCalendarAnalysisJob = (jobId: string, signal?: AbortSignal) =>
+  request<CalendarAnalysisJob>(`/api/calendar/analyze/${encodeURIComponent(jobId)}`, { signal });
+
+const waitForAbortableDelay = (milliseconds: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+export async function waitForCalendarAnalysis(
+  initialJob: CalendarAnalysisJob,
+  signal?: AbortSignal,
+): Promise<CalendarAnalysisJob> {
+  let job = initialJob;
+  const deadline = Date.now() + 30 * 60 * 1000;
+  while (job.status === 'pending' || job.status === 'queued' || job.status === 'in_progress') {
+    if (Date.now() >= deadline) {
+      throw new Error('日历分析仍在后台运行，请稍后刷新查看。');
+    }
+    const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    const delaySeconds = hidden ? 15 : Math.max(1, Math.min(15, job.retry_after ?? 2));
+    await waitForAbortableDelay(delaySeconds * 1000, signal);
+    job = await getCalendarAnalysisJob(job.job_id, signal);
+  }
+  if (job.status === 'completed') return job;
+  if (job.status === 'budget_blocked') {
+    throw new Error('今日日历分析额度已用完，请等待额度恢复。');
+  }
+  if (job.status === 'insufficient_context') {
+    throw new Error('当前没有可分析的经济日历事件。');
+  }
+  throw new Error('日历分析未能完成，请稍后重试。');
+}

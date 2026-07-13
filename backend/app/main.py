@@ -3,6 +3,8 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings as app_settings
@@ -10,11 +12,15 @@ from app.models.database import init_db
 from app.utils.scheduler import start_scheduler, stop_scheduler
 from app.routers import auth, news, analysis, x_sentiment, settings, calendar
 from app.routers import quotes
+from app.integrations.option_pro import router as option_pro_integration
+from app.integrations.option_pro.auth import IntegrationAPIError
+from app.utils.http import configure_safe_network_logging
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+configure_safe_network_logging()
 logger = logging.getLogger(__name__)
 
 # Ensure data directory exists
@@ -27,6 +33,15 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     await init_db()
+
+    # Capability inspection is local-only and never submits a model request.
+    from app.services.responses_runtime import OpenAIResponsesProvider
+
+    provider = OpenAIResponsesProvider()
+    app.state.openai_capabilities = provider.capabilities()
+    await provider.close()
+    if app.state.openai_capabilities.status not in {"ok", "not_configured"}:
+        logger.warning("OpenAI runtime capability check: %s", app.state.openai_capabilities.status)
 
     # Start background scheduler
     await start_scheduler()
@@ -76,6 +91,22 @@ app.include_router(x_sentiment.router)
 app.include_router(settings.router)
 app.include_router(calendar.router)
 app.include_router(quotes.router)
+app.include_router(option_pro_integration.router)
+
+
+@app.exception_handler(IntegrationAPIError)
+async def integration_api_error_handler(request, exc: IntegrationAPIError):
+    return option_pro_integration.error_response(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request, exc: RequestValidationError):
+    if request.url.path.startswith(option_pro_integration.PREFIX):
+        return option_pro_integration.error_response(
+            request,
+            IntegrationAPIError(422, "invalid_request", "The integration request is invalid."),
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.get("/live")

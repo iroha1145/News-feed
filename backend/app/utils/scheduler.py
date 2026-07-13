@@ -29,12 +29,28 @@ async def _job_fetch_source(source: str) -> None:
 
 async def _job_analyze_news() -> None:
     try:
-        from app.services.llm_analyzer import run_analysis_batch
+        from app.services.analysis_jobs import enqueue_auto_jobs
 
-        count = await run_analysis_batch()
-        logger.info("[Scheduler] Analysis batch complete: %s items analyzed", count)
+        count = await enqueue_auto_jobs()
+        logger.info("[Scheduler] Persistent analysis jobs enqueued: %s", count)
     except Exception as exc:
         logger.error("[Scheduler] Analysis job failed: %s", type(exc).__name__)
+
+
+async def _job_retry_event_projections() -> None:
+    try:
+        from app.services.news_aggregator import process_projection_retry_queue
+
+        result = await process_projection_retry_queue()
+        if result["attempted"]:
+            logger.info(
+                "[Scheduler] Event projection retries: attempted=%s completed=%s failed=%s",
+                result["attempted"],
+                result["completed"],
+                result["failed"],
+            )
+    except Exception as exc:
+        logger.error("[Scheduler] Event projection retry failed: %s", type(exc).__name__)
 
 
 async def _job_x_sentiment() -> None:
@@ -48,6 +64,52 @@ async def _job_x_sentiment() -> None:
             logger.debug("[Scheduler] Market scenario skipped (missing key or news context)")
     except Exception as exc:
         logger.error("[Scheduler] Market scenario job failed: %s", type(exc).__name__)
+
+
+async def _job_fetch_calendar() -> None:
+    try:
+        from app.services.calendar_client import fetch_economic_calendar
+
+        events = await fetch_economic_calendar(force=True)
+        logger.info("[Scheduler] Economic calendar refreshed: %s events", len(events))
+    except Exception as exc:
+        logger.error("[Scheduler] Economic calendar job failed: %s", type(exc).__name__)
+
+
+async def _job_pull_focus_context() -> None:
+    try:
+        from app.services.focus_context import pull_focus_context
+
+        result = await pull_focus_context()
+        logger.info("[Scheduler] Option Pro focus context: %s", result.get("status"))
+    except Exception as exc:
+        logger.error("[Scheduler] Focus context pull failed: %s", type(exc).__name__)
+
+
+async def _job_market_focus_cycle() -> None:
+    if not app_settings.hot_cycle_schedule_enabled:
+        return
+    if app_settings.automatic_hot_cycle_capability != "enabled":
+        logger.warning("[Scheduler] Market-focus cycle gated: %s", app_settings.automatic_hot_cycle_capability)
+        return
+    try:
+        from app.models.database import get_db
+        from app.services.market_focus import CycleConflict, create_market_focus_cycle
+        from app.services.market_schedule import due_cycle_trigger
+
+        trigger = due_cycle_trigger()
+        if trigger is None:
+            return
+        db = await get_db()
+        try:
+            await create_market_focus_cycle(db, trigger_type=trigger)
+        except CycleConflict as exc:
+            if exc.code not in {"no_new_hot_events", "prepared_revision_changed"}:
+                logger.warning("[Scheduler] Market-focus cycle gated: %s", exc.code)
+        finally:
+            await db.close()
+    except Exception as exc:
+        logger.error("[Scheduler] Market-focus cycle failed: %s", type(exc).__name__)
 
 
 async def _get_db_interval(key: str, fallback: int) -> int:
@@ -97,11 +159,13 @@ async def start_scheduler() -> None:
 
     from app.services.news_aggregator import (
         SOURCE_DEFINITIONS,
+        initialize_source_health,
         get_enabled_sources,
         get_source_interval,
     )
 
     _scheduler = AsyncIOScheduler()
+    await initialize_source_health()
     source_intervals: dict[str, int] = {}
     for source in get_enabled_sources():
         definition = SOURCE_DEFINITIONS[source]
@@ -126,6 +190,38 @@ async def start_scheduler() -> None:
         seconds=60,
         job_id="analyze_news",
         name="Analyze unanalyzed news",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_retry_event_projections,
+        seconds=60,
+        job_id="retry_event_projections",
+        name="Retry local event projections",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_fetch_calendar,
+        seconds=app_settings.calendar_fetch_interval_seconds,
+        job_id="fetch_economic_calendar",
+        name="Fetch economic calendar",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_pull_focus_context,
+        seconds=app_settings.option_pro_focus_interval_seconds,
+        job_id="pull_option_pro_focus_context",
+        name="Pull Option Pro focus context",
+    )
+
+    _add_interval_job(
+        _scheduler,
+        _job_market_focus_cycle,
+        seconds=60,
+        job_id="market_focus_cycle_schedule",
+        name="Market-focus cycle schedule",
     )
 
     x_sentiment_interval = await _get_db_interval(

@@ -50,6 +50,7 @@ def _parse_sa_item(item: ET.Element, feed_kind: str = "breaking") -> Optional[di
         "url": url,
         "image_url": None,
         "published_at": published_at,
+        "source_tickers": tickers[:100],
     }
 
 

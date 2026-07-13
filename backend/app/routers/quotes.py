@@ -11,6 +11,8 @@ import numpy as np
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Query
 
+from app.utils.http import safe_exception_message
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/quotes", tags=["quotes"])
 
@@ -185,7 +187,7 @@ def _fetch_market_quotes_sync() -> dict:
                 "as_of": as_of,
             })
         except Exception as exc:
-            logger.warning("Failed to fetch %s: %s", symbol, exc)
+            logger.warning("Failed to fetch %s: %s", symbol, safe_exception_message(exc))
             quotes.append(_empty_quote(symbol, meta, as_of))
     return {"quotes": quotes, "source": YAHOO_SOURCE, "as_of": as_of}
 
@@ -198,7 +200,7 @@ async def get_market_quotes():
     try:
         result = await _run_yfinance(_fetch_market_quotes_sync)
     except Exception as exc:
-        logger.warning("Failed to fetch market quotes: %s", exc)
+        logger.warning("Failed to fetch market quotes: %s", safe_exception_message(exc))
         as_of = _as_of()
         result = {
             "quotes": [_empty_quote(symbol, meta, as_of) for symbol, meta in ALL_SYMBOLS.items()],
@@ -276,7 +278,11 @@ async def get_candles(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
-        logger.exception("Candle fetch failed for %s", normalized)
+        logger.warning(
+            "Candle fetch failed for %s: %s",
+            normalized,
+            safe_exception_message(exc),
+        )
         raise HTTPException(status_code=502, detail="Market data provider unavailable") from exc
     _candle_cache.set(cache_key, result)
     return result
@@ -334,7 +340,11 @@ async def get_profile(symbol: str):
     try:
         result = await _run_yfinance(_fetch_profile_sync, normalized)
     except Exception as exc:
-        logger.exception("Profile fetch failed for %s", normalized)
+        logger.warning(
+            "Profile fetch failed for %s: %s",
+            normalized,
+            safe_exception_message(exc),
+        )
         raise HTTPException(status_code=502, detail="Market data provider unavailable") from exc
     _profile_cache.set(normalized, result)
     return result
@@ -362,7 +372,11 @@ async def get_asset_sentiment_api(
             "as_of": _as_of(),
         }
     except Exception as exc:
-        logger.warning("Sentiment aggregation failed for %s: %s", normalized, exc)
+        logger.warning(
+            "Sentiment aggregation failed for %s: %s",
+            normalized,
+            safe_exception_message(exc),
+        )
         return {
             "symbol": normalized,
             "days": days,

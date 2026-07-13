@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useApi } from '../../hooks/useApi'
 import { usePolling } from '../../hooks/usePolling'
-import { getAnalysisStats, getModelMarketScenario, getCalendar, getMarketQuotes, getLatestAnalyses, getNews, analyzeCalendar, type CalendarResponse, type MarketQuote } from '../../services/api'
+import { getAnalysisStats, getModelMarketScenario, getCalendar, getMarketQuotes, getLatestAnalyses, getNews, analyzeCalendar, waitForCalendarAnalysis, type CalendarResponse, type MarketQuote } from '../../services/api'
 import type { AnalysisStats, ModelMarketScenario, Analysis, NewsItem } from '../../types'
 import FearGreedGauge from './FearGreedGauge'
 import LoadingSpinner from '../common/LoadingSpinner'
@@ -48,7 +48,8 @@ export default function SentimentDashboard() {
     setCalendarAnalyzing(true)
     setCalendarActionError(null)
     try {
-      await analyzeCalendar(controller.signal)
+      const job = await analyzeCalendar(controller.signal)
+      await waitForCalendarAnalysis(job, controller.signal)
       calendarApi.refetch()
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return

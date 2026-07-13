@@ -5,12 +5,16 @@ import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from app.services import calendar_analyzer, calendar_client, googlenews_client, newsapi_client
 from app.services import news_aggregator
+from app.services import market_focus
+from app.utils import scheduler
+from app.models import database
+from app.integrations.option_pro.repository import upsert_source_health
 from app.services.seekingalpha_client import _parse_sa_item
 from app.utils.dedup import (
     compute_content_hash,
@@ -285,7 +289,7 @@ class SourceScheduleTests(unittest.TestCase):
     def test_default_source_states_and_intervals(self):
         expected = {
             "finnhub": (True, 300),
-            "massive": (True, 300),
+            "massive": (True, 3600),
             "google": (True, 900),
             "seekingalpha_breaking": (True, 300),
             "seekingalpha_daily": (True, 21600),
@@ -306,8 +310,218 @@ class SourceScheduleTests(unittest.TestCase):
         required = {
             "last_attempt", "last_success", "last_error", "duration_ms",
             "raw", "inserted", "duplicates",
+            "source_fetch_status", "news_persistence_status", "event_projection_status",
         }
         self.assertTrue(all(required <= set(item) for item in news_aggregator.get_source_statuses()))
+
+
+class SourceHealthPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restart_restores_last_success_before_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "source-health.db")
+            with patch.object(database, "DB_PATH", path):
+                await database.init_db()
+                db = await database.get_db()
+                try:
+                    await upsert_source_health(
+                        db,
+                        source="google",
+                        status="degraded",
+                        last_attempt_at="2026-07-12T10:05:00+00:00",
+                        last_success_at="2026-07-12T10:00:00+00:00",
+                        data_through="2026-07-12T10:00:00+00:00",
+                        consecutive_failures=2,
+                        next_attempt_at="2026-07-12T10:15:00+00:00",
+                        raw_count=12,
+                        inserted_count=7,
+                        duplicates_count=5,
+                        error_code="source_fetch_failed",
+                    )
+                finally:
+                    await db.close()
+                with patch.object(news_aggregator, "_source_status", {}):
+                    await news_aggregator.initialize_source_health()
+                    google = next(
+                        item for item in news_aggregator.get_source_statuses()
+                        if item["source"] == "google"
+                    )
+                    self.assertEqual(google["last_success"], "2026-07-12T10:00:00+00:00")
+                    self.assertEqual(google["consecutive_failures"], 2)
+
+    async def test_local_projection_failure_is_queued_without_source_backoff(self):
+        async def fetch_google():
+            now = datetime.now(timezone.utc).isoformat()
+            return [{
+                "source": "google/Reuters",
+                "title": "NVDA raises earnings guidance after strong demand",
+                "summary": "The company raised revenue guidance after its earnings report.",
+                "url": "https://example.test/projection-retry",
+                "image_url": None,
+                "published_at": now,
+                "source_tickers": ["NVDA"],
+                "ticker_association_method": "provider_tag",
+            }]
+
+        definition = news_aggregator.SourceDefinition(
+            "google", fetch_google, True, 900, "google_news"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "projection-retry.db")
+            with (
+                patch.object(database, "DB_PATH", path),
+                patch.dict(news_aggregator.SOURCE_DEFINITIONS, {"google": definition}),
+                patch.object(news_aggregator, "_source_status", {}),
+                patch.object(news_aggregator, "_backoff_until", {}),
+            ):
+                await database.init_db()
+                with patch.object(
+                    market_focus,
+                    "ingest_event_evidence",
+                    new=AsyncMock(side_effect=RuntimeError("local projection failed")),
+                ):
+                    result = await news_aggregator.aggregate_source("google", force=True)
+                self.assertEqual(result["status"], "degraded")
+                self.assertEqual(result["projection_queued"], 1)
+                status = next(
+                    item for item in news_aggregator.get_source_statuses()
+                    if item["source"] == "google"
+                )
+                self.assertEqual(status["source_fetch_status"], "ok")
+                self.assertEqual(status["news_persistence_status"], "ok")
+                self.assertEqual(status["event_projection_status"], "degraded")
+                self.assertEqual(status["consecutive_failures"], 0)
+                self.assertIsNone(status["next_attempt_at"])
+
+                db = await database.get_db()
+                try:
+                    health = await (await db.execute(
+                        """SELECT source_fetch_status,news_persistence_status,
+                                  event_projection_status,consecutive_failures,next_attempt_at
+                           FROM source_health WHERE source='google'"""
+                    )).fetchone()
+                    retry = await (await db.execute(
+                        "SELECT status,attempt_count FROM event_projection_retries"
+                    )).fetchone()
+                    self.assertEqual(tuple(health), ("ok", "ok", "degraded", 0, None))
+                    self.assertEqual(tuple(retry), ("pending", 0))
+                finally:
+                    await db.close()
+
+                retried = await news_aggregator.process_projection_retry_queue()
+                repeated = await news_aggregator.process_projection_retry_queue()
+                self.assertEqual(retried, {"attempted": 1, "completed": 1, "failed": 0})
+                self.assertEqual(repeated, {"attempted": 0, "completed": 0, "failed": 0})
+                db = await database.get_db()
+                try:
+                    member_count = await (await db.execute(
+                        "SELECT COUNT(*) FROM news_event_members"
+                    )).fetchone()
+                    self.assertEqual(member_count[0], 1)
+                finally:
+                    await db.close()
+
+    async def test_scheduler_runs_the_projection_retry_queue(self):
+        retry = AsyncMock(return_value={"attempted": 0, "completed": 0, "failed": 0})
+        with patch.object(news_aggregator, "process_projection_retry_queue", new=retry):
+            await scheduler._job_retry_event_projections()
+        retry.assert_awaited_once_with()
+
+    async def test_projection_retry_recovers_stale_in_progress_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "projection-stale.db")
+            with patch.object(database, "DB_PATH", path):
+                await database.init_db()
+                now = datetime.now(timezone.utc)
+                record = {
+                    "source": "google/Reuters",
+                    "title": "NVDA raises earnings guidance after strong demand",
+                    "summary": "The company raised revenue guidance after its earnings report.",
+                    "url": "https://example.test/projection-stale",
+                    "published_at": now.isoformat(),
+                    "fetched_at": now.isoformat(),
+                    "content_hash": "a" * 64,
+                    "source_tickers": ["NVDA"],
+                    "ticker_association_method": "provider_tag",
+                }
+                db = await database.get_db()
+                try:
+                    retry_id = await news_aggregator.enqueue_projection_retry(
+                        db, record=record, news_id=None, source="google"
+                    )
+                    await db.execute(
+                        """UPDATE event_projection_retries SET status='in_progress',updated_at=?
+                           WHERE retry_id=?""",
+                        ((now - timedelta(minutes=20)).isoformat(), retry_id),
+                    )
+                    await db.commit()
+                finally:
+                    await db.close()
+
+                result = await news_aggregator.process_projection_retry_queue()
+                self.assertEqual(result, {"attempted": 1, "completed": 1, "failed": 0})
+
+    async def test_projection_retry_dead_letters_poison_payload_at_attempt_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "projection-dead-letter.db")
+            with patch.object(database, "DB_PATH", path):
+                await database.init_db()
+                now = datetime.now(timezone.utc)
+                record = {
+                    "source": "google/Reuters",
+                    "title": "Poison event projection payload",
+                    "summary": "A deterministic invalid local projection payload.",
+                    "url": "https://example.test/projection-poison",
+                    "published_at": now.isoformat(),
+                    "fetched_at": now.isoformat(),
+                    "content_hash": "b" * 64,
+                    "source_tickers": ["NVDA"],
+                    "ticker_association_method": "provider_tag",
+                }
+                db = await database.get_db()
+                try:
+                    retry_id = await news_aggregator.enqueue_projection_retry(
+                        db, record=record, news_id=None, source="google"
+                    )
+                    await db.commit()
+                finally:
+                    await db.close()
+
+                with (
+                    patch.object(news_aggregator.app_settings, "projection_retry_max_attempts", 2),
+                    patch.object(
+                        market_focus,
+                        "ingest_event_evidence",
+                        new=AsyncMock(side_effect=ValueError("poison")),
+                    ),
+                ):
+                    first = await news_aggregator.process_projection_retry_queue()
+                    self.assertEqual(first["failed"], 1)
+                    db = await database.get_db()
+                    try:
+                        await db.execute(
+                            "UPDATE event_projection_retries SET next_attempt_at=? WHERE retry_id=?",
+                            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), retry_id),
+                        )
+                        await db.commit()
+                    finally:
+                        await db.close()
+                    second = await news_aggregator.process_projection_retry_queue()
+                    third = await news_aggregator.process_projection_retry_queue()
+                self.assertEqual(second["failed"], 1)
+                self.assertEqual(third, {"attempted": 0, "completed": 0, "failed": 0})
+                db = await database.get_db()
+                try:
+                    row = await (await db.execute(
+                        """SELECT status,attempt_count,next_attempt_at,last_error_code
+                           FROM event_projection_retries WHERE retry_id=?""",
+                        (retry_id,),
+                    )).fetchone()
+                    self.assertEqual(
+                        tuple(row),
+                        ("failed", 2, None, "event_projection_dead_letter"),
+                    )
+                finally:
+                    await db.close()
 
 
 if __name__ == "__main__":
