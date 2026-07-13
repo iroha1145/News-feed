@@ -32,6 +32,11 @@ def run(coro):
 def isolated_calendar_db(tmp_path, monkeypatch):
     path = tmp_path / "calendar-jobs.db"
     monkeypatch.setattr(database, "DB_PATH", str(path))
+    monkeypatch.setattr(settings, "calendar_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "calendar_llm_daily_job_limit", 10)
+    monkeypatch.setattr(
+        settings, "calendar_llm_daily_output_token_limit", 200_000
+    )
     monkeypatch.setattr(settings, "news_llm_manual_enabled", True)
     monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 50)
     monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", 1_638_400)
@@ -190,7 +195,59 @@ def test_calendar_post_creates_job_and_get_only_polls_storage(
         assert calendar.status_code == 200
         assert calendar.json()["events"][0].get("title_zh") is None
         assert calendar.json()["analyzed"] == 0
+        assert calendar.json()["analysis_capability"] == "enabled"
     assert fetch_calls == 2
+
+
+def test_calendar_post_is_fail_closed_before_fetch_or_job_creation(
+    isolated_calendar_db, monkeypatch
+):
+    fetch_calls = 0
+
+    async def fake_fetch():
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return [calendar_event()]
+
+    monkeypatch.setattr(calendar_router, "fetch_economic_calendar", fake_fetch)
+    monkeypatch.setattr(settings, "admin_token", "calendar-admin")
+    monkeypatch.setattr(settings, "calendar_llm_manual_enabled", False)
+
+    app = FastAPI()
+    app.include_router(calendar_router.router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/calendar/analyze",
+            headers={"X-Admin-Token": "calendar-admin"},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "disabled"
+
+        monkeypatch.setattr(settings, "calendar_llm_manual_enabled", True)
+        monkeypatch.setattr(
+            settings, "calendar_llm_daily_output_token_limit", None
+        )
+        unbudgeted = client.post(
+            "/api/calendar/analyze",
+            headers={"X-Admin-Token": "calendar-admin"},
+        )
+        assert unbudgeted.status_code == 409
+        assert (
+            unbudgeted.json()["detail"]["code"]
+            == "budget_configuration_required"
+        )
+
+    assert fetch_calls == 0
+
+    async def count_jobs():
+        db = await database.get_db()
+        try:
+            async with db.execute("SELECT COUNT(*) FROM calendar_analysis_jobs") as cursor:
+                return int((await cursor.fetchone())[0])
+        finally:
+            await db.close()
+
+    assert run(count_jobs()) == 0
 
 
 def test_calendar_worker_uses_mocked_responses_and_persists_result(
@@ -293,6 +350,70 @@ def test_calendar_worker_uses_mocked_responses_and_persists_result(
     assert provider.options["max_output_tokens"] == 1024
     assert provider.options["output_format"]["type"] == "json_schema"
     assert "untrusted data" in provider.options["instructions"]
+
+
+def test_disabled_calendar_worker_only_observes_existing_response(
+    isolated_calendar_db, monkeypatch
+):
+    first_event = calendar_event(31)
+    observed_event = calendar_event(32)
+    provider = FakeCalendarProvider(
+        ResponseResult(
+            response_id="resp_calendar_existing",
+            status="completed",
+            output_text=json.dumps(calendar_result(observed_event), ensure_ascii=False),
+        )
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            unsubmitted = await create_or_get_calendar_job(
+                db,
+                [first_event],
+                provider="openai",
+                model="gpt-5.6-terra",
+            )
+            observed = await create_or_get_calendar_job(
+                db,
+                [observed_event],
+                provider="openai",
+                model="gpt-5.6-terra",
+            )
+            await db.execute(
+                """UPDATE calendar_analysis_jobs
+                   SET status='queued',openai_response_id='resp_calendar_existing'
+                   WHERE job_id=?""",
+                (observed.job["job_id"],),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        monkeypatch.setattr(settings, "calendar_llm_manual_enabled", False)
+        assert await run_calendar_worker_once(
+            provider=provider,
+            worker_id="calendar-disabled-observer",
+        ) is True
+        assert provider.retrieve_calls == 1
+        assert provider.create_calls == 0
+
+        db = await database.get_db()
+        try:
+            observed_row = await get_calendar_job(db, observed.job["job_id"])
+            unsubmitted_row = await get_calendar_job(db, unsubmitted.job["job_id"])
+            assert observed_row["status"] == "completed"
+            assert unsubmitted_row["status"] == "pending"
+        finally:
+            await db.close()
+
+        assert await run_calendar_worker_once(
+            provider=provider,
+            worker_id="calendar-disabled-no-submit",
+        ) is False
+        assert provider.create_calls == 0
+
+    run(scenario())
 
 
 def test_background_calendar_response_is_linked_before_later_poll(

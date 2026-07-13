@@ -11,8 +11,10 @@ from app.config import settings
 from app.deps import auth as auth_deps
 from app.models import database
 from app.models.schemas import LLMAnalysisPayload
+from app.routers import analysis as analysis_router
 from app.routers import auth as auth_router
 from app.routers import quotes
+from app.routers import x_sentiment as x_sentiment_router
 from app.services import grok_x_monitor, llm_analyzer
 from app.utils.dedup import compute_content_hash, compute_legacy_content_hash
 
@@ -168,6 +170,143 @@ def test_model_market_scenario_payload_is_strict_and_bounded():
         grok_x_monitor._parse_scenario(json.dumps({**valid, "fear_greed_estimate": 150}))
     with pytest.raises(ValidationError):
         grok_x_monitor._parse_scenario(json.dumps({**valid, "overall_retail_sentiment": "0"}))
+
+
+def test_disabled_model_market_scenario_never_opens_database_or_queues_refresh(
+    isolated_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "x_sentiment_enabled", False)
+    monkeypatch.setattr(settings, "admin_token", "scenario-admin")
+    database_opened = False
+    refresh_called = False
+
+    async def forbidden_get_db():
+        nonlocal database_opened
+        database_opened = True
+        raise AssertionError("disabled scenario must not open the database")
+
+    async def forbidden_refresh():
+        nonlocal refresh_called
+        refresh_called = True
+        raise AssertionError("disabled scenario must not queue provider work")
+
+    monkeypatch.setattr(grok_x_monitor, "get_db", forbidden_get_db)
+    assert run(grok_x_monitor.run_x_sentiment_analysis()) is None
+    assert database_opened is False
+
+    monkeypatch.setattr(
+        x_sentiment_router, "run_x_sentiment_analysis", forbidden_refresh
+    )
+    app = FastAPI()
+    app.include_router(x_sentiment_router.router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/x-sentiment/refresh",
+            headers={"X-Admin-Token": "scenario-admin"},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "disabled"
+    assert refresh_called is False
+
+    async def count_rows():
+        db = await database.get_db()
+        try:
+            async with db.execute("SELECT COUNT(*) FROM x_sentiments") as cursor:
+                return int((await cursor.fetchone())[0])
+        finally:
+            await db.close()
+
+    assert run(count_rows()) == 0
+
+
+def test_manual_analysis_routes_fail_closed_and_report_real_enqueue_count(
+    isolated_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "admin_token", "analysis-admin")
+
+    async def seed_news(index: int):
+        db = await database.get_db()
+        try:
+            return await database.insert_news_item(db, news_record(index))
+        finally:
+            await db.close()
+
+    first_news_id = run(seed_news(901))
+    app = FastAPI()
+    app.include_router(analysis_router.router)
+    headers = {"X-Admin-Token": "analysis-admin"}
+
+    monkeypatch.setattr(settings, "news_llm_manual_enabled", False)
+    with TestClient(app) as client:
+        disabled = client.post("/api/analysis/trigger", headers=headers)
+        assert disabled.status_code == 409
+        assert disabled.json()["detail"]["code"] == "disabled"
+        disabled_retry = client.post(
+            f"/api/analysis/retry-failed?news_id={first_news_id}",
+            headers=headers,
+        )
+        assert disabled_retry.status_code == 409
+        assert disabled_retry.json()["detail"]["code"] == "disabled"
+
+    monkeypatch.setattr(settings, "news_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 10)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", None)
+    with TestClient(app) as client:
+        unbudgeted = client.post("/api/analysis/trigger", headers=headers)
+        assert unbudgeted.status_code == 409
+        assert (
+            unbudgeted.json()["detail"]["code"]
+            == "budget_configuration_required"
+        )
+        unbudgeted_retry = client.post(
+            f"/api/analysis/retry-failed?news_id={first_news_id}",
+            headers=headers,
+        )
+        assert unbudgeted_retry.status_code == 409
+
+    async def assert_no_jobs():
+        db = await database.get_db()
+        try:
+            async with db.execute("SELECT COUNT(*) FROM analysis_jobs") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            news = await database.get_news_item_by_id(
+                db, first_news_id, include_internal=True
+            )
+            assert news["analysis_status"] == "pending"
+        finally:
+            await db.close()
+
+    run(assert_no_jobs())
+
+    monkeypatch.setattr(
+        settings, "news_llm_manual_daily_output_token_limit", 1_000_000
+    )
+    with TestClient(app) as client:
+        enabled = client.post("/api/analysis/trigger?batch_size=5", headers=headers)
+        assert enabled.status_code == 200
+        assert enabled.json() == {
+            "status": "queued",
+            "batch_size": 5,
+            "enqueued": 1,
+            "capability": "enabled",
+        }
+        no_more = client.post("/api/analysis/trigger?batch_size=5", headers=headers)
+        assert no_more.status_code == 200
+        assert no_more.json()["status"] == "no_eligible_news"
+        assert no_more.json()["enqueued"] == 0
+
+    async def assert_manual_job():
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT request_origin,status FROM analysis_jobs WHERE news_id=?",
+                (first_news_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("manual", "pending")
+        finally:
+            await db.close()
+
+    run(assert_manual_job())
 
 
 def test_database_pragmas_indexes_batch_insert_and_absolute_path(isolated_db, monkeypatch):

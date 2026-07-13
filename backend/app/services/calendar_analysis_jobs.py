@@ -186,6 +186,9 @@ async def get_calendar_job(
 
 
 async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
+    capability = settings.manual_calendar_analysis_capability
+    if capability != "enabled":
+        return capability
     async with db.execute(
         "SELECT COUNT(*) FROM calendar_analysis_jobs "
         "WHERE status IN ('pending','queued','in_progress')"
@@ -199,7 +202,10 @@ async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
         "SELECT COUNT(*) FROM calendar_analysis_jobs WHERE budgeted_at >= ?",
         (day_start,),
     ) as cursor:
-        if int((await cursor.fetchone())[0]) >= settings.calendar_llm_daily_job_limit:
+        job_limit = settings.calendar_llm_daily_job_limit
+        if job_limit is None:
+            return "budget_configuration_required"
+        if int((await cursor.fetchone())[0]) >= job_limit:
             return "calendar_daily_job_limit_reached"
     async with db.execute(
         """SELECT COALESCE(SUM(
@@ -214,9 +220,12 @@ async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
         (day_start,),
     ) as cursor:
         reserved_or_used = int((await cursor.fetchone())[0])
+        output_limit = settings.calendar_llm_daily_output_token_limit
+        if output_limit is None:
+            return "budget_configuration_required"
         if (
             reserved_or_used + settings.calendar_max_output_tokens
-            > settings.calendar_llm_daily_output_token_limit
+            > output_limit
         ):
             return "calendar_daily_output_token_limit_reached"
     return None
@@ -476,6 +485,8 @@ async def _background_inflight_counts(
 async def claim_next_calendar_job(
     db: aiosqlite.Connection,
     worker_id: str,
+    *,
+    allow_new_submissions: bool | None = None,
 ) -> dict[str, Any] | None:
     await recover_expired_calendar_job_leases(db)
     now = utc_now()
@@ -490,8 +501,13 @@ async def claim_next_calendar_job(
             now_text,
             unknown_submission_cutoff,
         )
+        if allow_new_submissions is None:
+            allow_new_submissions = (
+                settings.manual_calendar_analysis_capability == "enabled"
+            )
         allow_submission = (
-            calendar_inflight < settings.calendar_llm_max_inflight
+            allow_new_submissions
+            and calendar_inflight < settings.calendar_llm_max_inflight
             and global_inflight < settings.openai_max_concurrency
         )
         submission_clause = "" if allow_submission else "AND openai_response_id IS NOT NULL"

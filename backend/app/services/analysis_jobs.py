@@ -1375,11 +1375,17 @@ async def request_cancel(db: aiosqlite.Connection, job_id: str) -> dict[str, Any
         raise
 
 
-async def enqueue_auto_jobs(limit: int | None = None) -> int:
-    # Automatic paid work is fail-closed. Both daily limits must be explicit;
-    # absent limits never mean unlimited. Manual analysis has a separate entry
-    # path and remains governed by the ordinary queue budget checks.
-    if settings.automatic_news_analysis_capability != "enabled":
+async def _enqueue_jobs(
+    limit: int | None,
+    *,
+    request_origin: Literal["manual", "automatic"],
+) -> int:
+    capability = (
+        settings.automatic_news_analysis_capability
+        if request_origin == "automatic"
+        else settings.manual_news_analysis_capability
+    )
+    if capability != "enabled":
         return 0
     db = await get_db()
     try:
@@ -1400,7 +1406,8 @@ async def enqueue_auto_jobs(limit: int | None = None) -> int:
             news_id = int(candidate["id"])
             has_ticker = bool(_source_tickers(candidate.get("source_tickers")))
             if (
-                has_sufficient_context(candidate)
+                request_origin == "automatic"
+                and has_sufficient_context(candidate)
                 and deterministic_market_relevance(candidate) < settings.news_llm_min_market_relevance
             ):
                 await db.execute(
@@ -1411,14 +1418,30 @@ async def enqueue_auto_jobs(limit: int | None = None) -> int:
                 )
                 await db.commit()
                 continue
+            priority = 100 if request_origin == "manual" else (50 if has_ticker else 0)
             result = await create_or_get_job(
-                db, news_id, priority=50 if has_ticker else 0, request_origin="automatic"
+                db,
+                news_id,
+                priority=priority,
+                request_origin=request_origin,
             )
             if result.created:
                 count += 1
         return count
     finally:
         await db.close()
+
+
+async def enqueue_auto_jobs(limit: int | None = None) -> int:
+    # Automatic paid work is fail-closed. Both daily limits must be explicit;
+    # absent limits never mean unlimited.
+    return await _enqueue_jobs(limit, request_origin="automatic")
+
+
+async def enqueue_manual_jobs(limit: int | None = None) -> int:
+    # The manual batch path has separate switches and budgets. It only persists
+    # Jobs; the dedicated worker owns every provider request.
+    return await _enqueue_jobs(limit, request_origin="manual")
 
 
 async def retry_failed_jobs(

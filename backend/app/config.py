@@ -147,6 +147,7 @@ class Settings(BaseSettings):
 
     # App
     analysis_batch_size: int = Field(default=10, ge=1, le=100)
+    x_sentiment_enabled: bool = False
     x_sentiment_interval: int = Field(default=21600, ge=300)
     database_url: str = "sqlite+aiosqlite:///data/macrolens.db"
     cors_origins: str = ""  # comma-separated origins
@@ -182,12 +183,15 @@ class Settings(BaseSettings):
     calendar_analysis_schema_version: str = Field(
         default="calendar-impact-schema-v1", min_length=1, max_length=100
     )
+    calendar_llm_manual_enabled: bool = False
     calendar_llm_max_inflight: int = Field(default=1, ge=1, le=16)
     calendar_llm_max_queued: int = Field(default=10, ge=1, le=10_000)
     calendar_max_output_tokens: int = Field(default=16384, ge=256, le=128000)
-    calendar_llm_daily_job_limit: int = Field(default=10, ge=1, le=1_000_000)
-    calendar_llm_daily_output_token_limit: int = Field(
-        default=200_000, ge=1, le=1_000_000_000
+    calendar_llm_daily_job_limit: Optional[int] = Field(
+        default=None, ge=1, le=1_000_000
+    )
+    calendar_llm_daily_output_token_limit: Optional[int] = Field(
+        default=None, ge=1, le=1_000_000_000
     )
     calendar_analysis_cache_ttl: int = Field(default=3600, ge=60, le=86400)
     calendar_fetch_interval_seconds: int = Field(default=600, ge=60, le=86400)
@@ -364,6 +368,17 @@ class Settings(BaseSettings):
         if (
             self.news_llm_manual_daily_job_limit is None
             or self.news_llm_manual_daily_output_token_limit is None
+        ):
+            return "budget_configuration_required"
+        return "enabled"
+
+    @property
+    def manual_calendar_analysis_capability(self) -> str:
+        if not self.calendar_llm_manual_enabled:
+            return "disabled"
+        if (
+            self.calendar_llm_daily_job_limit is None
+            or self.calendar_llm_daily_output_token_limit is None
         ):
             return "budget_configuration_required"
         return "enabled"

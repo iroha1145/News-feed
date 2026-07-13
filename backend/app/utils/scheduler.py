@@ -54,6 +54,8 @@ async def _job_retry_event_projections() -> None:
 
 
 async def _job_x_sentiment() -> None:
+    if not app_settings.x_sentiment_enabled:
+        return
     try:
         from app.services.grok_x_monitor import run_x_sentiment_analysis
 
@@ -224,18 +226,19 @@ async def start_scheduler() -> None:
         name="Market-focus cycle schedule",
     )
 
-    x_sentiment_interval = await _get_db_interval(
-        "x_sentiment_interval",
-        getattr(app_settings, "x_sentiment_interval", 1800),
-    )
-    x_sentiment_interval = max(300, x_sentiment_interval)
-    _add_interval_job(
-        _scheduler,
-        _job_x_sentiment,
-        seconds=x_sentiment_interval,
-        job_id="x_sentiment",
-        name="News-grounded model market scenario",
-    )
+    if app_settings.x_sentiment_enabled:
+        x_sentiment_interval = await _get_db_interval(
+            "x_sentiment_interval",
+            getattr(app_settings, "x_sentiment_interval", 1800),
+        )
+        x_sentiment_interval = max(300, x_sentiment_interval)
+        _add_interval_job(
+            _scheduler,
+            _job_x_sentiment,
+            seconds=x_sentiment_interval,
+            job_id="x_sentiment",
+            name="News-grounded model market scenario",
+        )
 
     _scheduler.start()
     logger.info("Scheduler started with independent news jobs: %s", source_intervals)

@@ -13,9 +13,10 @@ interface NewsCardProps {
   item: NewsItem
   onTickerClick?: (ticker: string, name?: string) => void
   onRetryQueued?: () => void
+  manualAnalysisEnabled?: boolean
 }
 
-export default function NewsCard({ item, onTickerClick, onRetryQueued }: NewsCardProps) {
+export default function NewsCard({ item, onTickerClick, onRetryQueued, manualAnalysisEnabled = false }: NewsCardProps) {
   const [retrying, setRetrying] = useState(false)
   const [retryQueued, setRetryQueued] = useState(false)
   const [retryError, setRetryError] = useState<string | null>(null)
@@ -196,8 +197,8 @@ export default function NewsCard({ item, onTickerClick, onRetryQueued }: NewsCar
                 {retryQueued ? '已重新排队' : '分析失败'}
               </span>
               {!retryQueued && (
-                <button type="button" onClick={handleRetry} disabled={retrying} className="rounded-md border border-red-300 px-2 py-1 font-bold text-error disabled:opacity-50 dark:border-red-800 dark:text-red-400">
-                  {retrying ? '处理中…' : '重新排队'}
+                <button type="button" onClick={handleRetry} disabled={retrying || !manualAnalysisEnabled} className="rounded-md border border-red-300 px-2 py-1 font-bold text-error disabled:opacity-50 dark:border-red-800 dark:text-red-400">
+                  {retrying ? '处理中…' : manualAnalysisEnabled ? '重新排队' : '重试已关闭'}
                 </button>
               )}
               {retryError && <span className="basis-full text-error dark:text-red-400" role="alert">{retryError}</span>}

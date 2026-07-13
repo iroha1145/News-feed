@@ -9,6 +9,7 @@ import AssetDetailModal from '../markets/AssetDetailModal'
 import { useAdminSession } from '../../context/AdminSessionContext'
 import { useSearchParams } from 'react-router-dom'
 import { toLocalTime } from '../../utils/time'
+import { paidCapabilityEnabled, paidCapabilityLabel } from '../../utils/paidCapability'
 
 type Filter = 'all' | 'bullish' | 'bearish' | 'neutral'
 
@@ -84,8 +85,10 @@ export default function NewsFeed() {
     setActionError(null)
     setActionMessage(null)
     try {
-      await triggerAnalysis(controller.signal)
-      setActionMessage('分析任务已提交，列表会自动更新。')
+      const result = await triggerAnalysis(controller.signal)
+      setActionMessage(result.enqueued > 0
+        ? `已提交 ${result.enqueued} 项分析任务，列表会自动更新。`
+        : '没有符合条件的新分析任务。')
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       if (!handleExpiredSession(error, '管理会话已过期，请重新登录后运行分析。')) {
@@ -101,6 +104,12 @@ export default function NewsFeed() {
   const totalPages = Math.max(1, Math.ceil((newsApi.data?.total ?? 0) / PAGE_SIZE))
   const enabledSources = sourcesApi.data?.sources.filter((source) => source.enabled) ?? []
   const unhealthySources = enabledSources.filter((source) => !source.configured || source.consecutive_failures > 0)
+  const manualCapability = statsApi.data?.manual_analysis_capability
+  const manualAnalysisEnabled = paidCapabilityEnabled(manualCapability)
+  const manualAnalysisLabel = paidCapabilityLabel(manualCapability, {
+    enabled: '运行分析',
+    disabled: '分析已关闭',
+  })
 
   const updateQuery = (nextFilter: Filter, nextPage: number) => {
     const next = new URLSearchParams(searchParams)
@@ -166,11 +175,11 @@ export default function NewsFeed() {
             <button
               type="button"
               onClick={handleAnalyze}
-              disabled={sessionChecking || analyzing || fetching}
+              disabled={sessionChecking || analyzing || fetching || !manualAnalysisEnabled}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-primary dark:bg-violet-600 text-on-primary rounded-lg text-xs font-bold hover:bg-primary-dim dark:hover:bg-violet-700 transition-all active:scale-95"
             >
               <span className="material-symbols-outlined text-[16px]" aria-hidden="true">psychology</span>
-              {analyzing ? '提交中…' : '运行分析'}
+              {analyzing ? '提交中…' : manualAnalysisLabel}
             </button>
           </div>
         </div>
@@ -227,6 +236,7 @@ export default function NewsFeed() {
                 item={item}
                 onTickerClick={(ticker, name) => setSelectedTicker({ symbol: ticker, name })}
                 onRetryQueued={refetchAll}
+                manualAnalysisEnabled={manualAnalysisEnabled}
               />
             ))
           )}

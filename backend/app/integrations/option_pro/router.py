@@ -484,6 +484,13 @@ async def create_analysis_job(
     body: AnalysisJobCreateRequest,
     _: IntegrationPrincipal = Depends(require_action),
 ):
+    capability = settings.manual_news_analysis_capability
+    if capability != "enabled":
+        raise IntegrationAPIError(
+            409,
+            capability,
+            "Manual analysis is disabled until both daily budgets are configured.",
+        )
     db = await get_db()
     try:
         try:

@@ -105,6 +105,9 @@ def _parse_scenario(raw: str) -> MarketScenarioPayload:
 async def run_x_sentiment_analysis() -> Optional[dict]:
     """Generate a news-grounded model scenario; no live X data is queried."""
     global _last_error
+    if not app_settings.x_sentiment_enabled:
+        _last_error = "Model market scenario is disabled"
+        return None
     db = await get_db()
     try:
         grok_key = await get_setting(db, "grok_api_key") or app_settings.grok_api_key
