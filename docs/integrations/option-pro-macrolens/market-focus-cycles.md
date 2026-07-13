@@ -36,7 +36,7 @@ hot_score =
   0.10 market_confirmation
 ```
 
-A missing component has zero active weight and the remaining weights are normalized. No missing value is filled with 50. Market confirmation is accepted only when the focus and symbol timestamps are not earlier than the event `available_at`, the symbol is active, and data quality reaches the configured minimum.
+A missing component has zero active weight and the remaining weights are normalized. No missing value is filled with 50. Market confirmation is accepted only when `symbol.data_through >= event.available_at`、`data_status=active`、来源状态为 active 或 degraded，且数据质量达到配置下限。`as_of` 只表示快照观察时间，不能代替数据截至时间；任一条件缺失时市场确认为 `null`。
 
 Scores at or above 75 enter `PREPARED`. Scores from 60 through 74.999 require an independent second source, a trusted ticker association, a hard event type, or material market confirmation. These bootstrap thresholds are versioned by `HOTSPOT_GATE_VERSION`.
 
@@ -51,10 +51,16 @@ supporting_weight = sum(weight of supporting events)
 conflicting_weight = sum(weight of conflicting events)
 conflict_ratio = conflicting_weight / (supporting_weight + conflicting_weight)
 effective_reliability = max(0, 1 - conflict_ratio)
-weighted_catalyst_context = catalyst_bias * confidence / 100 * effective_reliability
+support_factor = min(1, supporting_weight / SUPPORT_TARGET)
+weighted_catalyst_context =
+  catalyst_bias * confidence / 100 * support_factor * effective_reliability
 ```
 
-The result is limited to `[-100,100]`. No supporting evidence or zero total weight produces `null`. Adding conflicting weight can only reduce reliability and therefore cannot increase the absolute catalyst context.
+该展示公式版本为 `catalyst-context-v2`，`SUPPORT_TARGET` 是集中配置的 bootstrap 校准值，并随周期不可变输入保存。结果限制在 `[-100,100]`，不进入正式股票评分。没有支持证据时结果为 `null`；支持权重增加不会降低绝对值，冲突权重增加不会提高绝对值。相同事实指纹的转载只计一次支持权重，即使它们来自不同事件组。旧公式值只作为过渡期 Shadow 研究字段保留，不覆写历史结果。
+
+## Breakout confirmation context
+
+突破生命周期到市场活动确认强度的映射统一使用 `breakout-confirmation-context-v1`：`DISCOVERED=0`、`WATCHING=0`、`TRIGGERED=10`、`CONFIRMED=25`、`HOLDING=20`、`RETESTING=8`、`RETEST_HELD=25`、`REACCELERATING=30`、`EXTENDED=15`、`FAILED=0`、`EXPIRED=0`。兼容旧快照时仅保留 `ACTIVE=25`。这些值只说明事件后的市场活动确认，不是买入评分、上涨概率或突破质量分，也不进入正式突破评分。
 
 ## Revision and immutable cycle semantics
 

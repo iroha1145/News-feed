@@ -21,7 +21,8 @@ from app.models.catalysts import (
     NewsImpactAnalysis,
     PublicAnalysis,
 )
-from app.services.analysis_jobs import parse_utc, utc_now, utc_text
+from app.services.analysis_jobs import parse_utc, utc_now
+from app.services.ticker_lineage import utc_text
 from app.utils.tickers import normalize_ticker
 
 logger = logging.getLogger(__name__)
@@ -109,18 +110,18 @@ def filter_digest(kind: str, values: dict[str, Any]) -> str:
 VISIBLE_CTE = """
 WITH visible_revisions AS (
   SELECT r.*, ROW_NUMBER() OVER (
-    PARTITION BY r.news_id ORDER BY datetime(r.available_at) DESC, r.revision DESC
+    PARTITION BY r.news_id ORDER BY REPLACE(r.available_at,'Z','+00:00') DESC, r.revision DESC
   ) AS rn
   FROM analysis_revisions r
-  WHERE datetime(r.available_at) <= datetime(:as_of)
+  WHERE REPLACE(r.available_at,'Z','+00:00') <= :as_of
 ),
 visible_jobs AS (
   SELECT j.*, ROW_NUMBER() OVER (
-    PARTITION BY j.news_id ORDER BY datetime(j.updated_at) DESC, j.job_id DESC
+    PARTITION BY j.news_id ORDER BY REPLACE(j.updated_at,'Z','+00:00') DESC, j.job_id DESC
   ) AS rn
   FROM analysis_jobs j
-  WHERE datetime(j.created_at) <= datetime(:as_of)
-    AND datetime(j.updated_at) <= datetime(:as_of)
+  WHERE REPLACE(j.created_at,'Z','+00:00') <= :as_of
+    AND REPLACE(j.updated_at,'Z','+00:00') <= :as_of
 )
 """
 
@@ -132,25 +133,34 @@ SELECT n.id AS news_id, n.content_hash, n.source, n.title, n.summary, n.url,
        r.schema_version AS revision_schema, r.analyzed_at, r.available_at,
        COALESCE((
          SELECT json_group_array(json_object(
-           'ticker',latest.ticker,
-           'validation_status',latest.validation_status,
-           'validated_at',latest.validated_at,
-           'focus_revision',latest.focus_revision,
-           'universe_version',latest.universe_version,
-           'association_method',latest.association_method
+           'ticker',validation.ticker,
+           'validation_status',validation.validation_status,
+           'validated_at',validation.validated_at,
+           'focus_revision',validation.focus_revision,
+           'universe_version',validation.universe_version,
+           'association_method',validation.association_method
          ))
          FROM (
-           SELECT m.ticker,m.validation_status,m.validated_at,m.focus_revision,
-                  m.universe_version,m.association_method
+           SELECT m.ticker,COALESCE(v.validation_status,'unverified') AS validation_status,
+                  v.available_at AS validated_at,v.focus_revision,v.universe_version,
+                  m.association_method
            FROM news_ticker_mentions m
+           LEFT JOIN ticker_validation_revisions v ON v.id=(
+             SELECT latest.id FROM ticker_validation_revisions latest
+             WHERE latest.mention_id=m.id AND latest.available_at<=:as_of
+             ORDER BY latest.available_at DESC,latest.id DESC LIMIT 1
+           )
            WHERE m.news_id=n.id AND m.association_method='llm_inference'
+             AND m.analysis_revision_id=r.id
+             AND m.created_at<=:as_of
              AND m.id=(
-               SELECT MAX(newest.id) FROM news_ticker_mentions newest
-               WHERE newest.news_id=m.news_id AND newest.ticker=m.ticker
-                 AND newest.association_method='llm_inference'
+               SELECT MIN(identity.id) FROM news_ticker_mentions identity
+               WHERE identity.analysis_revision_id=m.analysis_revision_id
+                 AND identity.ticker=m.ticker
+                 AND identity.association_method='llm_inference'
              )
            ORDER BY m.ticker
-         ) latest
+         ) validation
        ),'[]') AS stock_validations_json,
        j.status AS job_status,
        sh.status AS source_health_status,
@@ -160,13 +170,13 @@ SELECT n.id AS news_id, n.content_hash, n.source, n.title, n.summary, n.url,
          SELECT MAX(c.change_sequence) FROM integration_changes c
          WHERE c.entity_id=CAST(n.id AS TEXT)
            AND c.entity_type IN ('news','analysis')
-           AND datetime(c.updated_at) <= datetime(:as_of)
+           AND REPLACE(c.updated_at,'Z','+00:00') <= :as_of
        ), n.id) AS change_sequence,
        COALESCE((
          SELECT c.updated_at FROM integration_changes c
          WHERE c.entity_id=CAST(n.id AS TEXT)
            AND c.entity_type IN ('news','analysis')
-           AND datetime(c.updated_at) <= datetime(:as_of)
+           AND REPLACE(c.updated_at,'Z','+00:00') <= :as_of
          ORDER BY c.change_sequence DESC LIMIT 1
        ), n.updated_at, n.fetched_at) AS effective_updated_at
 FROM news_items n
@@ -179,6 +189,40 @@ LEFT JOIN source_health sh ON sh.source=CASE
   ELSE n.source
 END
 """
+
+
+async def stock_validations_for_analysis(
+    db: aiosqlite.Connection,
+    *,
+    analysis_revision_id: int,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    async with db.execute(
+        """SELECT m.ticker,COALESCE(v.validation_status,'unverified') AS validation_status,
+                  v.available_at AS validated_at,v.focus_revision,v.universe_version,
+                  m.association_method
+           FROM news_ticker_mentions m
+           LEFT JOIN ticker_validation_revisions v ON v.id=(
+             SELECT latest.id FROM ticker_validation_revisions latest
+             WHERE latest.mention_id=m.id AND latest.available_at<=:as_of
+             ORDER BY latest.available_at DESC,latest.id DESC LIMIT 1
+           )
+           WHERE m.analysis_revision_id=:analysis_revision_id
+             AND m.association_method='llm_inference'
+             AND m.created_at<=:as_of
+             AND m.id=(
+               SELECT MIN(identity.id) FROM news_ticker_mentions identity
+               WHERE identity.analysis_revision_id=m.analysis_revision_id
+                 AND identity.ticker=m.ticker
+                 AND identity.association_method='llm_inference'
+             )
+           ORDER BY m.ticker""",
+        {
+            "analysis_revision_id": analysis_revision_id,
+            "as_of": utc_text(as_of),
+        },
+    ) as cursor:
+        return [dict(row) for row in await cursor.fetchall()]
 
 
 def _item_from_row(row: aiosqlite.Row | dict[str, Any]) -> CatalystItem | None:
@@ -278,8 +322,8 @@ async def query_feed(
     digest = filter_digest("feed", filters)
     cursor_payload = decode_cursor(cursor, kind="feed", filter_digest=digest) if cursor else None
     conditions = [
-        "datetime(n.fetched_at) <= datetime(:as_of)",
-        "(n.published_at IS NULL OR datetime(n.published_at) <= datetime(:as_of))",
+        "REPLACE(n.fetched_at,'Z','+00:00') <= :as_of",
+        "(n.published_at IS NULL OR REPLACE(n.published_at,'Z','+00:00') <= :as_of)",
         "datetime(COALESCE(n.published_at,n.fetched_at)) >= datetime(:window_start)",
     ]
     params: dict[str, Any] = {
@@ -301,7 +345,12 @@ async def query_feed(
     if min_abs_impact:
         conditions.append(
             "r.id IS NOT NULL AND EXISTS (SELECT 1 FROM analysis_stock_impacts si "
-            "WHERE si.analysis_id=r.id AND si.validation_status IN ('canonical','valid_external') "
+            "JOIN ticker_validation_revisions vv ON vv.id=("
+            "SELECT latest.id FROM ticker_validation_revisions latest "
+            "WHERE latest.mention_id=si.mention_id AND latest.available_at<=:as_of "
+            "ORDER BY latest.available_at DESC,latest.id DESC LIMIT 1) "
+            "WHERE si.analysis_revision_id=r.id "
+            "AND vv.validation_status IN ('canonical','valid_external') "
             "AND ABS(si.impact_score)>=:min_abs_impact)"
         )
         params["min_abs_impact"] = min_abs_impact
@@ -351,8 +400,8 @@ async def query_feed(
 async def get_news_item(db: aiosqlite.Connection, news_id: int, as_of: datetime) -> CatalystItem | None:
     sql = (
         VISIBLE_CTE + ITEM_SELECT
-        + " WHERE n.id=:news_id AND datetime(n.fetched_at)<=datetime(:as_of)"
-        + " AND (n.published_at IS NULL OR datetime(n.published_at)<=datetime(:as_of))"
+        + " WHERE n.id=:news_id AND REPLACE(n.fetched_at,'Z','+00:00')<=:as_of"
+        + " AND (n.published_at IS NULL OR REPLACE(n.published_at,'Z','+00:00')<=:as_of)"
     )
     async with db.execute(sql, {"news_id": news_id, "as_of": utc_text(as_of)}) as cursor:
         row = await cursor.fetchone()
@@ -382,13 +431,25 @@ async def query_ticker(
     digest = filter_digest("ticker", filters)
     cursor_payload = decode_cursor(cursor, kind="ticker", filter_digest=digest) if cursor else None
     conditions = [
-        "datetime(n.fetched_at)<=datetime(:as_of)",
-        "(n.published_at IS NULL OR datetime(n.published_at)<=datetime(:as_of))",
+        "REPLACE(n.fetched_at,'Z','+00:00')<=:as_of",
+        "(n.published_at IS NULL OR REPLACE(n.published_at,'Z','+00:00')<=:as_of)",
         "datetime(COALESCE(n.published_at,n.fetched_at))>=datetime(:window_start)",
-        "(EXISTS (SELECT 1 FROM news_ticker_mentions tm WHERE tm.news_id=n.id "
-        "AND tm.ticker=:ticker AND tm.validation_status IN ('canonical','valid_external')) "
-        "OR EXISTS (SELECT 1 FROM analysis_stock_impacts si WHERE si.analysis_id=r.id "
-        "AND si.ticker=:ticker AND si.validation_status IN ('canonical','valid_external')))",
+        "(EXISTS (SELECT 1 FROM news_ticker_mentions tm "
+        "JOIN ticker_validation_revisions source_validation ON source_validation.id=("
+        "SELECT latest.id FROM ticker_validation_revisions latest "
+        "WHERE latest.mention_id=tm.id AND latest.available_at<=:as_of "
+        "ORDER BY latest.available_at DESC,latest.id DESC LIMIT 1) "
+        "WHERE tm.news_id=n.id AND tm.ticker=:ticker "
+        "AND tm.association_method<>'llm_inference' "
+        "AND REPLACE(tm.created_at,'Z','+00:00')<=:as_of "
+        "AND source_validation.validation_status IN ('canonical','valid_external')) "
+        "OR EXISTS (SELECT 1 FROM analysis_stock_impacts si "
+        "JOIN ticker_validation_revisions impact_validation ON impact_validation.id=("
+        "SELECT latest.id FROM ticker_validation_revisions latest "
+        "WHERE latest.mention_id=si.mention_id AND latest.available_at<=:as_of "
+        "ORDER BY latest.available_at DESC,latest.id DESC LIMIT 1) "
+        "WHERE si.analysis_revision_id=r.id AND si.ticker=:ticker "
+        "AND impact_validation.validation_status IN ('canonical','valid_external')))",
     ]
     params: dict[str, Any] = {
         "as_of": utc_text(as_of),
@@ -399,8 +460,12 @@ async def query_ticker(
     if min_confidence:
         conditions.append(
             "(r.id IS NOT NULL AND EXISTS (SELECT 1 FROM analysis_stock_impacts si "
-            "WHERE si.analysis_id=r.id AND si.ticker=:ticker "
-            "AND si.validation_status IN ('canonical','valid_external') "
+            "JOIN ticker_validation_revisions impact_validation ON impact_validation.id=("
+            "SELECT latest.id FROM ticker_validation_revisions latest "
+            "WHERE latest.mention_id=si.mention_id AND latest.available_at<=:as_of "
+            "ORDER BY latest.available_at DESC,latest.id DESC LIMIT 1) "
+            "WHERE si.analysis_revision_id=r.id AND si.ticker=:ticker "
+            "AND impact_validation.validation_status IN ('canonical','valid_external') "
             "AND si.confidence>=:min_confidence))"
         )
         params["min_confidence"] = min_confidence

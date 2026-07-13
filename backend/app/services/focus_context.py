@@ -386,8 +386,8 @@ async def persist_focus_context(
             if not secrets.compare_digest(str(previous[1]), digest):
                 raise ValueError("focus_revision_payload_conflict")
             await db.execute(
-                "UPDATE focus_context_snapshots SET status='current',fetched_at=? WHERE revision=?",
-                (now, context.revision),
+                "UPDATE focus_context_snapshots SET status='current' WHERE revision=?",
+                (context.revision,),
             )
             await db.commit()
         else:
@@ -468,3 +468,54 @@ async def pull_focus_context(*, client: httpx.AsyncClient | None = None) -> dict
         await db.close()
         if owned and client is not None:
             await client.aclose()
+
+
+async def resume_focus_revalidation() -> dict[str, Any]:
+    """Advance one local revalidation slice without another remote request."""
+
+    db = await get_db()
+    try:
+        snapshot = await latest_focus_context(db)
+        if snapshot is None:
+            return {"status": "idle", "pending": False}
+        from app.services.market_focus import (
+            TICKER_VALIDATION_RULES_VERSION,
+            revalidate_events_for_focus_context,
+        )
+
+        regated = await revalidate_events_for_focus_context(db, snapshot["payload"])
+        async with db.execute(
+            """SELECT pending_run_key,pending_focus_revision,pending_phase,
+                      pending_mention_cursor,pending_group_cursor,
+                      last_focus_revision,validation_rules_version
+               FROM focus_validation_state WHERE singleton_id=1"""
+        ) as cursor:
+            row = await cursor.fetchone()
+        async with db.execute(
+            "SELECT COALESCE(MAX(revision),0) FROM focus_context_snapshots"
+        ) as cursor:
+            max_revision_row = await cursor.fetchone()
+        max_revision = int(max_revision_row[0] if max_revision_row else 0)
+        backlog = bool(
+            row
+            and (
+                max_revision > int(row[5] or 0)
+                or str(row[6] or "") != TICKER_VALIDATION_RULES_VERSION
+            )
+        )
+        pending = bool(row and row[0]) or backlog
+        return {
+            "status": "pending" if pending else "complete",
+            "pending": pending,
+            "focus_revision": (
+                int(row[1])
+                if row and row[1] is not None
+                else int(row[5] or 0) + 1 if backlog else None
+            ),
+            "phase": str(row[2]) if row and row[2] else "queued" if backlog else None,
+            "mention_cursor": int(row[3]) if row else 0,
+            "group_cursor": str(row[4]) if row else "",
+            "event_groups_regated": regated,
+        }
+    finally:
+        await db.close()

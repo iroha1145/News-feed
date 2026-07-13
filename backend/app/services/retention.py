@@ -3,10 +3,23 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
 from app.config import settings
+
+
+def _new_york_trading_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    except (TypeError, ValueError):
+        return None
 
 
 async def _delete(
@@ -38,6 +51,180 @@ async def _database_page_metrics(db: aiosqlite.Connection) -> dict[str, int]:
         "database_bytes": total,
         "database_free_bytes": free,
         "database_live_bytes": max(0, total - free),
+    }
+
+
+async def _cleanup_focus_snapshots(db: aiosqlite.Connection) -> dict[str, int]:
+    """Compact old focus snapshots while preserving current and cycle provenance."""
+
+    await db.create_function("new_york_trading_date", 1, _new_york_trading_date)
+
+    full_days = settings.focus_snapshot_full_resolution_days
+    retention_days = settings.focus_snapshot_retention_days
+    rollup_enabled = settings.focus_snapshot_daily_rollup_enabled
+    rollup_clause = ""
+    params: list[Any] = [f"-{retention_days} days"]
+    if rollup_enabled:
+        rollup_clause = """
+            OR (
+              datetime(ranked.as_of)>=datetime('now',?)
+              AND datetime(ranked.as_of)<datetime('now',?)
+              AND ranked.daily_rank>1
+            )
+        """
+        params.extend((f"-{retention_days} days", f"-{full_days} days"))
+    params.append(settings.retention_batch_size)
+    async with db.execute(
+        f"""WITH ranked AS (
+               SELECT s.revision,s.as_of,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY new_york_trading_date(s.as_of)
+                        ORDER BY datetime(s.as_of) DESC,s.revision DESC
+                      ) AS daily_rank
+               FROM focus_context_snapshots s
+             )
+             SELECT ranked.revision,new_york_trading_date(ranked.as_of) AS snapshot_day,
+                    CASE WHEN datetime(ranked.as_of)>=datetime('now',?) THEN 1 ELSE 0 END
+                    AS rollup_candidate
+             FROM ranked
+             WHERE (
+                 datetime(ranked.as_of)<datetime('now',?)
+                 {rollup_clause}
+             )
+               AND ranked.revision<>(
+                 SELECT MAX(latest.revision) FROM focus_context_snapshots latest
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM market_focus_cycles cycle
+                 WHERE cycle.focus_revision=ranked.revision
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM analysis_stock_impacts impact
+                 WHERE impact.focus_revision=ranked.revision
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM news_ticker_mentions mention
+                 WHERE mention.focus_revision=ranked.revision
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM ticker_validation_revisions validation
+                 WHERE validation.focus_revision=ranked.revision
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM focus_validation_state state
+                 WHERE state.last_focus_revision=ranked.revision
+                    OR state.pending_focus_revision=ranked.revision
+                    OR ranked.revision>COALESCE(state.last_focus_revision,0)
+               )
+             ORDER BY datetime(ranked.as_of),ranked.revision
+             LIMIT ?""",
+        (
+            f"-{retention_days} days",
+            *params,
+        ),
+    ) as cursor:
+        candidates = await cursor.fetchall()
+
+    deleted = 0
+    rollup_days: set[str] = set()
+    if candidates:
+        revisions = [int(row[0]) for row in candidates]
+        placeholders = ",".join("?" for _ in revisions)
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                f"""DELETE FROM focus_context_snapshots
+                    WHERE revision IN ({placeholders})
+                      AND revision<>(SELECT MAX(revision) FROM focus_context_snapshots)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM market_focus_cycles cycle
+                        WHERE cycle.focus_revision=focus_context_snapshots.revision
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM analysis_stock_impacts impact
+                        WHERE impact.focus_revision=focus_context_snapshots.revision
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM news_ticker_mentions mention
+                        WHERE mention.focus_revision=focus_context_snapshots.revision
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM ticker_validation_revisions validation
+                        WHERE validation.focus_revision=focus_context_snapshots.revision
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM focus_validation_state state
+                        WHERE state.last_focus_revision=focus_context_snapshots.revision
+                           OR state.pending_focus_revision=focus_context_snapshots.revision
+                           OR focus_context_snapshots.revision>
+                              COALESCE(state.last_focus_revision,0)
+                      )""",
+                tuple(revisions),
+            )
+            deleted = max(0, cursor.rowcount)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        if deleted:
+            # Candidates were already protected and ordered.  Count each day
+            # compacted in this batch once, rather than on every retention run.
+            rollup_days = {
+                str(row[1]) for row in candidates if int(row[2]) == 1 and row[1]
+            }
+
+    async with db.execute("SELECT COUNT(*) FROM focus_context_snapshots") as cursor:
+        retained_row = await cursor.fetchone()
+    async with db.execute(
+        """SELECT COUNT(DISTINCT focus_revision) FROM market_focus_cycles
+           WHERE focus_revision IS NOT NULL"""
+    ) as cursor:
+        protected_row = await cursor.fetchone()
+    async with db.execute(
+        """SELECT COUNT(*) FROM focus_context_snapshots snapshot
+           WHERE EXISTS (
+               SELECT 1 FROM analysis_stock_impacts impact
+               WHERE impact.focus_revision=snapshot.revision
+             ) OR EXISTS (
+               SELECT 1 FROM news_ticker_mentions mention
+               WHERE mention.focus_revision=snapshot.revision
+             ) OR EXISTS (
+               SELECT 1 FROM ticker_validation_revisions validation
+               WHERE validation.focus_revision=snapshot.revision
+             ) OR EXISTS (
+               SELECT 1 FROM focus_validation_state state
+               WHERE state.last_focus_revision=snapshot.revision
+                  OR state.pending_focus_revision=snapshot.revision
+                  OR snapshot.revision>COALESCE(state.last_focus_revision,0)
+             )"""
+    ) as cursor:
+        lineage_protected_row = await cursor.fetchone()
+    return {
+        "focus_snapshots_deleted": deleted,
+        "focus_snapshots_retained": int(retained_row[0] if retained_row else 0),
+        "focus_snapshot_rollup_created": len(rollup_days),
+        "focus_snapshots_cycle_protected": int(protected_row[0] if protected_row else 0),
+        "focus_snapshots_lineage_protected": int(
+            lineage_protected_row[0] if lineage_protected_row else 0
+        ),
+    }
+
+
+async def _passive_wal_checkpoint(db: aiosqlite.Connection) -> dict[str, int]:
+    async with db.execute("PRAGMA journal_mode") as cursor:
+        mode_row = await cursor.fetchone()
+    if not mode_row or str(mode_row[0]).lower() != "wal":
+        return {
+            "wal_checkpoint_busy": 0,
+            "wal_pages": 0,
+            "wal_checkpointed_pages": 0,
+        }
+    async with db.execute("PRAGMA wal_checkpoint(PASSIVE)") as cursor:
+        row = await cursor.fetchone()
+    return {
+        "wal_checkpoint_busy": int(row[0] if row else 0),
+        "wal_pages": int(row[1] if row else 0),
+        "wal_checkpointed_pages": int(row[2] if row else 0),
     }
 
 
@@ -121,10 +308,16 @@ async def cleanup_extended_retention(db: aiosqlite.Connection) -> dict[str, int]
         "calendar_event_revisions": 0,
         "integration_changes": 0,
         "news_items": 0,
+        "focus_snapshots_deleted": 0,
+        "focus_snapshots_retained": 0,
+        "focus_snapshot_rollup_created": 0,
+        "focus_snapshots_cycle_protected": 0,
+        "focus_snapshots_lineage_protected": 0,
     }
     before = await _database_page_metrics(db)
     stats.update({f"{key}_before": value for key, value in before.items()})
     try:
+        stats.update(await _cleanup_focus_snapshots(db))
         if settings.analysis_job_retention_days:
             stats["analysis_jobs"] = await _delete(
                 db, table="analysis_jobs", id_column="job_id",
@@ -264,12 +457,15 @@ async def cleanup_extended_retention(db: aiosqlite.Connection) -> dict[str, int]
         if violations:
             raise RuntimeError("retention_foreign_key_violation")
         await db.commit()
+        stats.update(await _passive_wal_checkpoint(db))
         after = await _database_page_metrics(db)
         stats.update({f"{key}_after": value for key, value in after.items()})
         stats["database_bytes_reclaimed"] = max(
             0,
             stats["database_live_bytes_before"] - stats["database_live_bytes_after"],
         )
+        stats["database_bytes"] = stats["database_bytes_after"]
+        stats["live_bytes"] = stats["database_live_bytes_after"]
         return stats
     except Exception:
         await db.rollback()

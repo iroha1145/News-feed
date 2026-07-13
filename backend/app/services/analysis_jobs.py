@@ -27,6 +27,11 @@ from app.services.responses_runtime import (
     build_model_input,
     validate_output,
 )
+from app.services.ticker_lineage import (
+    TRUSTED_VALIDATION_STATUSES,
+    build_validation_basis_hash,
+    record_ticker_mention,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -315,70 +320,120 @@ async def _publish_analysis_locked(
     )
     analysis_id = int(cursor.lastrowid)
 
-    from app.services.market_focus import record_ticker_mentions
+    from app.services.market_focus import (
+        _focus_payload,
+        refresh_event_groups_for_news,
+        validate_ticker_association,
+    )
 
+    focus, focus_symbols, focus_external_symbols = await _focus_payload(db)
+    focus_revision = int(focus["revision"]) if focus and focus.get("revision") else None
+    universe_version = str(focus["universe_version"]) if focus and focus.get("universe_version") else None
+    basis_hash = build_validation_basis_hash(
+        canonical_symbols=focus_symbols,
+        external_symbols=focus_external_symbols,
+        universe_version=universe_version,
+    )
+    invalid_association_count = 0
     source_tickers = _source_tickers(news.get("source_tickers"))
-    if source_tickers:
-        await record_ticker_mentions(
+    for ticker in source_tickers:
+        state = validate_ticker_association(
+            ticker,
+            association_method="provider_tag",
+            focus_symbols=focus_symbols,
+            trusted_external_symbols=focus_external_symbols,
+        )
+        if state == "invalid":
+            invalid_association_count += 1
+            continue
+        await record_ticker_mention(
             db,
             news_id=int(news["id"]),
-            tickers=source_tickers,
+            ticker=ticker,
             association_method="provider_tag",
+            association_confidence=0.95,
             source=str(news["source"]),
+            validation_status=state,
+            available_at=available_at,
+            focus_revision=focus_revision,
+            universe_version=universe_version,
+            validation_basis_hash=basis_hash,
+            reason_code="provider_association",
         )
     async with db.execute(
         """SELECT DISTINCT ticker FROM news_ticker_mentions
            WHERE news_id=? AND association_method<>'llm_inference'
-             AND validation_status IN ('canonical','valid_external')""",
+             AND current_validation_status IN ('canonical','valid_external')""",
         (news["id"],),
     ) as trusted_cursor:
         trusted_external = {str(row[0]) for row in await trusted_cursor.fetchall()}
-    # A new analysis revision replaces the current model-derived associations.
-    # Provider/company evidence remains append-only and the raw model output is
-    # still retained in analysis_revisions for audit.
-    await db.execute(
-        "DELETE FROM news_ticker_mentions WHERE news_id=? AND association_method='llm_inference'",
-        (news["id"],),
+    llm_basis_hash = build_validation_basis_hash(
+        canonical_symbols=focus_symbols,
+        external_symbols=focus_external_symbols | trusted_external,
+        universe_version=universe_version,
     )
-    model_mentions = await record_ticker_mentions(
-        db,
-        news_id=int(news["id"]),
-        tickers=[stock.ticker for stock in payload.affected_stocks],
-        association_method="llm_inference",
-        source="model_output",
-        trusted_external_symbols=trusted_external,
-    )
-    validation_by_ticker = {
-        row["ticker"]: row["validation_status"] for row in model_mentions if row["ticker"]
-    }
-    async with db.execute(
-        "SELECT revision,universe_version FROM focus_context_snapshots ORDER BY revision DESC LIMIT 1"
-    ) as focus_cursor:
-        focus_row = await focus_cursor.fetchone()
+    validation_by_ticker: dict[str, str] = {}
+    mentions_by_ticker: dict[str, int] = {}
+    for stock in payload.affected_stocks:
+        state = validate_ticker_association(
+            stock.ticker,
+            association_method="llm_inference",
+            focus_symbols=focus_symbols,
+            trusted_external_symbols=trusted_external | focus_external_symbols,
+        )
+        if state == "invalid":
+            invalid_association_count += 1
+            continue
+        mention = await record_ticker_mention(
+            db,
+            news_id=int(news["id"]),
+            ticker=stock.ticker,
+            association_method="llm_inference",
+            association_confidence=0.5,
+            source="model_output",
+            validation_status=state,
+            available_at=available_at,
+            focus_revision=focus_revision,
+            universe_version=universe_version,
+            validation_basis_hash=llm_basis_hash,
+            analysis_revision_id=analysis_id,
+            reason_code="model_association",
+        )
+        validation_by_ticker[stock.ticker] = state
+        mentions_by_ticker[stock.ticker] = int(mention["mention_id"])
+
+    if invalid_association_count:
+        await db.execute(
+            """INSERT INTO projection_safety_counters(counter_key,count,updated_at)
+               VALUES ('invalid_ticker_association',?,?)
+               ON CONFLICT(counter_key) DO UPDATE SET
+                 count=projection_safety_counters.count+excluded.count,
+                 updated_at=excluded.updated_at""",
+            (invalid_association_count, available_at),
+        )
 
     for stock in payload.affected_stocks:
         validation_status = validation_by_ticker.get(stock.ticker, "unverified")
-        if validation_status not in {"canonical", "valid_external"}:
+        mention_id = mentions_by_ticker.get(stock.ticker)
+        if validation_status == "invalid" or mention_id is None:
             continue
         await db.execute(
             """INSERT INTO analysis_stock_impacts
-               (analysis_id, news_id, ticker, company, impact_score, confidence, horizon,
+               (analysis_id,analysis_revision_id,mention_id,news_id,ticker,company,impact_score,confidence,horizon,
                 mechanism, reason, source, content_hash, published_at, fetched_at,
                 analyzed_at, available_at, model, reasoning_effort, prompt_version, schema_version,
                 validation_status,validated_at,focus_revision,universe_version,association_method)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'llm_inference')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'llm_inference')""",
             (
-                analysis_id, news["id"], stock.ticker, stock.company, stock.impact_score,
+                analysis_id, analysis_id, mention_id, news["id"], stock.ticker,
+                stock.company, stock.impact_score,
                 stock.confidence, stock.horizon.value, stock.mechanism.value, stock.reason,
                 str(news["source"]), str(news["content_hash"]), news.get("published_at"),
                 str(news["fetched_at"]), analyzed_at, available_at, model,
                 reasoning_effort, prompt_version, schema_version, validation_status, analyzed_at,
-                int(focus_row[0]) if focus_row else None,
-                str(focus_row[1]) if focus_row else None,
+                focus_revision, universe_version,
             ),
         )
-
-    from app.services.market_focus import refresh_event_groups_for_news
 
     await refresh_event_groups_for_news(db, int(news["id"]))
 
@@ -390,7 +445,7 @@ async def _publish_analysis_locked(
             "reason": stock.reason,
         }
         for stock in payload.affected_stocks
-        if validation_by_ticker.get(stock.ticker) in {"canonical", "valid_external"}
+        if validation_by_ticker.get(stock.ticker) in TRUSTED_VALIDATION_STATUSES
     ]
     legacy_commodities = [
         {"name": value.name, "impact_score": value.impact_score, "reason": value.reason}

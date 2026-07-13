@@ -6,11 +6,15 @@
 
 ## MacroLens
 
-本轮数据库迁移号为 `PRAGMA user_version=3`。程序拒绝打开高于自身支持版本的数据库，迁移完成并校验后才写入版本号。迁移失败会回滚事务并恢复外键检查。
+本轮数据库迁移号为 `PRAGMA user_version=4`。程序拒绝打开高于自身支持版本的数据库，迁移完成并校验后才写入版本号。迁移失败会回滚事务并恢复外键检查。
 
 新增 analysis_jobs、analysis_revisions、analysis_stock_impacts、calendar_analysis_jobs、calendar_snapshots、calendar_event_revisions、integration_changes、integration_nonces、analysis_worker_state 和持久来源健康。
 
 本次增量新增 `focus_context_snapshots`、`news_ticker_mentions`、`news_event_groups`、`news_event_members`、`hotspot_preparation_sets`、`hotspot_preparation_state`、`market_focus_cycles`、`market_focus_cycle_events`、`event_projection_retries`、`projection_safety_counters` 与 `market_focus_cycle_archives`。`analysis_revisions` 继续只保存逐条新闻分析版本，禁止复用、重命名或迁移为热点/周期表。
+
+v4 将股票关联身份与验证状态拆开：`news_ticker_mentions` 只保留自然键身份和当前状态缓存，`ticker_validation_revisions` 追加保存每次实际状态变化，`focus_validation_state` 保存有界重验证游标与统计。模型关联绑定产生它的 `analysis_revision_id`，新分析版本不会删除旧关联；`analysis_stock_impacts` 同时关联分析版本和 Mention。
+
+升级时按自然键合并旧 Mention：保留最早创建时间、最高置信度和最新检查状态。初始验证版本优先使用旧 `validated_at`；缺失时使用迁移时刻，绝不回填到新闻发布时间。此类记录标记为 `legacy_backfill`。迁移前没有保存下来的验证变化无法恢复，因此旧历史只能从保守基线开始；无法唯一对应分析版本的旧模型关联会保留为 `legacy association`，不会猜测归属。
 
 `analysis_stock_impacts` 增加 validation_status、validated_at、focus_revision、universe_version 和 association_method。历史股票影响按最近焦点快照与可信来源标记回填；无法确认的记录设为 unverified，不伪造 canonical。来源健康拆成抓取、新闻保存和事件投影三段状态。
 
@@ -24,9 +28,9 @@
 
 ## Option Pro
 
-新建独立 /data/catalyst-cache.db，版本 catalyst-cache-v1；不得改写 /data/optix.db 或 breakout-db-v3。
+独立 `/data/catalyst-cache.db` 本轮从 v4 升级到 v6；不得改写 `/data/optix.db` 或 `breakout-db-v3`。
 
-缓存包含同步 Run、水位、Staging、原始新闻、追加分析、股票影响、日历版本、来源健康、本地任务、刷新 Outbox、Worker 状态和单实例锁。发布使用 BEGIN IMMEDIATE、租约和 fencing token，完整分页成功后一次提交。
+缓存继续包含同步 Run、水位、Staging、原始新闻、追加分析、股票影响、日历版本、来源健康、本地任务、刷新 Outbox、Worker 状态和单实例锁。v5 新增按完成交易日与算法版本隔离的 `focus_daily_strength_snapshots`；v6 为该派生缓存补齐负载摘要、覆盖率、各算法版本、数据截至时间和租约隔离字段。v5 缓存只含可重算的派生特征，升级时会在同一事务内安全失效并按 v6 结构重建，不触碰新闻、分析或正式评分数据。失去租约的旧进程不能覆盖新缓存。焦点快照增加 30/90 天分层保留，清理采用短事务分批执行，并保护周期或任务仍在引用的版本。
 
 Option Pro 自有 AI Job 使用独立 /data/ai-jobs.db。
 

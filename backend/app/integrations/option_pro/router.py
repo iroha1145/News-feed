@@ -24,6 +24,7 @@ from app.integrations.option_pro.repository import (
     query_feed,
     query_latest,
     query_ticker,
+    stock_validations_for_analysis,
 )
 from app.models.catalysts import (
     AnalysisJobCreateRequest,
@@ -105,20 +106,11 @@ async def job_response(request: Request, db, job: dict) -> AnalysisJobResponse:
         revision = await cursor.fetchone()
     result = None
     if revision is not None:
-        async with db.execute(
-            """SELECT m.ticker,m.validation_status,m.validated_at,m.focus_revision,
-                      m.universe_version,m.association_method
-               FROM news_ticker_mentions m
-               WHERE m.news_id=? AND m.association_method='llm_inference'
-                 AND m.id=(
-                   SELECT MAX(newest.id) FROM news_ticker_mentions newest
-                   WHERE newest.news_id=m.news_id AND newest.ticker=m.ticker
-                     AND newest.association_method='llm_inference'
-                 )
-               ORDER BY m.ticker""",
-            (job["news_id"],),
-        ) as validation_cursor:
-            stock_validations = [dict(row) for row in await validation_cursor.fetchall()]
+        stock_validations = await stock_validations_for_analysis(
+            db,
+            analysis_revision_id=int(revision["id"]),
+            as_of=utc_now(),
+        )
         payload = NewsImpactAnalysis.model_validate_json(revision["payload_json"])
         result = PublicAnalysis(
             **payload.model_dump(),
