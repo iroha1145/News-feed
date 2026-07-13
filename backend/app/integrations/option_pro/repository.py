@@ -127,7 +127,28 @@ visible_jobs AS (
 
 ITEM_SELECT = """
 SELECT n.id AS news_id, n.content_hash, n.source, n.title, n.summary, n.url,
-       n.published_at, n.fetched_at, n.updated_at AS news_updated_at, n.source_tickers,
+       n.published_at, n.fetched_at, n.updated_at AS news_updated_at,
+       COALESCE((
+         SELECT json_group_array(provider.ticker)
+         FROM (
+           SELECT DISTINCT m.ticker
+           FROM news_ticker_mentions m
+           JOIN ticker_validation_revisions v ON v.id=(
+             SELECT latest.id FROM ticker_validation_revisions latest
+             WHERE latest.mention_id=m.id
+               AND REPLACE(latest.available_at,'Z','+00:00')<=:as_of
+             ORDER BY REPLACE(latest.available_at,'Z','+00:00') DESC,
+                      latest.id DESC LIMIT 1
+           )
+           WHERE m.news_id=n.id
+             AND m.association_method IN (
+               'provider_tag','company_endpoint','exact_alias','event_propagation'
+             )
+             AND REPLACE(m.created_at,'Z','+00:00')<=:as_of
+             AND v.validation_status IN ('canonical','valid_external')
+           ORDER BY m.ticker
+         ) provider
+       ),'[]') AS source_tickers,
        r.id AS revision_id, r.revision, r.payload_json, r.model AS revision_model,
        r.reasoning_effort AS revision_reasoning, r.prompt_version AS revision_prompt,
        r.schema_version AS revision_schema, r.analyzed_at, r.available_at,
@@ -509,6 +530,16 @@ async def query_latest(
 ) -> tuple[str, list[CatalystItem], datetime | None, str | None, bool, datetime | None]:
     as_of = utc_now()
     cursor_payload = _decode_cursor_payload(cursor, kind="latest") if cursor else None
+    if cursor_payload is not None:
+        # The retention decision belongs to the immutable first-page
+        # snapshot.  Wall-clock time may advance while a bounded resync walks
+        # later pages, but that must not invalidate its signed cursor.
+        try:
+            as_of = parse_utc(cursor_payload["snapshot_as_of"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise IntegrationAPIError(
+                400, "invalid_cursor", "The pagination cursor is invalid."
+            ) from exc
     if updated_after is None:
         if cursor_payload is None:
             updated_after = as_of - timedelta(days=1)
@@ -534,7 +565,6 @@ async def query_latest(
     if cursor_payload is not None and cursor_payload.get("filter") != digest:
         raise IntegrationAPIError(400, "invalid_cursor", "The pagination cursor is invalid.")
     if cursor_payload:
-        as_of = parse_utc(cursor_payload["snapshot_as_of"])
         snapshot_max = int(cursor_payload["snapshot_max"])
         last_sequence = int(cursor_payload["last_sequence"])
         snapshot_token = str(cursor_payload["snapshot_token"])
