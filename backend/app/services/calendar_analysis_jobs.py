@@ -215,7 +215,7 @@ async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
     ) as cursor:
         reserved_or_used = int((await cursor.fetchone())[0])
         if (
-            reserved_or_used + settings.openai_max_output_tokens
+            reserved_or_used + settings.calendar_max_output_tokens
             > settings.calendar_llm_daily_output_token_limit
         ):
             return "calendar_daily_output_token_limit_reached"
@@ -329,7 +329,7 @@ async def create_or_get_calendar_job(
                 model,
                 settings.openai_reasoning,
                 settings.openai_execution_mode,
-                settings.openai_max_output_tokens,
+                settings.calendar_max_output_tokens,
                 settings.calendar_analysis_prompt_version,
                 settings.calendar_analysis_schema_version,
                 events_json,
@@ -710,7 +710,7 @@ async def process_claimed_calendar_job(
         "model": str(job["model"]),
         "reasoning_effort": str(job["reasoning_effort"]),
         "max_output_tokens": int(
-            job.get("max_output_tokens") or settings.openai_max_output_tokens
+            job.get("max_output_tokens") or settings.calendar_max_output_tokens
         ),
         "output_format": output_format,
         "instructions": CALENDAR_ANALYSIS_INSTRUCTIONS,

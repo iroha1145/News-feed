@@ -61,7 +61,9 @@ class Settings(BaseSettings):
     openai_background_poll_timeout_seconds: int = Field(default=1800, ge=30, le=3600)
     openai_background_initial_poll_seconds: int = Field(default=2, ge=1, le=60)
     openai_background_max_poll_seconds: int = Field(default=15, ge=1, le=120)
-    openai_max_output_tokens: int = Field(default=16384, ge=256, le=32768)
+    # Provider-wide safety ceiling. Individual task types use their own lower
+    # limits so a news item and a market-focus cycle never share one budget.
+    openai_max_output_tokens: int = Field(default=128000, ge=256, le=128000)
     openai_max_concurrency: int = Field(default=2, ge=1, le=16)
     # Background submission retries are owned by the durable job state machine.
     # SDK-level retries could create an unlinked duplicate paid response.
@@ -70,16 +72,50 @@ class Settings(BaseSettings):
     news_impact_schema_version: str = Field(default="news-impact-schema-v2", min_length=1, max_length=100)
 
     # Persistent analysis queue and cost gates.
-    news_llm_auto_analyze_enabled: bool = True
+    news_llm_auto_analyze_enabled: bool = False
+    news_item_max_output_tokens: int = Field(default=32768, ge=256, le=128000)
     news_llm_max_inflight: int = Field(default=2, ge=1, le=16)
     news_llm_max_queued: int = Field(default=200, ge=1, le=10_000)
     news_llm_daily_job_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     news_llm_daily_output_token_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000_000)
+    news_llm_manual_daily_job_limit: int = Field(default=50, ge=1, le=1_000_000)
+    news_llm_manual_daily_output_token_limit: int = Field(default=1_638_400, ge=1, le=1_000_000_000)
     news_llm_min_context_chars: int = Field(default=100, ge=1, le=10_000)
     news_llm_min_market_relevance: int = Field(default=35, ge=0, le=100)
     analysis_worker_poll_seconds: int = Field(default=5, ge=1, le=300)
     analysis_worker_lease_seconds: int = Field(default=120, ge=30, le=1800)
     analysis_job_retry_cooldown_seconds: int = Field(default=300, ge=1, le=86400)
+
+    # Pull-only focus context from option-pro. Empty credentials keep the
+    # capability disabled while preserving the last local snapshot.
+    option_pro_focus_base_url: str = ""
+    option_pro_focus_key_id: str = Field(default="", max_length=128)
+    option_pro_focus_secret: str = Field(default="", max_length=4096)
+    option_pro_focus_verify_tls: bool = True
+    option_pro_focus_ca_bundle: str = ""
+    option_pro_focus_interval_seconds: int = Field(default=1800, ge=60, le=86400)
+    option_pro_focus_timeout_seconds: int = Field(default=20, ge=1, le=120)
+
+    # Deterministic hotspot preparation and bounded market-focus cycles.
+    hotspot_direct_threshold: float = Field(default=75.0, ge=0, le=100)
+    hotspot_conditional_threshold: float = Field(default=60.0, ge=0, le=100)
+    hotspot_gate_version: str = Field(default="hotspot-bootstrap-v1", min_length=1, max_length=100)
+    hotspot_market_data_quality_min: float = Field(default=0.6, ge=0, le=1)
+    hot_cycle_enabled: bool = False
+    hot_cycle_schedule_enabled: bool = False
+    hot_cycle_times_et: str = "08:00,12:00,16:00"
+    hot_cycle_optional_20_et: bool = False
+    hot_cycle_manual_enabled: bool = True
+    hot_cycle_manual_cooldown_seconds: int = Field(default=900, ge=0, le=86400)
+    hot_cycle_max_events: int = Field(default=8, ge=1, le=20)
+    hot_cycle_max_focus_symbols: int = Field(default=20, ge=1, le=40)
+    hot_cycle_model: str = Field(default="gpt-5.6-terra", min_length=1, max_length=200)
+    hot_cycle_reasoning: Literal["none", "low", "medium", "high", "xhigh", "max"] = "max"
+    hot_cycle_max_output_tokens: int = Field(default=49152, ge=256, le=128000)
+    hot_cycle_daily_job_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000)
+    hot_cycle_daily_output_token_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000_000)
+    hot_cycle_prompt_version: str = Field(default="market-focus-v1", min_length=1, max_length=100)
+    hot_cycle_schema_version: str = Field(default="market-focus-schema-v1", min_length=1, max_length=100)
 
     # Option Pro Integration API. Empty keys keep the remote surface disabled
     # while the ordinary MacroLens application remains fully operational.
@@ -108,8 +144,12 @@ class Settings(BaseSettings):
     # News-source scheduling. Paid quota-limited aggregators stay opt-in.
     finnhub_news_enabled: bool = True
     finnhub_news_interval: int = Field(default=300, ge=30)
+    finnhub_focus_interval: int = Field(default=1800, ge=1800, le=3600)
     massive_news_enabled: bool = True
-    massive_news_interval: int = Field(default=300, ge=30)
+    massive_news_interval: int = Field(default=3600, ge=30)
+    massive_focus_interval: int = Field(default=2700, ge=1800, le=3600)
+    massive_focus_request_limit: int = Field(default=10, ge=1, le=40)
+    finnhub_focus_request_limit: int = Field(default=20, ge=1, le=40)
     google_news_enabled: bool = True
     google_news_interval: int = Field(default=900, ge=30)
     seekingalpha_breaking_enabled: bool = True
@@ -131,6 +171,7 @@ class Settings(BaseSettings):
     )
     calendar_llm_max_inflight: int = Field(default=1, ge=1, le=16)
     calendar_llm_max_queued: int = Field(default=10, ge=1, le=10_000)
+    calendar_max_output_tokens: int = Field(default=16384, ge=256, le=128000)
     calendar_llm_daily_job_limit: int = Field(default=10, ge=1, le=1_000_000)
     calendar_llm_daily_output_token_limit: int = Field(
         default=200_000, ge=1, le=1_000_000_000
@@ -140,6 +181,15 @@ class Settings(BaseSettings):
     analysis_retention_limit: int = Field(default=350, ge=1, le=100000)
     news_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
     x_sentiment_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    news_item_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    analysis_job_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    analysis_revision_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    stock_impact_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    event_group_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    analysis_cycle_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    calendar_revision_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    integration_change_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    retention_batch_size: int = Field(default=500, ge=1, le=10000)
 
     @field_validator(
         "default_llm_model",
@@ -147,6 +197,10 @@ class Settings(BaseSettings):
         "news_impact_schema_version",
         "calendar_analysis_prompt_version",
         "calendar_analysis_schema_version",
+        "hotspot_gate_version",
+        "hot_cycle_model",
+        "hot_cycle_prompt_version",
+        "hot_cycle_schema_version",
     )
     @classmethod
     def validate_bounded_identifier(cls, value: str) -> str:
@@ -155,7 +209,7 @@ class Settings(BaseSettings):
             raise ValueError("must be a bounded model or version identifier")
         return value
 
-    @field_validator("option_pro_read_key_id", "option_pro_action_key_id")
+    @field_validator("option_pro_read_key_id", "option_pro_action_key_id", "option_pro_focus_key_id")
     @classmethod
     def validate_key_id(cls, value: str) -> str:
         value = value.strip()
@@ -182,6 +236,7 @@ class Settings(BaseSettings):
         "option_pro_action_secret",
         "option_pro_previous_read_secret",
         "option_pro_previous_action_secret",
+        "option_pro_focus_secret",
     )
     @classmethod
     def validate_integration_secret(cls, value: str) -> str:
@@ -192,6 +247,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_sensitive_endpoints_and_credentials(self):
+        if any(
+            value > self.openai_max_output_tokens
+            for value in (
+                self.news_item_max_output_tokens,
+                self.hot_cycle_max_output_tokens,
+                self.calendar_max_output_tokens,
+            )
+        ):
+            raise ValueError("task output-token limits must not exceed OPENAI_MAX_OUTPUT_TOKENS")
         parsed = urlparse(self.openai_base_url.strip())
         if (
             not parsed.hostname
@@ -239,7 +303,37 @@ class Settings(BaseSettings):
             raise ValueError("Option Pro keys require a non-empty OPTION_PRO_ALLOWED_CIDRS allow-list")
         if self.option_pro_nonce_ttl_seconds < self.option_pro_signature_clock_skew_seconds:
             raise ValueError("nonce TTL must be at least the signature clock-skew window")
+        if bool(self.option_pro_focus_key_id) != bool(self.option_pro_focus_secret):
+            raise ValueError("Option Pro focus key id and secret must be configured together")
+        focus_url = self.option_pro_focus_base_url.strip()
+        if focus_url:
+            focus = urlparse(focus_url)
+            if (
+                focus.scheme != "https"
+                or not focus.hostname
+                or focus.username
+                or focus.password
+                or focus.query
+                or focus.fragment
+            ):
+                raise ValueError("OPTION_PRO_FOCUS_BASE_URL must be an HTTPS origin without credentials, query, or fragment")
         return self
+
+    @property
+    def automatic_news_analysis_capability(self) -> str:
+        if not self.news_llm_auto_analyze_enabled:
+            return "disabled"
+        if self.news_llm_daily_job_limit is None or self.news_llm_daily_output_token_limit is None:
+            return "budget_configuration_required"
+        return "enabled"
+
+    @property
+    def automatic_hot_cycle_capability(self) -> str:
+        if not self.hot_cycle_enabled:
+            return "disabled"
+        if self.hot_cycle_daily_job_limit is None or self.hot_cycle_daily_output_token_limit is None:
+            return "budget_configuration_required"
+        return "enabled"
 
     def validate_config(self) -> list[str]:
         """Check for common config mistakes. Returns list of warnings."""

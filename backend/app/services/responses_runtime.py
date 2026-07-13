@@ -36,7 +36,11 @@ class ResponseResult:
     error_code: str | None = None
     usage_input_tokens: int = 0
     usage_cached_input_tokens: int = 0
+    usage_cache_write_tokens: int = 0
+    usage_reasoning_tokens: int = 0
     usage_output_tokens: int = 0
+    usage_total_tokens: int = 0
+    latency_ms: int | None = None
     model: str | None = None
     reasoning_effort: str | None = None
 
@@ -53,6 +57,7 @@ class ResponsesProvider(Protocol):
         max_output_tokens: int | None = None,
         output_format: dict[str, Any] | None = None,
         instructions: str | None = None,
+        prompt_cache_key: str | None = None,
     ) -> ResponseResult: ...
 
     async def retrieve(self, response_id: str) -> ResponseResult: ...
@@ -68,6 +73,7 @@ class ResponsesProvider(Protocol):
         max_output_tokens: int | None = None,
         output_format: dict[str, Any] | None = None,
         instructions: str | None = None,
+        prompt_cache_key: str | None = None,
     ) -> ResponseResult: ...
 
 
@@ -132,21 +138,32 @@ def validate_output(output_text: str) -> NewsImpactAnalysis:
     return NewsImpactAnalysis.model_validate_json(output_text)
 
 
-def _usage(result: Any) -> tuple[int, int, int]:
+def _usage(result: Any) -> tuple[int, int, int, int, int, int]:
     usage = getattr(result, "usage", None)
     if usage is None:
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
     input_tokens = max(0, int(getattr(usage, "input_tokens", 0) or 0))
     output_tokens = max(0, int(getattr(usage, "output_tokens", 0) or 0))
     details = getattr(usage, "input_tokens_details", None)
     cached = max(0, int(getattr(details, "cached_tokens", 0) or 0)) if details else 0
-    return input_tokens, cached, output_tokens
+    cache_write = max(0, int(getattr(details, "cache_write_tokens", 0) or 0)) if details else 0
+    output_details = getattr(usage, "output_tokens_details", None)
+    reasoning = max(0, int(getattr(output_details, "reasoning_tokens", 0) or 0)) if output_details else 0
+    total = max(0, int(getattr(usage, "total_tokens", 0) or 0))
+    if total == 0:
+        total = input_tokens + output_tokens
+    return input_tokens, cached, cache_write, output_tokens, reasoning, total
 
 
 def _normalize_response(result: Any) -> ResponseResult:
-    input_tokens, cached_tokens, output_tokens = _usage(result)
+    input_tokens, cached_tokens, cache_write_tokens, output_tokens, reasoning_tokens, total_tokens = _usage(result)
     error = getattr(result, "error", None)
     error_code = getattr(error, "code", None) if error is not None else None
+    if error_code is None:
+        incomplete = getattr(result, "incomplete_details", None)
+        incomplete_reason = getattr(incomplete, "reason", None) if incomplete is not None else None
+        if incomplete_reason:
+            error_code = str(incomplete_reason)
     reasoning = getattr(result, "reasoning", None)
     reasoning_effort = getattr(reasoning, "effort", None) if reasoning is not None else None
     return ResponseResult(
@@ -156,7 +173,10 @@ def _normalize_response(result: Any) -> ResponseResult:
         error_code=str(error_code)[:100] if error_code else None,
         usage_input_tokens=input_tokens,
         usage_cached_input_tokens=cached_tokens,
+        usage_cache_write_tokens=cache_write_tokens,
+        usage_reasoning_tokens=reasoning_tokens,
         usage_output_tokens=output_tokens,
+        usage_total_tokens=total_tokens,
         model=str(getattr(result, "model", "") or "") or None,
         reasoning_effort=str(reasoning_effort or "") or None,
     )
@@ -221,8 +241,9 @@ class OpenAIResponsesProvider:
         max_output_tokens: int | None = None,
         output_format: dict[str, Any] | None = None,
         instructions: str | None = None,
+        prompt_cache_key: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        request = {
             "model": model or settings.default_llm_model,
             "reasoning": {"effort": reasoning_effort or settings.openai_reasoning},
             "instructions": instructions or UNTRUSTED_NEWS_SYSTEM_PROMPT,
@@ -230,6 +251,9 @@ class OpenAIResponsesProvider:
             "max_output_tokens": max_output_tokens or settings.openai_max_output_tokens,
             "text": {"format": output_format or structured_output_format()},
         }
+        if prompt_cache_key:
+            request["prompt_cache_key"] = prompt_cache_key
+        return request
 
     def _responses(self):
         capabilities = self.capabilities()
@@ -246,6 +270,7 @@ class OpenAIResponsesProvider:
         max_output_tokens: int | None = None,
         output_format: dict[str, Any] | None = None,
         instructions: str | None = None,
+        prompt_cache_key: str | None = None,
     ) -> ResponseResult:
         result = await self._responses().create(
             **self._common_request(
@@ -255,6 +280,7 @@ class OpenAIResponsesProvider:
                 max_output_tokens=max_output_tokens,
                 output_format=output_format,
                 instructions=instructions,
+                prompt_cache_key=prompt_cache_key,
             ),
             background=True,
             store=True,
@@ -276,6 +302,7 @@ class OpenAIResponsesProvider:
         max_output_tokens: int | None = None,
         output_format: dict[str, Any] | None = None,
         instructions: str | None = None,
+        prompt_cache_key: str | None = None,
     ) -> ResponseResult:
         result = await self._responses().create(
             **self._common_request(
@@ -285,6 +312,7 @@ class OpenAIResponsesProvider:
                 max_output_tokens=max_output_tokens,
                 output_format=output_format,
                 instructions=instructions,
+                prompt_cache_key=prompt_cache_key,
             ),
             background=False,
             store=False,

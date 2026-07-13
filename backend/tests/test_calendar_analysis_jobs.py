@@ -145,7 +145,7 @@ def test_calendar_worker_uses_mocked_responses_and_persists_result(
     isolated_calendar_db, monkeypatch
 ):
     monkeypatch.setattr(settings, "openai_execution_mode", "background")
-    monkeypatch.setattr(settings, "openai_max_output_tokens", 1024)
+    monkeypatch.setattr(settings, "calendar_max_output_tokens", 1024)
     event = calendar_event()
     completed = ResponseResult(
         response_id="resp_calendar",
@@ -175,7 +175,7 @@ def test_calendar_worker_uses_mocked_responses_and_persists_result(
             await db.close()
 
         monkeypatch.setattr(settings, "openai_execution_mode", "worker_sync")
-        monkeypatch.setattr(settings, "openai_max_output_tokens", 32768)
+        monkeypatch.setattr(settings, "calendar_max_output_tokens", 16384)
 
         assert await run_calendar_worker_once(
             provider=provider,
@@ -410,7 +410,7 @@ def test_calendar_output_budget_reserves_active_jobs_and_releases_unused_capacit
     isolated_calendar_db, monkeypatch
 ):
     monkeypatch.setattr(settings, "calendar_llm_daily_job_limit", 10)
-    monkeypatch.setattr(settings, "openai_max_output_tokens", 1024)
+    monkeypatch.setattr(settings, "calendar_max_output_tokens", 1024)
     monkeypatch.setattr(settings, "calendar_llm_daily_output_token_limit", 1124)
 
     async def scenario():

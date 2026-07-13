@@ -12,6 +12,7 @@ from app.models.database import init_db
 from app.services.analysis_jobs import run_worker_once
 from app.services.calendar_analysis_jobs import run_calendar_worker_once
 from app.services.responses_runtime import OpenAIResponsesProvider
+from app.services.market_focus import run_market_focus_worker_once
 from app.utils.http import configure_safe_network_logging
 
 logging.basicConfig(
@@ -44,7 +45,11 @@ async def run() -> None:
                 provider=provider,
                 worker_id=worker_id,
             )
-            if worked_news or worked_calendar:
+            worked_market_focus = await run_market_focus_worker_once(
+                provider=provider,
+                worker_id=worker_id,
+            )
+            if worked_news or worked_calendar or worked_market_focus:
                 continue
             try:
                 await asyncio.wait_for(stop.wait(), timeout=settings.analysis_worker_poll_seconds)

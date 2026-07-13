@@ -5,12 +5,14 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import socket
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 from pydantic import ValidationError
@@ -30,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_JOB_STATUSES = {"pending", "queued", "in_progress"}
 TERMINAL_JOB_STATUSES = {
-    "completed", "failed", "cancelled", "insufficient_context", "budget_blocked"
+    "completed", "failed", "cancelled", "insufficient_context", "budget_blocked",
+    "incomplete_output",
 }
 LOW_CONTEXT_MODEL = "low-context-neutral-v2"
 MARKET_TERMS = {
@@ -95,10 +98,20 @@ def has_sufficient_context(news: dict[str, Any]) -> bool:
 
 
 def deterministic_market_relevance(news: dict[str, Any]) -> int:
-    if _source_tickers(news.get("source_tickers")):
-        return 100
     title = " ".join(str(news.get("title") or "").lower().split())
     summary = " ".join(str(news.get("summary") or "").lower().split())
+    tickers = _source_tickers(news.get("source_tickers"))
+    if tickers:
+        source = str(news.get("source") or "").lower()
+        native_source = any(name in source for name in ("finnhub", "massive", "seekingalpha"))
+        alias_match = any(re.search(rf"(?<![A-Za-z]){re.escape(ticker.lower())}(?![A-Za-z])", title) for ticker in tickers)
+        if native_source and alias_match:
+            return 85
+        if native_source:
+            return 70
+        if alias_match:
+            return 65
+        return 45
     if any(term in title for term in MARKET_TERMS):
         return 70
     if any(term in summary for term in MARKET_TERMS):
@@ -129,6 +142,7 @@ def execution_input_hash(
     schema_version: str,
     execution_number: int,
     retry_of_job_id: str | None,
+    request_origin: Literal["manual", "automatic"],
 ) -> str:
     """Build a durable execution key while retaining the source digest separately.
 
@@ -148,6 +162,7 @@ def execution_input_hash(
             schema_version,
             str(execution_number),
             retry_of_job_id or "initial",
+            request_origin,
         )
     ).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -185,7 +200,12 @@ async def _fetch_job(db: aiosqlite.Connection, job_id: str) -> dict[str, Any] | 
     return dict(row) if row else None
 
 
-async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
+async def _budget_error(
+    db: aiosqlite.Connection,
+    now: datetime,
+    *,
+    request_origin: Literal["manual", "automatic"],
+) -> str | None:
     async with db.execute(
         "SELECT COUNT(*) FROM analysis_jobs WHERE status IN ('pending','queued','in_progress')"
     ) as cursor:
@@ -194,16 +214,27 @@ async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
         return "queue_capacity_reached"
 
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    if settings.news_llm_daily_job_limit is not None:
+    job_limit = (
+        settings.news_llm_daily_job_limit
+        if request_origin == "automatic"
+        else settings.news_llm_manual_daily_job_limit
+    )
+    output_limit = (
+        settings.news_llm_daily_output_token_limit
+        if request_origin == "automatic"
+        else settings.news_llm_manual_daily_output_token_limit
+    )
+    if job_limit is not None:
         async with db.execute(
             """SELECT COUNT(*) FROM analysis_jobs
                WHERE provider='openai' AND created_at >= ?
+                 AND request_origin=?
                  AND status NOT IN ('insufficient_context','budget_blocked')""",
-            (day_start,),
+            (day_start, request_origin),
         ) as cursor:
-            if int((await cursor.fetchone())[0]) >= settings.news_llm_daily_job_limit:
+            if int((await cursor.fetchone())[0]) >= job_limit:
                 return "daily_job_limit_reached"
-    if settings.news_llm_daily_output_token_limit is not None:
+    if output_limit is not None:
         async with db.execute(
             """SELECT COALESCE(SUM(
                    CASE
@@ -217,13 +248,13 @@ async def _budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
                    END
                  ),0)
                FROM analysis_jobs
-               WHERE provider='openai' AND created_at >= ?""",
-            (day_start,),
+               WHERE provider='openai' AND created_at >= ? AND request_origin=?""",
+            (day_start, request_origin),
         ) as cursor:
             reserved_or_used = int((await cursor.fetchone())[0])
             if (
-                reserved_or_used + settings.openai_max_output_tokens
-                > settings.news_llm_daily_output_token_limit
+                reserved_or_used + settings.news_item_max_output_tokens
+                > output_limit
             ):
                 return "daily_output_token_limit_reached"
     return None
@@ -242,7 +273,11 @@ async def _publish_analysis_locked(
     schema_version: str,
     usage_input_tokens: int = 0,
     usage_cached_input_tokens: int = 0,
+    usage_cache_write_tokens: int = 0,
+    usage_reasoning_tokens: int = 0,
     usage_output_tokens: int = 0,
+    usage_total_tokens: int = 0,
+    latency_ms: int | None = None,
     terminal_status: str = "completed",
 ) -> int:
     now = utc_now()
@@ -336,11 +371,13 @@ async def _publish_analysis_locked(
         """UPDATE analysis_jobs
            SET status=?, completed_at=?, updated_at=?, error_code=NULL,
                usage_input_tokens=?, usage_cached_input_tokens=?, usage_output_tokens=?,
+               usage_cache_write_tokens=?,usage_reasoning_tokens=?,usage_total_tokens=?,latency_ms=?,
                next_attempt_at=NULL, lease_owner=NULL, lease_expires_at=NULL
            WHERE job_id=?""",
         (
             terminal_status, analyzed_at, analyzed_at, usage_input_tokens,
-            usage_cached_input_tokens, usage_output_tokens, job["job_id"],
+            usage_cached_input_tokens, usage_output_tokens, usage_cache_write_tokens,
+            usage_reasoning_tokens, usage_total_tokens, latency_ms, job["job_id"],
         ),
     )
     return analysis_id
@@ -354,6 +391,7 @@ async def create_or_get_job(
     priority: int = 100,
     expected_content_hash: str | None = None,
     expected_change_sequence: int | None = None,
+    request_origin: Literal["manual", "automatic"] = "manual",
 ) -> CreateJobResult:
     now = utc_now()
     await db.execute("BEGIN IMMEDIATE")
@@ -391,11 +429,12 @@ async def create_or_get_job(
             """SELECT * FROM analysis_jobs
                WHERE news_id=? AND COALESCE(source_input_hash,input_hash)=?
                  AND provider=? AND model=? AND reasoning_effort=?
+                 AND request_origin=?
                  AND prompt_version=? AND schema_version=?
                ORDER BY execution_number DESC, datetime(created_at) DESC, job_id DESC
                LIMIT 1""",
             (
-                news_id, digest, selected_provider, selected_model, selected_reasoning,
+                news_id, digest, selected_provider, selected_model, selected_reasoning, request_origin,
                 settings.news_impact_prompt_version,
                 settings.news_impact_schema_version,
             ),
@@ -427,7 +466,7 @@ async def create_or_get_job(
             execution_number = max(1, int(existing.get("execution_number") or 1)) + 1
 
         budget_error = (
-            await _budget_error(db, now)
+            await _budget_error(db, now, request_origin=request_origin)
             if sufficient and provider_supported
             else None
         )
@@ -454,21 +493,22 @@ async def create_or_get_job(
             schema_version=settings.news_impact_schema_version,
             execution_number=execution_number,
             retry_of_job_id=retry_of_job_id,
+            request_origin=request_origin,
         )
         await db.execute(
             """INSERT INTO analysis_jobs
                (job_id, news_id, input_hash, source_input_hash, content_hash,
                 change_sequence, retry_of_job_id, execution_number, status, priority, provider, model,
-                reasoning_effort, execution_mode, max_output_tokens,
+                reasoning_effort, execution_mode, max_output_tokens,request_origin,
                 prompt_version, schema_version, next_attempt_at,
                 error_code, completed_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job_id, news_id, durable_input_hash, digest, str(news["content_hash"]),
                 current_change_sequence, retry_of_job_id, execution_number, status,
                 max(-1000, min(1000, priority)), selected_provider, selected_model,
                 selected_reasoning, settings.openai_execution_mode,
-                settings.openai_max_output_tokens, settings.news_impact_prompt_version,
+                settings.news_item_max_output_tokens, request_origin, settings.news_impact_prompt_version,
                 settings.news_impact_schema_version, utc_text(now) if status == "pending" else None,
                 job_error, utc_text(now) if status == "failed" else None,
                 utc_text(now), utc_text(now),
@@ -666,7 +706,10 @@ async def _fail_claimed(
         "status='failed', error_code=?, next_attempt_at=?, completed_at=COALESCE(completed_at,?), updated_at=?,"
         "usage_input_tokens=MAX(usage_input_tokens,?),"
         "usage_cached_input_tokens=MAX(usage_cached_input_tokens,?),"
+        "usage_cache_write_tokens=MAX(usage_cache_write_tokens,?),"
+        "usage_reasoning_tokens=MAX(usage_reasoning_tokens,?),"
         "usage_output_tokens=MAX(usage_output_tokens,?),"
+        "usage_total_tokens=MAX(usage_total_tokens,?),latency_ms=COALESCE(?,latency_ms),"
         "lease_owner=NULL, lease_expires_at=NULL",
         (
             error_code[:100],
@@ -675,7 +718,11 @@ async def _fail_claimed(
             utc_text(now),
             usage_input,
             usage_cached,
+            result.usage_cache_write_tokens if result else 0,
+            result.usage_reasoning_tokens if result else 0,
             usage_output,
+            result.usage_total_tokens if result else 0,
+            result.latency_ms if result else None,
         ),
     )
     if updated:
@@ -864,6 +911,32 @@ async def _handle_provider_result(
             (utc_text(now), utc_text(now)),
         )
         return
+    if status == "incomplete" or result.error_code in {"max_output_tokens", "incomplete_max_output_tokens"}:
+        updated = await _update_claimed(
+            db,
+            job,
+            "status='incomplete_output',error_code='incomplete_output',next_attempt_at=NULL,"
+            "completed_at=?,updated_at=?,usage_input_tokens=MAX(usage_input_tokens,?),"
+            "usage_cached_input_tokens=MAX(usage_cached_input_tokens,?),"
+            "usage_cache_write_tokens=MAX(usage_cache_write_tokens,?),"
+            "usage_reasoning_tokens=MAX(usage_reasoning_tokens,?),"
+            "usage_output_tokens=MAX(usage_output_tokens,?),"
+            "usage_total_tokens=MAX(usage_total_tokens,?),latency_ms=COALESCE(?,latency_ms),"
+            "lease_owner=NULL,lease_expires_at=NULL",
+            (
+                utc_text(now), utc_text(now), result.usage_input_tokens,
+                result.usage_cached_input_tokens, result.usage_cache_write_tokens,
+                result.usage_reasoning_tokens, result.usage_output_tokens,
+                result.usage_total_tokens, result.latency_ms,
+            ),
+        )
+        if updated:
+            await db.execute(
+                "UPDATE news_items SET analysis_status='failed',analysis_error='incomplete_output',updated_at=? WHERE id=?",
+                (utc_text(now), job["news_id"]),
+            )
+            await db.commit()
+        return
     if status != "completed":
         await _fail_claimed(db, job, result.error_code or "provider_response_failed", result)
         return
@@ -895,7 +968,11 @@ async def _handle_provider_result(
             schema_version=current["schema_version"],
             usage_input_tokens=result.usage_input_tokens,
             usage_cached_input_tokens=result.usage_cached_input_tokens,
+            usage_cache_write_tokens=result.usage_cache_write_tokens,
+            usage_reasoning_tokens=result.usage_reasoning_tokens,
             usage_output_tokens=result.usage_output_tokens,
+            usage_total_tokens=result.usage_total_tokens,
+            latency_ms=result.latency_ms,
         )
         await db.commit()
     except Exception:
@@ -992,12 +1069,15 @@ async def process_claimed_job(
                 "status='in_progress', submitted_at=COALESCE(submitted_at,?), attempt_count=attempt_count+1, updated_at=?",
                 (utc_text(), utc_text()),
             )
+            request_started = time.monotonic()
             result = await provider.create_sync(
                 model_input,
                 model=str(job["model"]),
                 reasoning_effort=str(job["reasoning_effort"]),
                 max_output_tokens=max_output_tokens,
             )
+            if result.latency_ms is None:
+                result = replace(result, latency_ms=round((time.monotonic() - request_started) * 1000))
         except Exception:
             await _fail_claimed(db, job, "worker_sync_request_failed")
             return
@@ -1017,12 +1097,15 @@ async def process_claimed_job(
     if not marked:
         return
     try:
+        request_started = time.monotonic()
         result = await provider.create_background(
             model_input,
             model=str(job["model"]),
             reasoning_effort=str(job["reasoning_effort"]),
             max_output_tokens=max_output_tokens,
         )
+        if result.latency_ms is None:
+            result = replace(result, latency_ms=round((time.monotonic() - request_started) * 1000))
     except Exception:
         await _fail_claimed(db, job, "submission_outcome_unknown")
         return
@@ -1191,7 +1274,10 @@ async def request_cancel(db: aiosqlite.Connection, job_id: str) -> dict[str, Any
 
 
 async def enqueue_auto_jobs(limit: int | None = None) -> int:
-    if not settings.news_llm_auto_analyze_enabled:
+    # Automatic paid work is fail-closed. Both daily limits must be explicit;
+    # absent limits never mean unlimited. Manual analysis has a separate entry
+    # path and remains governed by the ordinary queue budget checks.
+    if settings.automatic_news_analysis_capability != "enabled":
         return 0
     db = await get_db()
     try:
@@ -1223,7 +1309,9 @@ async def enqueue_auto_jobs(limit: int | None = None) -> int:
                 )
                 await db.commit()
                 continue
-            result = await create_or_get_job(db, news_id, priority=50 if has_ticker else 0)
+            result = await create_or_get_job(
+                db, news_id, priority=50 if has_ticker else 0, request_origin="automatic"
+            )
             if result.created:
                 count += 1
         return count
