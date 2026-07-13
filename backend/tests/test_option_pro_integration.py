@@ -2290,7 +2290,7 @@ def test_hmac_scope_rotation_replay_and_expired_timestamp(isolated_integration_d
         assert "openai_response_id" not in response.text
 
         replay = client.get(target, headers=headers)
-        assert replay.status_code == 401
+        assert replay.status_code == 409
         assert replay.json()["code"] == "nonce_replayed"
 
         rotated = _signed_headers("GET", target, b"", "read-key", "read-previous-secret", "nonce-previous-0002")
@@ -2322,7 +2322,9 @@ def test_hmac_scope_rotation_replay_and_expired_timestamp(isolated_integration_d
         assert client.get(target, headers=bad_signature).status_code == 401
 
         bad_hash = _signed_headers("POST", job_target, body, "action-key", "action-current-secret", "nonce-bad-hash-0007")
-        assert client.post(job_target, content=b"{}", headers=bad_hash).json()["code"] == "body_hash_mismatch"
+        bad_hash_response = client.post(job_target, content=b"{}", headers=bad_hash)
+        assert bad_hash_response.status_code == 401
+        assert bad_hash_response.json()["code"] == "body_hash_mismatch"
 
 
 def test_canonical_query_preserves_repeated_empty_values_and_rfc3986_spaces():
