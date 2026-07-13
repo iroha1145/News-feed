@@ -27,6 +27,7 @@ from app.services.responses_runtime import (
     structured_output_format,
 )
 from app.utils.dedup import normalize_title, normalize_url, similar_titles
+from app.utils.tickers import normalize_ticker
 
 
 AMBIGUOUS_TICKERS = {"AI", "ON", "IT", "CAT", "ALL", "ARE", "NOW", "SO", "A", "C"}
@@ -122,13 +123,6 @@ def _json_list(value: Any) -> list[Any]:
         except (TypeError, json.JSONDecodeError):
             return []
     return value if isinstance(value, list) else []
-
-
-def normalize_ticker(value: Any) -> str:
-    ticker = str(value or "").strip().upper().lstrip("$")
-    if not re.fullmatch(r"[A-Z0-9][A-Z0-9.^/_-]{0,19}", ticker):
-        return ""
-    return ticker
 
 
 def validate_ticker_association(

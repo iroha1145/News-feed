@@ -22,6 +22,7 @@ from app.models.catalysts import (
     PublicAnalysis,
 )
 from app.services.analysis_jobs import parse_utc, utc_now, utc_text
+from app.utils.tickers import normalize_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +219,7 @@ def _item_from_row(row: aiosqlite.Row | dict[str, Any]) -> CatalystItem | None:
 
     tickers: list[str] = []
     for value in _json_list(record.get("source_tickers")):
-        ticker = str(value or "").strip().upper().lstrip("$")[:20]
+        ticker = normalize_ticker(value)
         if ticker and ticker not in tickers:
             tickers.append(ticker)
 
