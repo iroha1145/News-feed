@@ -341,7 +341,7 @@ async def latest(
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     _: IntegrationPrincipal = Depends(require_read),
 ):
-    cutoff = bounded_as_of(updated_after or (utc_now() - timedelta(days=1)))
+    cutoff = bounded_as_of(updated_after) if updated_after is not None else None
     db = await get_db()
     try:
         snapshot, items, next_updated_after, next_cursor, has_more, data_through = await query_latest(

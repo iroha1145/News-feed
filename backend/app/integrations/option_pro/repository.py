@@ -68,7 +68,7 @@ def encode_cursor(payload: dict[str, Any]) -> str:
     return f"{encoded}.{signature}"
 
 
-def decode_cursor(cursor: str, *, kind: str, filter_digest: str) -> dict[str, Any]:
+def _decode_cursor_payload(cursor: str, *, kind: str) -> dict[str, Any]:
     try:
         encoded, signature = cursor.split(".", 1)
         if len(encoded) > 4096 or len(signature) != 64:
@@ -85,11 +85,18 @@ def decode_cursor(cursor: str, *, kind: str, filter_digest: str) -> dict[str, An
         payload = json.loads(raw)
         if not isinstance(payload, dict) or payload.get("v") != 1:
             raise ValueError
-        if payload.get("kind") != kind or payload.get("filter") != filter_digest:
+        if payload.get("kind") != kind:
             raise ValueError
         return payload
     except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise IntegrationAPIError(400, "invalid_cursor", "The pagination cursor is invalid.") from exc
+
+
+def decode_cursor(cursor: str, *, kind: str, filter_digest: str) -> dict[str, Any]:
+    payload = _decode_cursor_payload(cursor, kind=kind)
+    if payload.get("filter") != filter_digest:
+        raise IntegrationAPIError(400, "invalid_cursor", "The pagination cursor is invalid.")
+    return payload
 
 
 def filter_digest(kind: str, values: dict[str, Any]) -> str:
@@ -430,11 +437,23 @@ async def query_ticker(
 async def query_latest(
     db: aiosqlite.Connection,
     *,
-    updated_after: datetime,
+    updated_after: datetime | None,
     limit: int,
     cursor: str | None,
 ) -> tuple[str, list[CatalystItem], datetime | None, str | None, bool, datetime | None]:
     as_of = utc_now()
+    cursor_payload = _decode_cursor_payload(cursor, kind="latest") if cursor else None
+    if updated_after is None:
+        if cursor_payload is None:
+            updated_after = as_of - timedelta(days=1)
+        else:
+            # Freeze the implicit first-page boundary for the whole snapshot.
+            try:
+                updated_after = parse_utc(cursor_payload["updated_after"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrationAPIError(
+                    400, "invalid_cursor", "The pagination cursor is invalid."
+                ) from exc
     if as_of - updated_after > timedelta(days=7, seconds=5):
         raise IntegrationAPIError(
             400,
@@ -446,7 +465,8 @@ async def query_latest(
             latest_window_days=7,
         )
     digest = filter_digest("latest", {"updated_after": updated_after})
-    cursor_payload = decode_cursor(cursor, kind="latest", filter_digest=digest) if cursor else None
+    if cursor_payload is not None and cursor_payload.get("filter") != digest:
+        raise IntegrationAPIError(400, "invalid_cursor", "The pagination cursor is invalid.")
     if cursor_payload:
         as_of = parse_utc(cursor_payload["snapshot_as_of"])
         snapshot_max = int(cursor_payload["snapshot_max"])
@@ -494,6 +514,7 @@ async def query_latest(
                 "snapshot_max": snapshot_max,
                 "snapshot_token": snapshot_token,
                 "snapshot_as_of": utc_text(as_of),
+                "updated_after": utc_text(updated_after),
                 "last_sequence": int(page[-1]["sequence"]),
             }
         )

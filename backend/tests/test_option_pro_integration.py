@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import aiosqlite
 import pytest
@@ -2388,6 +2389,125 @@ def test_signed_manual_analysis_gate_rejects_before_writing_job(
             await db.close()
 
     assert run(count_jobs()) == 0
+
+
+def test_signed_latest_cursor_reuses_implicit_updated_after_across_pages(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_read_key_id", "read-key")
+    monkeypatch.setattr(settings, "option_pro_read_secret", "read-secret")
+    monkeypatch.setattr(settings, "option_pro_action_key_id", "action-key")
+    monkeypatch.setattr(settings, "option_pro_action_secret", "action-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+
+    async def seed():
+        db = await database.get_db()
+        try:
+            for index in range(3):
+                await database.insert_news_item(db, news_record(810 + index))
+        finally:
+            await db.close()
+
+    run(seed())
+    app = _integration_app()
+    prefix = "/api/integrations/option-pro/v1/latest"
+    first_target = f"{prefix}?limit=1"
+
+    with TestClient(app) as client:
+        first = client.get(
+            first_target,
+            headers=_signed_headers(
+                "GET", first_target, b"", "read-key", "read-secret", "nonce-latest-default-01"
+            ),
+        )
+        assert first.status_code == 200
+        first_page = first.json()
+        assert first_page["has_more"] is True
+        assert first_page["next_cursor"]
+        assert len(first_page["items"]) == 1
+
+        second_target = (
+            f"{prefix}?"
+            f"{urlencode({'limit': 1, 'cursor': first_page['next_cursor']})}"
+        )
+        second = client.get(
+            second_target,
+            headers=_signed_headers(
+                "GET", second_target, b"", "read-key", "read-secret", "nonce-latest-default-02"
+            ),
+        )
+        assert second.status_code == 200, second.text
+        second_page = second.json()
+        assert second_page["snapshot_token"] == first_page["snapshot_token"]
+        assert second_page["items"][0]["news_id"] != first_page["items"][0]["news_id"]
+
+
+def test_signed_latest_cursor_requires_original_explicit_updated_after(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_read_key_id", "read-key")
+    monkeypatch.setattr(settings, "option_pro_read_secret", "read-secret")
+    monkeypatch.setattr(settings, "option_pro_action_key_id", "action-key")
+    monkeypatch.setattr(settings, "option_pro_action_secret", "action-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+
+    async def seed():
+        db = await database.get_db()
+        try:
+            for index in range(3):
+                await database.insert_news_item(db, news_record(820 + index))
+        finally:
+            await db.close()
+
+    run(seed())
+    app = _integration_app()
+    prefix = "/api/integrations/option-pro/v1/latest"
+    original_updated_after = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(
+        microsecond=0
+    ).isoformat()
+    first_target = (
+        f"{prefix}?"
+        f"{urlencode({'updated_after': original_updated_after, 'limit': 1})}"
+    )
+
+    with TestClient(app) as client:
+        first = client.get(
+            first_target,
+            headers=_signed_headers(
+                "GET", first_target, b"", "read-key", "read-secret", "nonce-latest-explicit-01"
+            ),
+        )
+        assert first.status_code == 200
+        first_page = first.json()
+        assert first_page["has_more"] is True
+        assert first_page["next_cursor"]
+
+        same_filter_target = (
+            f"{prefix}?"
+            f"{urlencode({'updated_after': original_updated_after, 'limit': 1, 'cursor': first_page['next_cursor']})}"
+        )
+        same_filter = client.get(
+            same_filter_target,
+            headers=_signed_headers(
+                "GET", same_filter_target, b"", "read-key", "read-secret", "nonce-latest-explicit-02"
+            ),
+        )
+        assert same_filter.status_code == 200, same_filter.text
+
+        changed_filter_target = (
+            f"{prefix}?"
+            f"{urlencode({'updated_after': first_page['next_updated_after'], 'limit': 1, 'cursor': first_page['next_cursor']})}"
+        )
+        changed_filter = client.get(
+            changed_filter_target,
+            headers=_signed_headers(
+                "GET", changed_filter_target, b"", "read-key", "read-secret", "nonce-latest-explicit-03"
+            ),
+        )
+        assert changed_filter.status_code == 400
+        assert changed_filter.json()["code"] == "invalid_cursor"
 
 
 def test_canonical_path_discards_legacy_testclient_query_suffix():
