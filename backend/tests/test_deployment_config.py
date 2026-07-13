@@ -49,8 +49,43 @@ def test_backend_and_worker_share_model_database_and_retention_environment():
         "EVENT_MEMBER_RETENTION_DAYS",
         "PROJECTION_RETRY_RETENTION_DAYS",
         "PROJECTION_RETRY_MAX_ATTEMPTS",
+        "ANALYSIS_WORKER_QUICK_CHECK_INTERVAL_SECONDS",
     ):
         assert f"  {key}: ${{{key}:-" in compose
+
+
+def test_data_init_can_traverse_legacy_and_migrated_data_directories():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    data_init = compose.split("  data-init:", 1)[1].split("\n  backend:", 1)[0]
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'user: "0:10001"' in data_init
+    assert "cap_drop:\n      - ALL" in data_init
+    assert "cap_add:\n      - CHOWN" in data_init
+    assert "scripts/verify-data-init.sh" in workflow
+
+    verifier = (ROOT / "scripts" / "verify-data-init.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'sudo chown "$owner_uid:$owner_gid" "${files[@]}"' in verifier
+    assert "sudo stat -c '%u:%g'" in verifier
+    assert '"$data_dir"/*' not in verifier
+
+
+def test_worker_healthcheck_caches_only_the_expensive_integrity_probe():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    worker = compose.split("  analysis-worker:", 1)[1].split("\n  frontend:", 1)[0]
+    healthcheck = (ROOT / "backend" / "app" / "worker_healthcheck.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ANALYSIS_WORKER_QUICK_CHECK_INTERVAL_SECONDS:-1800" in compose
+    assert 'test: ["CMD", "python", "-m", "app.worker_healthcheck"]' in worker
+    assert "timeout: 120s" in worker
+    assert "PRAGMA quick_check" in healthcheck
+    assert 'Path("/tmp/macrolens-analysis-worker-quick-check.ok")' in healthcheck
 
 
 def test_ci_starts_and_smokes_all_runtime_services_without_external_sources():

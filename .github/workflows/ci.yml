@@ -81,6 +81,8 @@ jobs:
           docker compose config --quiet
       - name: Build containers
         run: docker compose build
+      - name: Verify data directory ownership migration
+        run: scripts/verify-data-init.sh
       - name: Start backend, analysis worker, and frontend
         run: >-
           docker compose up -d --no-build --force-recreate --remove-orphans

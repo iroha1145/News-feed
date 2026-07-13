@@ -46,6 +46,7 @@ x-analysis-runtime-environment: &analysis-runtime-environment
   NEWS_LLM_MIN_MARKET_RELEVANCE: ${NEWS_LLM_MIN_MARKET_RELEVANCE:-35}
   ANALYSIS_WORKER_POLL_SECONDS: ${ANALYSIS_WORKER_POLL_SECONDS:-5}
   ANALYSIS_WORKER_LEASE_SECONDS: ${ANALYSIS_WORKER_LEASE_SECONDS:-120}
+  ANALYSIS_WORKER_QUICK_CHECK_INTERVAL_SECONDS: ${ANALYSIS_WORKER_QUICK_CHECK_INTERVAL_SECONDS:-1800}
   ANALYSIS_JOB_RETRY_COOLDOWN_SECONDS: ${ANALYSIS_JOB_RETRY_COOLDOWN_SECONDS:-300}
   CALENDAR_ANALYSIS_PROMPT_VERSION: ${CALENDAR_ANALYSIS_PROMPT_VERSION:-calendar-impact-v1}
   CALENDAR_ANALYSIS_SCHEMA_VERSION: ${CALENDAR_ANALYSIS_SCHEMA_VERSION:-calendar-impact-schema-v1}
@@ -92,7 +93,10 @@ services:
   data-init:
     <<: *backend-image
     container_name: macrolens-data-init
-    user: "0:0"
+    # UID 0 owns legacy root:root directories, while GID 10001 can traverse
+    # already-migrated 10001:10001 directories with mode 0750. CAP_CHOWN is
+    # still the only retained capability.
+    user: "0:10001"
     command:
       - sh
       - -c
@@ -190,7 +194,9 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "app.worker_healthcheck"]
       interval: 30s
-      timeout: 10s
+      # The first probe performs PRAGMA quick_check on the complete production
+      # database. Later probes use the /tmp marker for the configured interval.
+      timeout: 120s
       retries: 3
       start_period: 30s
 

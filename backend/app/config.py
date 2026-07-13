@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     news_llm_min_market_relevance: int = Field(default=35, ge=0, le=100)
     analysis_worker_poll_seconds: int = Field(default=5, ge=1, le=300)
     analysis_worker_lease_seconds: int = Field(default=120, ge=30, le=1800)
+    analysis_worker_quick_check_interval_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=86400,
+    )
     analysis_job_retry_cooldown_seconds: int = Field(default=300, ge=1, le=86400)
 
     # Pull-only focus context from option-pro. Empty credentials keep the
