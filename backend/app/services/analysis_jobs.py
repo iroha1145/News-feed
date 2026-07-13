@@ -1026,7 +1026,7 @@ async def _handle_provider_result(
             raw_payload = json.loads(result.output_text or "")
             stocks = raw_payload.get("affected_stocks", []) if isinstance(raw_payload, dict) else []
             if isinstance(stocks, list):
-                from app.services.market_focus import normalize_ticker
+                from app.utils.tickers import normalize_ticker
 
                 invalid_tickers = sum(
                     1

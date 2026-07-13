@@ -42,6 +42,7 @@ from app.services.market_schedule import (
     due_cycle_trigger,
     is_nyse_early_close,
     is_nyse_trading_day,
+    next_cycle_at,
     scheduled_slots_for_day,
 )
 
@@ -847,6 +848,9 @@ def test_nyse_schedule_handles_dst_weekends_holidays_and_early_close(monkeypatch
     assert not is_nyse_trading_day(date(2026, 7, 4))
     assert not scheduled_slots_for_day(date(2026, 7, 4))
     assert is_nyse_trading_day(date(2021, 12, 31))
+    assert not is_nyse_trading_day(date(2023, 1, 2))
+    assert not scheduled_slots_for_day(date(2023, 1, 2))
+    assert not is_nyse_trading_day(date(2026, 1, 1))
     assert not is_nyse_trading_day(date(2022, 1, 17))
     assert not is_nyse_trading_day(date(2022, 6, 20))
     assert not is_nyse_trading_day(date(2022, 7, 4))
@@ -863,6 +867,13 @@ def test_nyse_schedule_handles_dst_weekends_holidays_and_early_close(monkeypatch
     assert due_cycle_trigger(summer) == "scheduled_1200"
     assert due_cycle_trigger(winter) == "scheduled_1200"
     assert summer.utcoffset() != winter.utcoffset()
+    next_after_weekend_new_year = next_cycle_at(
+        datetime(2022, 12, 30, 20, 1, tzinfo=EASTERN)
+    )
+    assert next_after_weekend_new_year is not None
+    assert next_after_weekend_new_year.astimezone(EASTERN) == datetime(
+        2023, 1, 3, 8, 0, tzinfo=EASTERN
+    )
 
 
 def test_finnhub_company_news_date_uses_eastern_calendar_day():

@@ -10,6 +10,7 @@ import aiosqlite
 
 from app.config import settings
 from app.utils.dedup import normalize_title, publication_bucket, similar_titles
+from app.utils.tickers import normalize_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -357,7 +358,7 @@ def _serialize_source_tickers(value: Any) -> str:
         value = []
     tickers: list[str] = []
     for item in value:
-        ticker = str(item or "").strip().upper().lstrip("$")[:20]
+        ticker = normalize_ticker(item)
         if ticker and ticker not in tickers:
             tickers.append(ticker)
     return json.dumps(tickers[:100], separators=(",", ":"))

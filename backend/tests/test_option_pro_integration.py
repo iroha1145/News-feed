@@ -2048,6 +2048,50 @@ def test_news_and_ticker_status_expose_degraded_source_as_stale(isolated_integra
     run(scenario())
 
 
+def test_feed_drops_provider_tickers_that_violate_the_public_contract(isolated_integration_db):
+    async def scenario():
+        db = await database.get_db()
+        try:
+            record = news_record(208)
+            record["source_tickers"] = [
+                "AMD",
+                "ema.pr.a:ca",
+                "$MSFT",
+                "MSFT",
+                "AMD",
+                "NOT A TICKER",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            ]
+            await database.insert_news_item(db, record)
+            items, _, _, _ = await query_feed(
+                db,
+                as_of=datetime.now(timezone.utc) + timedelta(seconds=1),
+                window_hours=24,
+                limit=20,
+                cursor=None,
+                source=None,
+                classification=None,
+                min_confidence=0,
+                min_abs_impact=0,
+                analysis_status=None,
+            )
+            assert len(items) == 1
+            assert items[0].source_tickers == ["AMD", "MSFT"]
+
+            _, latest_items, _, _, _, _ = await query_latest(
+                db,
+                updated_after=datetime.now(timezone.utc) - timedelta(days=1),
+                limit=20,
+                cursor=None,
+            )
+            assert len(latest_items) == 1
+            assert latest_items[0].source_tickers == ["AMD", "MSFT"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
 def test_empty_latest_advances_watermark_without_losing_later_change(isolated_integration_db):
     async def scenario():
         db = await database.get_db()
