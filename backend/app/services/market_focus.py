@@ -3061,6 +3061,41 @@ async def _finish_cycle(
         ownership = (
             cycle["cycle_id"], fencing_token, worker_id, now,
         )
+        runtime_error_code = None
+        if result.model is not None and result.model != str(cycle["model"]):
+            runtime_error_code = "provider_model_mismatch"
+        elif (
+            result.reasoning_effort is not None
+            and result.reasoning_effort != str(cycle["reasoning_effort"])
+        ):
+            runtime_error_code = "provider_reasoning_mismatch"
+        if runtime_error_code:
+            changed = await db.execute(
+                """UPDATE market_focus_cycles SET status='failed',error_code=?,
+                   completed_at=?,updated_at=?,usage_input_tokens=?,
+                   usage_cached_input_tokens=?,usage_cache_write_tokens=?,
+                   usage_reasoning_tokens=?,usage_output_tokens=?,usage_total_tokens=?,
+                   lease_owner=NULL,lease_expires_at=NULL
+                   WHERE cycle_id=? AND fencing_token=? AND lease_owner=?
+                     AND lease_expires_at>?""",
+                (runtime_error_code, now, now, *usage, *ownership),
+            )
+            if changed.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                """UPDATE hotspot_preparation_sets SET status='PREPARED',
+                   leased_cycle_id=NULL WHERE leased_cycle_id=?""",
+                (cycle["cycle_id"],),
+            )
+            await db.execute(
+                """UPDATE hotspot_preparation_state SET active_cycle_id=NULL,
+                   last_cycle_at=?,updated_at=?
+                   WHERE singleton_id=1 AND active_cycle_id=?""",
+                (now, now, cycle["cycle_id"]),
+            )
+            await db.commit()
+            return True
         if provider_status == "incomplete" or result.error_code in {
             "max_output_tokens", "incomplete_max_output_tokens",
         }:
@@ -3172,10 +3207,13 @@ async def _finish_cycle(
             changed = await db.execute(
                 """UPDATE market_focus_cycles SET status='failed',
                    error_code=?,completed_at=?,updated_at=?,
+                   usage_input_tokens=?,usage_cached_input_tokens=?,
+                   usage_cache_write_tokens=?,usage_reasoning_tokens=?,
+                   usage_output_tokens=?,usage_total_tokens=?,
                    lease_owner=NULL,lease_expires_at=NULL
                    WHERE cycle_id=? AND fencing_token=? AND lease_owner=?
                      AND lease_expires_at>?""",
-                (structured_error_code, now, now, *ownership),
+                (structured_error_code, now, now, *usage, *ownership),
             )
             if changed.rowcount != 1:
                 await db.rollback()
