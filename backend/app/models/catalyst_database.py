@@ -375,6 +375,18 @@ CREATE TABLE IF NOT EXISTS focus_revalidation_groups (
 )
 """
 
+CREATE_FOCUS_EVENT_GROUP_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS focus_event_group_snapshots (
+    focus_revision INTEGER NOT NULL REFERENCES focus_context_snapshots(revision) ON DELETE CASCADE,
+    event_group_id TEXT NOT NULL REFERENCES news_event_groups(event_group_id) ON DELETE CASCADE,
+    as_of TEXT NOT NULL,
+    state_json TEXT NOT NULL CHECK(json_valid(state_json)),
+    evidence_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(focus_revision,event_group_id)
+)
+"""
+
 CREATE_NEWS_EVENT_GROUPS = """
 CREATE TABLE IF NOT EXISTS news_event_groups (
     event_group_id TEXT PRIMARY KEY,
@@ -559,6 +571,7 @@ TABLES = [
     CREATE_NEWS_EVENT_MEMBERS,
     CREATE_FOCUS_REVALIDATION_CHANGED_NEWS,
     CREATE_FOCUS_REVALIDATION_GROUPS,
+    CREATE_FOCUS_EVENT_GROUP_SNAPSHOTS,
     CREATE_HOTSPOT_PREPARATION_SETS,
     CREATE_HOTSPOT_PREPARATION_STATE,
     CREATE_MARKET_FOCUS_CYCLES,
@@ -595,6 +608,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ticker_validation_focus_revision ON ticker_validation_revisions(focus_revision)",
     "CREATE INDEX IF NOT EXISTS idx_focus_revalidation_changed_news ON focus_revalidation_changed_news(run_key,news_id)",
     "CREATE INDEX IF NOT EXISTS idx_focus_revalidation_groups ON focus_revalidation_groups(run_key,event_group_id)",
+    "CREATE INDEX IF NOT EXISTS idx_focus_event_group_snapshots_as_of ON focus_event_group_snapshots(event_group_id,as_of DESC,focus_revision DESC)",
     "CREATE INDEX IF NOT EXISTS idx_event_groups_available ON news_event_groups(available_at DESC, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_event_members_group ON news_event_members(event_group_id, fetched_at)",
     "CREATE INDEX IF NOT EXISTS idx_event_members_retention ON news_event_members(created_at,event_group_id)",

@@ -22,9 +22,11 @@ from app.services.market_focus import (
     calculate_weighted_catalyst_context,
     create_market_focus_cycle,
     get_hotspot_status,
+    event_group_state_as_of,
     ingest_event_evidence,
     list_prepared_hotspots,
     request_market_focus_cancel,
+    refresh_event_groups_for_news,
     record_ticker_mentions,
     retry_market_focus_cycle,
     run_market_focus_worker_once,
@@ -35,6 +37,7 @@ from app.services.ticker_lineage import (
     append_validation_revision,
     build_validation_basis_hash,
     record_ticker_mention,
+    trusted_tickers_for_news_as_of,
     validation_as_of,
 )
 from app.services.responses_runtime import ProviderCapabilities, ResponseResult
@@ -527,6 +530,167 @@ def test_invalid_model_ticker_is_counted_without_storing_raw_value(isolated_mark
             )).fetchall()
             assert count[0] == 1
             assert mentions == []
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_latest_analysis_revision_replaces_current_llm_tickers_but_preserves_history(
+    isolated_market_db,
+):
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc) - timedelta(minutes=10)
+            item = news(905, title="Chip demand outlook changes materially")
+            item["source_tickers"] = ["MSFT"]
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(db, item, news_id=news_id)
+            basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols={"AMD", "NVDA", "MSFT"},
+                universe_version="analysis-lineage-test",
+            )
+
+            async def add_analysis(
+                revision: int,
+                at: datetime,
+                tickers: list[str],
+                *,
+                validation_status: str = "valid_external",
+            ) -> int:
+                cursor = await db.execute(
+                    """INSERT INTO analysis_revisions
+                       (news_id,revision,input_hash,payload_json,provider,model,
+                        reasoning_effort,prompt_version,schema_version,fetched_at,
+                        analyzed_at,available_at,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        news_id,
+                        revision,
+                        hashlib.sha256(f"analysis-{revision}".encode()).hexdigest(),
+                        "{}",
+                        "test",
+                        "test-model",
+                        "none",
+                        "test-v1",
+                        "test-v1",
+                        base.isoformat(),
+                        at.isoformat(),
+                        at.isoformat(),
+                        at.isoformat(),
+                    ),
+                )
+                analysis_id = int(cursor.lastrowid)
+                for ticker in tickers:
+                    await record_ticker_mention(
+                        db,
+                        news_id=news_id,
+                        ticker=ticker,
+                        association_method="llm_inference",
+                        association_confidence=0.5,
+                        source="model_output",
+                        validation_status=validation_status,
+                        available_at=at,
+                        focus_revision=1,
+                        universe_version="analysis-lineage-test",
+                        validation_basis_hash=basis,
+                        analysis_revision_id=analysis_id,
+                        reason_code="model_association",
+                    )
+                return analysis_id
+
+            first_at = base + timedelta(minutes=1)
+            second_at = base + timedelta(minutes=2)
+            first_analysis_id = await add_analysis(1, first_at, ["AMD", "NVDA"])
+            await refresh_event_groups_for_news(db, news_id)
+            first_group = await (await db.execute(
+                """SELECT version,validated_tickers_json FROM news_event_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert json.loads(first_group[1]) == ["AMD", "MSFT", "NVDA"]
+
+            second_analysis_id = await add_analysis(2, second_at, ["NVDA"])
+            await refresh_event_groups_for_news(db, news_id)
+            await db.commit()
+
+            current_projection = await trusted_tickers_for_news_as_of(
+                db,
+                news_id=news_id,
+                as_of=datetime.now(timezone.utc),
+            )
+            historical_projection = await trusted_tickers_for_news_as_of(
+                db,
+                news_id=news_id,
+                as_of=first_at + timedelta(seconds=1),
+            )
+            historical_group = await event_group_state_as_of(
+                db,
+                event_group_id,
+                first_at + timedelta(seconds=1),
+            )
+            member = await (await db.execute(
+                """SELECT validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            group = await (await db.execute(
+                """SELECT version,validated_tickers_json FROM news_event_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            mention_count = await (await db.execute(
+                """SELECT COUNT(*) FROM news_ticker_mentions
+                   WHERE news_id=? AND association_method='llm_inference'""",
+                (news_id,),
+            )).fetchone()
+
+            assert current_projection["latest_analysis_revision_id"] == second_analysis_id
+            assert current_projection["llm_tickers"] == ["NVDA"]
+            assert current_projection["trusted_tickers"] == ["MSFT", "NVDA"]
+            assert historical_projection["latest_analysis_revision_id"] == first_analysis_id
+            assert historical_projection["llm_tickers"] == ["AMD", "NVDA"]
+            # The provider Mention was observed during ingestion after this
+            # historical boundary, so the point-in-time group excludes it.
+            assert historical_group["trusted_tickers"] == ["AMD", "NVDA"]
+            assert json.loads(member[0]) == ["MSFT", "NVDA"]
+            assert json.loads(group[1]) == ["MSFT", "NVDA"]
+            assert int(group[0]) == int(first_group[0]) + 1
+            assert int(mention_count[0]) == 3
+
+            version_before_replay = int(group[0])
+            await refresh_event_groups_for_news(db, news_id)
+            replayed = await (await db.execute(
+                """SELECT version,validated_tickers_json FROM news_event_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert tuple(replayed) == (version_before_replay, '["MSFT", "NVDA"]')
+
+            third_analysis_id = await add_analysis(
+                3,
+                base + timedelta(minutes=3),
+                ["XYZ"],
+                validation_status="unverified",
+            )
+            await refresh_event_groups_for_news(db, news_id)
+            failed_closed = await trusted_tickers_for_news_as_of(
+                db,
+                news_id=news_id,
+                as_of=datetime.now(timezone.utc),
+            )
+            failed_closed_member = await (await db.execute(
+                """SELECT validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert failed_closed["latest_analysis_revision_id"] == third_analysis_id
+            assert failed_closed["llm_tickers"] == []
+            assert failed_closed["trusted_tickers"] == ["MSFT"]
+            assert json.loads(failed_closed_member[0]) == ["MSFT"]
         finally:
             await db.close()
 
@@ -1584,7 +1748,7 @@ def test_expired_focus_lease_takeover_fences_stale_runner(
     run(scenario())
 
 
-def test_old_focus_revision_rebuilds_events_as_of_and_blocks_mixed_cycle(
+def test_old_focus_revision_preserves_live_event_cache_and_blocks_mixed_cycle(
     isolated_market_db, monkeypatch
 ):
     _enable_cycles(monkeypatch)
@@ -1656,6 +1820,9 @@ def test_old_focus_revision_rebuilds_events_as_of_and_blocks_mixed_cycle(
                 (event_group_id,),
             )).fetchone()
             assert json.loads(initial_projection[0]) == ["XYZ"]
+            prepared_before_replay = int((await (await db.execute(
+                "SELECT COUNT(*) FROM hotspot_preparation_sets"
+            )).fetchone())[0])
 
             monkeypatch.setattr(settings, "focus_revalidation_max_rows_per_run", 1)
             monkeypatch.setattr(settings, "focus_revalidation_batch_size", 1)
@@ -1700,15 +1867,6 @@ def test_old_focus_revision_rebuilds_events_as_of_and_blocks_mixed_cycle(
             with pytest.raises(CycleConflict, match="focus_revalidation_pending"):
                 await create_market_focus_cycle(db, trigger_type="manual")
 
-            for _ in range(20):
-                await resume_focus_revalidation()
-                state = await (await db.execute(
-                    """SELECT last_focus_revision,pending_run_key
-                       FROM focus_validation_state WHERE singleton_id=1"""
-                )).fetchone()
-                if int(state[0] or 0) == 2 and state[1] is None:
-                    break
-            assert tuple(state) == (2, None)
             member_at_revision_2 = await (await db.execute(
                 """SELECT validated_tickers_json FROM news_event_members
                    WHERE event_group_id=?""",
@@ -1719,8 +1877,18 @@ def test_old_focus_revision_rebuilds_events_as_of_and_blocks_mixed_cycle(
                    WHERE event_group_id=?""",
                 (event_group_id,),
             )).fetchone()
-            assert json.loads(member_at_revision_2[0]) == []
-            assert json.loads(group_at_revision_2[0]) == []
+            historical_group_at_revision_2 = await event_group_state_as_of(
+                db,
+                event_group_id,
+                revision_2_at,
+            )
+            assert historical_group_at_revision_2["trusted_tickers"] == []
+            assert json.loads(member_at_revision_2[0]) == ["XYZ"]
+            assert json.loads(group_at_revision_2[0]) == ["XYZ"]
+            prepared_after_replay = int((await (await db.execute(
+                "SELECT COUNT(*) FROM hotspot_preparation_sets"
+            )).fetchone())[0])
+            assert prepared_after_replay == prepared_before_replay
             assert await market_focus_service._focus_projection_revalidation_pending(db)
 
             for _ in range(20):
@@ -1745,6 +1913,157 @@ def test_old_focus_revision_rebuilds_events_as_of_and_blocks_mixed_cycle(
             assert json.loads(member_at_revision_3[0]) == ["XYZ"]
             assert json.loads(group_at_revision_3[0]) == ["XYZ"]
             assert not await market_focus_service._focus_projection_revalidation_pending(db)
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_historical_revalidation_updates_only_the_matching_analysis_impact(
+    isolated_market_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "focus_revalidation_max_rows_per_run", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_batch_size", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_max_seconds_per_run", 5.0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc)
+            dummy_news_id = await database.insert_news_item(db, news(981))
+            await record_ticker_mentions(
+                db,
+                news_id=dummy_news_id,
+                tickers=["DUMMY"],
+                association_method="exact_alias",
+                source="alias_dictionary",
+            )
+            item = news(982, title="XYZ guidance changes materially")
+            item["source_tickers"] = []
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="impact-lineage",
+            )
+
+            async def add_analysis(
+                revision: int,
+                at: datetime,
+                status: str,
+            ) -> tuple[int, int]:
+                cursor = await db.execute(
+                    """INSERT INTO analysis_revisions
+                       (news_id,revision,input_hash,payload_json,provider,model,
+                        reasoning_effort,prompt_version,schema_version,fetched_at,
+                        analyzed_at,available_at,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        news_id,
+                        revision,
+                        hashlib.sha256(f"impact-analysis-{revision}".encode()).hexdigest(),
+                        "{}",
+                        "test",
+                        "test-model",
+                        "none",
+                        "test-v1",
+                        "test-v1",
+                        base.isoformat(),
+                        at.isoformat(),
+                        at.isoformat(),
+                        at.isoformat(),
+                    ),
+                )
+                analysis_id = int(cursor.lastrowid)
+                mention = await record_ticker_mention(
+                    db,
+                    news_id=news_id,
+                    ticker="XYZ",
+                    association_method="llm_inference",
+                    association_confidence=0.5,
+                    source="model_output",
+                    validation_status=status,
+                    available_at=at,
+                    focus_revision=None,
+                    universe_version="impact-lineage",
+                    validation_basis_hash=basis,
+                    analysis_revision_id=analysis_id,
+                    reason_code="model_association",
+                )
+                mention_id = int(mention["mention_id"])
+                await db.execute(
+                    """INSERT INTO analysis_stock_impacts
+                       (analysis_id,analysis_revision_id,mention_id,news_id,ticker,
+                        company,impact_score,confidence,horizon,mechanism,reason,
+                        source,content_hash,published_at,fetched_at,analyzed_at,
+                        available_at,model,reasoning_effort,prompt_version,
+                        schema_version,validation_status,validated_at,
+                        focus_revision,universe_version,association_method)
+                       VALUES (?,?,?,?,?,'XYZ Corp',25,60,'days','direct_company',
+                               'test impact','test',?,NULL,?,?,?,
+                               'test-model','none','test-v1','test-v1',?,?,NULL,
+                               'impact-lineage','llm_inference')""",
+                    (
+                        analysis_id,
+                        analysis_id,
+                        mention_id,
+                        news_id,
+                        "XYZ",
+                        hashlib.sha256(f"impact-{revision}".encode()).hexdigest(),
+                        base.isoformat(),
+                        at.isoformat(),
+                        at.isoformat(),
+                        status,
+                        at.isoformat() if status in {"canonical", "valid_external"} else None,
+                    ),
+                )
+                return analysis_id, mention_id
+
+            first_analysis_id, _ = await add_analysis(1, base, "unverified")
+            await db.commit()
+            target_at = base + timedelta(minutes=1)
+            context = FocusContext.model_validate({
+                "schema_version": "option-pro-macrolens-focus-v2",
+                "schema_sha256": FOCUS_SCHEMA_SHA256,
+                "revision": 1,
+                "as_of": target_at,
+                "data_through": target_at,
+                "market_session": "regular",
+                "universe_version": "impact-lineage",
+                "symbols": [{
+                    "ticker": "XYZ",
+                    "validation_status": "canonical",
+                    "universe_reasons": ["test"],
+                    "as_of": target_at,
+                    "data_through": target_at,
+                    "data_quality": 1.0,
+                    "data_status": "active",
+                    "source_status": "active",
+                }],
+                "major_market_symbols": [],
+                "warnings": [],
+            })
+            await persist_focus_context(db, context, fetched_at=target_at)
+
+            second_analysis_id, _ = await add_analysis(
+                2,
+                base + timedelta(minutes=2),
+                "valid_external",
+            )
+            await db.commit()
+            await resume_focus_revalidation()
+            impacts = await (await db.execute(
+                """SELECT analysis_revision_id,validation_status
+                   FROM analysis_stock_impacts WHERE news_id=?
+                   ORDER BY analysis_revision_id""",
+                (news_id,),
+            )).fetchall()
+            assert [tuple(row) for row in impacts] == [
+                (first_analysis_id, "canonical"),
+                (second_analysis_id, "valid_external"),
+            ]
         finally:
             await db.close()
 
@@ -1863,6 +2182,496 @@ def test_large_event_group_member_refresh_resumes_one_row_per_slice(
                 (event_group_id,),
             )).fetchone()
             assert json.loads(group[0]) == ["XYZ"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_new_analysis_revision_mid_member_scan_cannot_restore_old_llm_ticker(
+    isolated_market_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "focus_revalidation_max_rows_per_run", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_batch_size", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_max_seconds_per_run", 5.0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc) - timedelta(minutes=10)
+            item = news(
+                983,
+                title="Chip makers raise annual earnings guidance materially",
+            )
+            item["source_tickers"] = []
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+            first_member = await (await db.execute(
+                "SELECT id FROM news_event_members WHERE event_group_id=?",
+                (event_group_id,),
+            )).fetchone()
+            second_fingerprint = hashlib.sha256(
+                b"analysis-race-second-member"
+            ).hexdigest()
+            await db.execute(
+                """INSERT INTO news_event_members
+                   (event_group_id,news_id,source,normalized_url,title,
+                    published_at,fetched_at,source_tickers_json,
+                    validated_tickers_json,publisher_identity,event_type,
+                    evidence_fingerprint,content_hash,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_group_id,
+                    news_id,
+                    "second-wire",
+                    "https://example.test/analysis-race/second",
+                    item["title"],
+                    base.isoformat(),
+                    base.isoformat(),
+                    "[]",
+                    "[]",
+                    "second-publisher",
+                    "earnings_guidance",
+                    second_fingerprint,
+                    second_fingerprint,
+                    base.isoformat(),
+                ),
+            )
+            await db.execute(
+                "UPDATE news_event_groups SET member_count=2 WHERE event_group_id=?",
+                (event_group_id,),
+            )
+
+            initial_basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="analysis-member-race",
+            )
+            focus_basis = build_validation_basis_hash(
+                canonical_symbols={"AMD", "NVDA"},
+                external_symbols=set(),
+                universe_version="analysis-member-race",
+            )
+
+            async def add_analysis(
+                revision: int,
+                available_at: datetime,
+                tickers: list[str],
+                *,
+                validation_status: str,
+            ) -> int:
+                cursor = await db.execute(
+                    """INSERT INTO analysis_revisions
+                       (news_id,revision,input_hash,payload_json,provider,model,
+                        reasoning_effort,prompt_version,schema_version,fetched_at,
+                        analyzed_at,available_at,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        news_id,
+                        revision,
+                        hashlib.sha256(
+                            f"analysis-member-race-{revision}".encode()
+                        ).hexdigest(),
+                        "{}",
+                        "test",
+                        "test-model",
+                        "none",
+                        "test-v1",
+                        "test-v1",
+                        base.isoformat(),
+                        available_at.isoformat(),
+                        available_at.isoformat(),
+                        available_at.isoformat(),
+                    ),
+                )
+                analysis_id = int(cursor.lastrowid)
+                for ticker in tickers:
+                    await record_ticker_mention(
+                        db,
+                        news_id=news_id,
+                        ticker=ticker,
+                        association_method="llm_inference",
+                        association_confidence=0.8,
+                        source="model_output",
+                        validation_status=validation_status,
+                        available_at=available_at,
+                        focus_revision=(
+                            1 if validation_status == "canonical" else None
+                        ),
+                        universe_version="analysis-member-race",
+                        validation_basis_hash=(
+                            focus_basis
+                            if validation_status == "canonical"
+                            else initial_basis
+                        ),
+                        analysis_revision_id=analysis_id,
+                        reason_code="model_association",
+                    )
+                return analysis_id
+
+            first_analysis_id = await add_analysis(
+                1,
+                base + timedelta(minutes=1),
+                ["AMD", "NVDA"],
+                validation_status="unverified",
+            )
+            await db.commit()
+
+            observed = base + timedelta(minutes=3)
+            context = FocusContext.model_validate({
+                "schema_version": "option-pro-macrolens-focus-v2",
+                "schema_sha256": FOCUS_SCHEMA_SHA256,
+                "revision": 1,
+                "as_of": observed,
+                "data_through": observed,
+                "market_session": "regular",
+                "universe_version": "analysis-member-race",
+                "symbols": [
+                    {
+                        "ticker": ticker,
+                        "validation_status": "canonical",
+                        "universe_reasons": ["test"],
+                        "session_change_pct": 8.0,
+                        "rvol_time_of_day": 2.0,
+                        "breakout_state": "CONFIRMED",
+                        "as_of": observed,
+                        "data_through": observed,
+                        "data_quality": 1.0,
+                        "data_status": "active",
+                        "source_status": "active",
+                    }
+                    for ticker in ("AMD", "NVDA")
+                ],
+                "major_market_symbols": [],
+                "warnings": [],
+            })
+            await persist_focus_context(db, context, fetched_at=observed)
+
+            for _ in range(20):
+                state = await (await db.execute(
+                    """SELECT pending_phase,pending_active_group_id,
+                              pending_group_member_cursor,
+                              pending_group_validated_tickers_json
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                if (
+                    state[0] == "refresh_validation"
+                    and state[1] == event_group_id
+                    and int(state[2]) == int(first_member[0])
+                ):
+                    break
+                await resume_focus_revalidation()
+            assert tuple(state[:3]) == (
+                "refresh_validation",
+                event_group_id,
+                int(first_member[0]),
+            )
+            assert json.loads(state[3]) == ["AMD", "NVDA"]
+
+            version_before_refresh = int((await (await db.execute(
+                "SELECT version FROM news_event_groups WHERE event_group_id=?",
+                (event_group_id,),
+            )).fetchone())[0])
+            second_analysis_id = await add_analysis(
+                2,
+                base + timedelta(minutes=4),
+                ["NVDA"],
+                validation_status="canonical",
+            )
+            assert await refresh_event_groups_for_news(db, news_id) == 1
+            await db.commit()
+            version_after_refresh = int((await (await db.execute(
+                "SELECT version FROM news_event_groups WHERE event_group_id=?",
+                (event_group_id,),
+            )).fetchone())[0])
+            assert version_after_refresh == version_before_refresh + 1
+
+            for _ in range(30):
+                await resume_focus_revalidation()
+                state = await (await db.execute(
+                    """SELECT last_focus_revision,pending_run_key
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                if tuple(state) == (1, None):
+                    break
+            assert tuple(state) == (1, None)
+
+            members = await (await db.execute(
+                """SELECT validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=? ORDER BY id""",
+                (event_group_id,),
+            )).fetchall()
+            group = await (await db.execute(
+                """SELECT version,validated_tickers_json
+                   FROM news_event_groups WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            mentions = await (await db.execute(
+                """SELECT ticker,analysis_revision_id FROM news_ticker_mentions
+                   WHERE news_id=? AND association_method='llm_inference'
+                   ORDER BY id""",
+                (news_id,),
+            )).fetchall()
+            assert [json.loads(row[0]) for row in members] == [
+                ["NVDA"],
+                ["NVDA"],
+            ]
+            assert tuple(group) == (version_after_refresh, '["NVDA"]')
+            assert [tuple(row) for row in mentions] == [
+                ("AMD", first_analysis_id),
+                ("NVDA", first_analysis_id),
+                ("NVDA", second_analysis_id),
+            ]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_semantic_focus_successor_inherits_reconciled_group_before_regate(
+    isolated_market_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "focus_revalidation_max_rows_per_run", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_batch_size", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_max_seconds_per_run", 5.0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc) - timedelta(minutes=10)
+            item = news(
+                984,
+                title="NVDA raises annual earnings guidance materially",
+            )
+            item["source_tickers"] = []
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+            second_fingerprint = hashlib.sha256(
+                b"focus-handoff-second-member"
+            ).hexdigest()
+            await db.execute(
+                """INSERT INTO news_event_members
+                   (event_group_id,news_id,source,normalized_url,title,
+                    published_at,fetched_at,source_tickers_json,
+                    validated_tickers_json,publisher_identity,event_type,
+                    evidence_fingerprint,content_hash,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_group_id,
+                    news_id,
+                    "independent-wire",
+                    "https://example.test/focus-handoff/second",
+                    item["title"],
+                    base.isoformat(),
+                    base.isoformat(),
+                    "[]",
+                    "[]",
+                    "independent-publisher",
+                    "earnings_guidance",
+                    second_fingerprint,
+                    second_fingerprint,
+                    base.isoformat(),
+                ),
+            )
+            await db.execute(
+                "UPDATE news_event_groups SET member_count=2 WHERE event_group_id=?",
+                (event_group_id,),
+            )
+            initial_basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="focus-handoff",
+            )
+            await record_ticker_mention(
+                db,
+                news_id=news_id,
+                ticker="NVDA",
+                association_method="exact_alias",
+                association_confidence=1.0,
+                source="alias_dictionary",
+                validation_status="unverified",
+                available_at=base + timedelta(minutes=1),
+                focus_revision=None,
+                universe_version="focus-handoff",
+                validation_basis_hash=initial_basis,
+                reason_code="exact_alias",
+            )
+            await db.commit()
+
+            data_through = base + timedelta(minutes=1)
+
+            def focus(revision: int, as_of: datetime) -> FocusContext:
+                return FocusContext.model_validate({
+                    "schema_version": "option-pro-macrolens-focus-v2",
+                    "schema_sha256": FOCUS_SCHEMA_SHA256,
+                    "revision": revision,
+                    "as_of": as_of,
+                    "data_through": data_through,
+                    "market_session": "regular",
+                    "universe_version": "focus-handoff",
+                    "symbols": [{
+                        "ticker": "NVDA",
+                        "validation_status": "canonical",
+                        "universe_reasons": ["test"],
+                        "session_change_pct": 10.0,
+                        "rvol_time_of_day": 2.0,
+                        "breakout_state": "CONFIRMED",
+                        "as_of": as_of,
+                        "data_through": data_through,
+                        "data_quality": 1.0,
+                        "data_status": "active",
+                        "source_status": "active",
+                    }],
+                    "major_market_symbols": [],
+                    "warnings": [],
+                })
+
+            revision_1_at = base + timedelta(minutes=2)
+            await persist_focus_context(
+                db,
+                focus(1, revision_1_at),
+                fetched_at=revision_1_at,
+            )
+            for _ in range(20):
+                state = await (await db.execute(
+                    """SELECT pending_run_key,pending_phase,
+                              pending_active_group_id,pending_group_cursor
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                dirty = await (await db.execute(
+                    """SELECT version_advanced FROM focus_revalidation_groups
+                       WHERE run_key=? AND event_group_id=?""",
+                    (state[0], event_group_id),
+                )).fetchone() if state[0] else None
+                if dirty is not None:
+                    break
+                await resume_focus_revalidation()
+            assert state[1] == "refresh_validation"
+            assert tuple(state[2:]) == ("", event_group_id)
+            assert int(dirty[0]) == 1
+            prepared_before = int((await (await db.execute(
+                """SELECT COUNT(*) FROM hotspot_preparation_sets
+                   WHERE event_group_id=? AND event_group_version=(
+                     SELECT version FROM news_event_groups
+                     WHERE event_group_id=?
+                   )""",
+                (event_group_id, event_group_id),
+            )).fetchone())[0])
+            assert prepared_before == 0
+            reconciled_version = int((await (await db.execute(
+                "SELECT version FROM news_event_groups WHERE event_group_id=?",
+                (event_group_id,),
+            )).fetchone())[0])
+
+            revision_2_at = base + timedelta(minutes=3)
+            original_revalidate = (
+                market_focus_service.revalidate_events_for_focus_context
+            )
+
+            async def defer_revalidation(*_args, **_kwargs):
+                return 0
+
+            monkeypatch.setattr(
+                market_focus_service,
+                "revalidate_events_for_focus_context",
+                defer_revalidation,
+            )
+            try:
+                assert await persist_focus_context(
+                    db,
+                    focus(2, revision_2_at),
+                    fetched_at=revision_2_at,
+                ) is True
+            finally:
+                monkeypatch.setattr(
+                    market_focus_service,
+                    "revalidate_events_for_focus_context",
+                    original_revalidate,
+                )
+
+            gate_calls: list[tuple[str, int, bool]] = []
+            original_gate = market_focus_service._gate_group
+
+            async def observe_gate(
+                gate_db,
+                gate_group_id,
+                *,
+                version_already_advanced=False,
+                focus_payload_override=None,
+            ):
+                gate_calls.append((
+                    gate_group_id,
+                    int((focus_payload_override or {}).get("revision") or 0),
+                    bool(version_already_advanced),
+                ))
+                return await original_gate(
+                    gate_db,
+                    gate_group_id,
+                    version_already_advanced=version_already_advanced,
+                    focus_payload_override=focus_payload_override,
+                )
+
+            monkeypatch.setattr(
+                market_focus_service,
+                "_gate_group",
+                observe_gate,
+            )
+
+            first_resume = await resume_focus_revalidation()
+            assert first_resume["pending"] is True
+            handoff = await (await db.execute(
+                """SELECT run_key,event_group_id,version_advanced
+                   FROM focus_revalidation_groups WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert tuple(handoff) == (
+                market_focus_service.FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
+                event_group_id,
+                1,
+            )
+
+            for _ in range(10):
+                result = await resume_focus_revalidation()
+                state = await (await db.execute(
+                    """SELECT last_focus_revision,pending_run_key
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                if not result["pending"]:
+                    break
+            assert tuple(state) == (2, None)
+            assert (event_group_id, 2, True) in gate_calls
+
+            group = await (await db.execute(
+                """SELECT version,status FROM news_event_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            preparation = await (await db.execute(
+                """SELECT event_group_version,event_snapshot_json
+                   FROM hotspot_preparation_sets WHERE event_group_id=?
+                   ORDER BY prepared_revision DESC LIMIT 1""",
+                (event_group_id,),
+            )).fetchone()
+            assert tuple(group) == (reconciled_version, "PREPARED")
+            assert preparation is not None
+            assert int(preparation[0]) == int(group[0])
+            assert json.loads(preparation[1])["event_group_version"] == int(group[0])
+            remaining_dirty = await (await db.execute(
+                """SELECT COUNT(*) FROM focus_revalidation_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert int(remaining_dirty[0]) == 0
         finally:
             await db.close()
 
@@ -3588,5 +4397,691 @@ def test_massive_focus_queries_are_deduplicated_and_bounded():
             request_limit=2,
         )
         assert client.calls == ["NVDA", "AMD"]
+
+    run(scenario())
+
+
+def test_partial_group_handoff_restarts_under_latest_semantic_focus_and_keeps_snapshots(
+    isolated_market_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "focus_revalidation_max_rows_per_run", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_batch_size", 1)
+    monkeypatch.setattr(settings, "focus_revalidation_max_seconds_per_run", 5.0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc) - timedelta(minutes=10)
+            item = news(
+                1101,
+                title="NVDA raises annual earnings guidance materially",
+            )
+            item["source_tickers"] = []
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+            for index in range(1, 4):
+                fingerprint = hashlib.sha256(
+                    f"semantic-focus-member-{index}".encode()
+                ).hexdigest()
+                await db.execute(
+                    """INSERT INTO news_event_members
+                       (event_group_id,news_id,source,normalized_url,title,
+                        published_at,fetched_at,source_tickers_json,
+                        validated_tickers_json,publisher_identity,event_type,
+                        evidence_fingerprint,content_hash,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        event_group_id,
+                        news_id,
+                        f"semantic-wire-{index}",
+                        f"https://example.test/semantic-focus/{index}",
+                        item["title"],
+                        base.isoformat(),
+                        base.isoformat(),
+                        "[]",
+                        "[]",
+                        f"semantic-publisher-{index}",
+                        "earnings_guidance",
+                        fingerprint,
+                        fingerprint,
+                        base.isoformat(),
+                    ),
+                )
+            await db.execute(
+                "UPDATE news_event_groups SET member_count=4 WHERE event_group_id=?",
+                (event_group_id,),
+            )
+            initial_basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="semantic-focus-handoff",
+            )
+            await record_ticker_mention(
+                db,
+                news_id=news_id,
+                ticker="NVDA",
+                association_method="exact_alias",
+                association_confidence=1.0,
+                source="alias_dictionary",
+                validation_status="unverified",
+                available_at=base + timedelta(seconds=30),
+                focus_revision=None,
+                universe_version="semantic-focus-handoff",
+                validation_basis_hash=initial_basis,
+                reason_code="exact_alias",
+            )
+            await db.commit()
+
+            def context(revision: int, observed: datetime) -> FocusContext:
+                return FocusContext.model_validate({
+                    "schema_version": "option-pro-macrolens-focus-v2",
+                    "schema_sha256": FOCUS_SCHEMA_SHA256,
+                    "revision": revision,
+                    "as_of": observed,
+                    "data_through": base + timedelta(minutes=1),
+                    "market_session": "regular",
+                    "universe_version": "semantic-focus-handoff",
+                    "symbols": [{
+                        "ticker": "NVDA",
+                        "validation_status": "canonical",
+                        "universe_reasons": ["test"],
+                        "session_change_pct": 10.0,
+                        "rvol_time_of_day": 2.0,
+                        "breakout_state": "CONFIRMED",
+                        "as_of": observed,
+                        "data_through": base + timedelta(minutes=1),
+                        "data_quality": 1.0,
+                        "data_status": "active",
+                        "source_status": "active",
+                    }],
+                    "major_market_symbols": [],
+                    "warnings": [],
+                })
+
+            gate_revisions: list[int] = []
+            original_gate = market_focus_service._gate_group
+
+            async def observe_gate(
+                gate_db,
+                gate_group_id,
+                *,
+                version_already_advanced=False,
+                focus_payload_override=None,
+            ):
+                revision = int((focus_payload_override or {}).get("revision") or 0)
+                if revision:
+                    gate_revisions.append(revision)
+                return await original_gate(
+                    gate_db,
+                    gate_group_id,
+                    version_already_advanced=version_already_advanced,
+                    focus_payload_override=focus_payload_override,
+                )
+
+            monkeypatch.setattr(market_focus_service, "_gate_group", observe_gate)
+
+            revision_1_at = base + timedelta(minutes=2)
+            assert await persist_focus_context(
+                db,
+                context(1, revision_1_at),
+                fetched_at=revision_1_at,
+            ) is True
+
+            first_member_id = int((await (await db.execute(
+                """SELECT MIN(id) FROM news_event_members
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone())[0])
+            for _ in range(20):
+                state = await (await db.execute(
+                    """SELECT pending_focus_revision,pending_phase,
+                              pending_active_group_id,pending_group_member_cursor
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                if tuple(state) == (
+                    1,
+                    "refresh_validation",
+                    event_group_id,
+                    first_member_id,
+                ):
+                    break
+                await resume_focus_revalidation()
+            assert tuple(state) == (
+                1,
+                "refresh_validation",
+                event_group_id,
+                first_member_id,
+            )
+            partially_written = await (await db.execute(
+                """SELECT id,validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=? ORDER BY id""",
+                (event_group_id,),
+            )).fetchall()
+            assert [json.loads(row[1]) for row in partially_written] == [
+                ["NVDA"],
+                [],
+                [],
+                [],
+            ]
+
+            revision_2_at = base + timedelta(minutes=3)
+            assert await persist_focus_context(
+                db,
+                context(2, revision_2_at),
+                fetched_at=revision_2_at,
+            ) is True
+
+            for _ in range(80):
+                result = await resume_focus_revalidation()
+                state = await (await db.execute(
+                    """SELECT last_focus_revision,pending_run_key,
+                              pending_focus_revision,pending_phase
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                if tuple(state[:3]) == (2, None, None):
+                    break
+            assert tuple(state[:3]) == (2, None, None)
+            assert result["pending"] is False
+
+            members = await (await db.execute(
+                """SELECT validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=? ORDER BY id""",
+                (event_group_id,),
+            )).fetchall()
+            group = await (await db.execute(
+                """SELECT validated_tickers_json,status FROM news_event_groups
+                   WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            snapshots = await (await db.execute(
+                """SELECT focus_revision,as_of,state_json
+                   FROM focus_event_group_snapshots
+                   WHERE event_group_id=? ORDER BY focus_revision""",
+                (event_group_id,),
+            )).fetchall()
+            remaining_work = await (await db.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM focus_revalidation_changed_news),
+                     (SELECT COUNT(*) FROM focus_revalidation_groups)"""
+            )).fetchone()
+
+            assert [json.loads(row[0]) for row in members] == [
+                ["NVDA"],
+                ["NVDA"],
+                ["NVDA"],
+                ["NVDA"],
+            ]
+            assert json.loads(group[0]) == ["NVDA"]
+            assert group[1] == "PREPARED"
+            assert [int(row[0]) for row in snapshots] == [1, 2]
+            assert [row[1] for row in snapshots] == [
+                revision_1_at.isoformat(timespec="microseconds"),
+                revision_2_at.isoformat(timespec="microseconds"),
+            ]
+            assert [json.loads(row[2])["trusted_tickers"] for row in snapshots] == [
+                ["NVDA"],
+                ["NVDA"],
+            ]
+            assert 1 not in gate_revisions
+            assert set(gate_revisions) == {2}
+            assert tuple(remaining_work) == (0, 0)
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_only_current_prepared_group_version_is_counted_and_consumed(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            item = news(
+                1102,
+                source="finnhub/Reuters",
+                title="NVDA raises annual earnings guidance after record demand",
+            )
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+            first = await (await db.execute(
+                """SELECT prepared_revision,event_group_version
+                   FROM hotspot_preparation_sets WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            assert first is not None
+
+            await db.execute(
+                "UPDATE news_event_groups SET version=version+1 WHERE event_group_id=?",
+                (event_group_id,),
+            )
+            second_revision = await market_focus_service._gate_group(
+                db,
+                event_group_id,
+                version_already_advanced=True,
+            )
+            await db.commit()
+            assert second_revision is not None
+            current_version = int((await (await db.execute(
+                "SELECT version FROM news_event_groups WHERE event_group_id=?",
+                (event_group_id,),
+            )).fetchone())[0])
+            assert current_version == int(first[1]) + 1
+
+            status = await get_hotspot_status(db)
+            assert status["prepared_hot_count"] == 1
+            cycle = await create_market_focus_cycle(
+                db,
+                trigger_type="manual",
+                expected_prepared_revision=status["prepared_revision"],
+            )
+            assert cycle["event_group_count"] == 1
+            cycle_event = await (await db.execute(
+                """SELECT prepared_revision,event_group_version
+                   FROM market_focus_cycle_events WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(cycle_event) == (second_revision, current_version)
+            leased = await (await db.execute(
+                """SELECT prepared_revision,status FROM hotspot_preparation_sets
+                   WHERE event_group_id=? ORDER BY prepared_revision""",
+                (event_group_id,),
+            )).fetchall()
+            assert [tuple(row) for row in leased] == [
+                (int(first[0]), "PREPARED"),
+                (second_revision, "LEASED"),
+            ]
+        finally:
+            await db.close()
+
+        assert await run_market_focus_worker_once(
+            provider=CompletedCycleProvider(),
+            worker_id="current-prepared-version",
+        ) is True
+
+        db = await database.get_db()
+        try:
+            consumed = await (await db.execute(
+                """SELECT prepared_revision,status,consumed_cycle_id
+                   FROM hotspot_preparation_sets WHERE event_group_id=?
+                   ORDER BY prepared_revision""",
+                (event_group_id,),
+            )).fetchall()
+            watermark = await (await db.execute(
+                """SELECT last_consumed_revision
+                   FROM hotspot_preparation_state WHERE singleton_id=1"""
+            )).fetchone()
+            status = await get_hotspot_status(db)
+            assert [tuple(row[:2]) for row in consumed] == [
+                (int(first[0]), "PREPARED"),
+                (second_revision, "CONSUMED"),
+            ]
+            assert consumed[0][2] is None
+            assert consumed[1][2] == cycle["cycle_id"]
+            assert int(watermark[0]) == second_revision
+            assert status["prepared_hot_count"] == 0
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_gated_current_group_blocks_all_old_prepared_versions(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            item = news(
+                1103,
+                source="finnhub/Reuters",
+                title="NVDA raises annual earnings guidance after record demand",
+            )
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+            await db.execute(
+                "UPDATE news_event_groups SET version=version+1 WHERE event_group_id=?",
+                (event_group_id,),
+            )
+            assert await market_focus_service._gate_group(
+                db,
+                event_group_id,
+                version_already_advanced=True,
+            ) is not None
+            await db.execute(
+                "UPDATE news_event_groups SET status='GATED' WHERE event_group_id=?",
+                (event_group_id,),
+            )
+            await db.commit()
+
+            status = await get_hotspot_status(db)
+            assert status["prepared_hot_count"] == 0
+            assert status["manual_enabled"] is False
+            with pytest.raises(CycleConflict, match="no_new_hot_events"):
+                await create_market_focus_cycle(db, trigger_type="manual")
+
+            preparations = await (await db.execute(
+                """SELECT status,consumed_cycle_id FROM hotspot_preparation_sets
+                   WHERE event_group_id=? ORDER BY prepared_revision""",
+                (event_group_id,),
+            )).fetchall()
+            cycles = await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycles"
+            )).fetchone()
+            assert [tuple(row) for row in preparations] == [
+                ("PREPARED", None),
+                ("PREPARED", None),
+            ]
+            assert int(cycles[0]) == 0
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_ten_day_historical_focus_replay_records_snapshot_without_live_mutation(
+    isolated_market_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "focus_revalidation_max_seconds_per_run", 5.0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc) - timedelta(days=10)
+            item = news(
+                1104,
+                title="XYZ raises annual earnings guidance materially",
+            )
+            item["source_tickers"] = []
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+            initial_basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="ten-day-replay",
+            )
+            await record_ticker_mention(
+                db,
+                news_id=news_id,
+                ticker="XYZ",
+                association_method="exact_alias",
+                association_confidence=1.0,
+                source="alias_dictionary",
+                validation_status="unverified",
+                available_at=base + timedelta(seconds=30),
+                focus_revision=None,
+                universe_version="ten-day-replay",
+                validation_basis_hash=initial_basis,
+                reason_code="exact_alias",
+            )
+            await db.commit()
+
+            def context(
+                revision: int,
+                observed: datetime,
+                *,
+                include_symbol: bool,
+            ) -> FocusContext:
+                return FocusContext.model_validate({
+                    "schema_version": "option-pro-macrolens-focus-v2",
+                    "schema_sha256": FOCUS_SCHEMA_SHA256,
+                    "revision": revision,
+                    "as_of": observed,
+                    "data_through": observed,
+                    "market_session": "regular",
+                    "universe_version": "ten-day-replay",
+                    "symbols": ([{
+                        "ticker": "XYZ",
+                        "validation_status": "canonical",
+                        "universe_reasons": ["test"],
+                        "session_change_pct": 9.0,
+                        "rvol_time_of_day": 2.0,
+                        "breakout_state": "CONFIRMED",
+                        "as_of": observed,
+                        "data_through": observed,
+                        "data_quality": 1.0,
+                        "data_status": "active",
+                        "source_status": "active",
+                    }] if include_symbol else []),
+                    "major_market_symbols": [],
+                    "warnings": [],
+                })
+
+            revision_1_at = base + timedelta(minutes=1)
+            revision_2_at = base + timedelta(minutes=2)
+            revision_3_at = base + timedelta(minutes=3)
+            assert await persist_focus_context(
+                db,
+                context(1, revision_1_at, include_symbol=True),
+                fetched_at=revision_1_at,
+            ) is True
+            for _ in range(20):
+                await resume_focus_revalidation()
+                state = await (await db.execute(
+                    """SELECT last_focus_revision,pending_run_key
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                if tuple(state) == (1, None):
+                    break
+            assert tuple(state) == (1, None)
+
+            live_members_before = await (await db.execute(
+                """SELECT id,validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=? ORDER BY id""",
+                (event_group_id,),
+            )).fetchall()
+            live_group_before = await (await db.execute(
+                """SELECT version,status,validated_tickers_json,
+                          evidence_fingerprint,last_hot_score
+                   FROM news_event_groups WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            live_hotspots_before = await (await db.execute(
+                """SELECT prepared_revision,event_group_version,status,
+                          event_snapshot_json
+                   FROM hotspot_preparation_sets WHERE event_group_id=?
+                   ORDER BY prepared_revision""",
+                (event_group_id,),
+            )).fetchall()
+
+            monkeypatch.setattr(settings, "focus_revalidation_max_rows_per_run", 1)
+            monkeypatch.setattr(settings, "focus_revalidation_batch_size", 1)
+            assert await persist_focus_context(
+                db,
+                context(2, revision_2_at, include_symbol=False),
+                fetched_at=revision_2_at,
+            ) is True
+            assert await persist_focus_context(
+                db,
+                context(3, revision_3_at, include_symbol=True),
+                fetched_at=revision_3_at,
+            ) is True
+
+            for _ in range(40):
+                state = await (await db.execute(
+                    """SELECT last_focus_revision,pending_run_key,
+                              pending_focus_revision
+                       FROM focus_validation_state WHERE singleton_id=1"""
+                )).fetchone()
+                historical_snapshot = await (await db.execute(
+                    """SELECT state_json FROM focus_event_group_snapshots
+                       WHERE focus_revision=2 AND event_group_id=?""",
+                    (event_group_id,),
+                )).fetchone()
+                if int(state[0] or 0) >= 2 and historical_snapshot is not None:
+                    break
+                await resume_focus_revalidation()
+            assert int(state[0]) == 2
+            assert historical_snapshot is not None
+            historical_state = json.loads(historical_snapshot[0])
+            assert historical_state["as_of"] == revision_2_at.isoformat(
+                timespec="microseconds"
+            )
+            assert historical_state["trusted_tickers"] == []
+
+            live_members_after = await (await db.execute(
+                """SELECT id,validated_tickers_json FROM news_event_members
+                   WHERE event_group_id=? ORDER BY id""",
+                (event_group_id,),
+            )).fetchall()
+            live_group_after = await (await db.execute(
+                """SELECT version,status,validated_tickers_json,
+                          evidence_fingerprint,last_hot_score
+                   FROM news_event_groups WHERE event_group_id=?""",
+                (event_group_id,),
+            )).fetchone()
+            live_hotspots_after = await (await db.execute(
+                """SELECT prepared_revision,event_group_version,status,
+                          event_snapshot_json
+                   FROM hotspot_preparation_sets WHERE event_group_id=?
+                   ORDER BY prepared_revision""",
+                (event_group_id,),
+            )).fetchall()
+            assert [tuple(row) for row in live_members_after] == [
+                tuple(row) for row in live_members_before
+            ]
+            assert tuple(live_group_after) == tuple(live_group_before)
+            assert [tuple(row) for row in live_hotspots_after] == [
+                tuple(row) for row in live_hotspots_before
+            ]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_expired_focus_lease_without_takeover_cannot_self_renew_or_commit(
+    isolated_market_db,
+):
+    async def scenario():
+        stale = await database.get_db()
+        observer = await database.get_db()
+        try:
+            lease = await market_focus_service._acquire_focus_revalidation_lease(
+                stale
+            )
+            assert lease is not None
+            owner, fencing_token = lease
+            expired_at = "2000-01-01T00:00:00.000000+00:00"
+            await observer.execute(
+                """UPDATE focus_validation_state
+                   SET revalidation_lease_expires_at=?
+                   WHERE singleton_id=1 AND revalidation_lease_owner=?
+                     AND revalidation_fencing_token=?""",
+                (expired_at, owner, fencing_token),
+            )
+            await observer.commit()
+
+            await stale.execute(
+                """UPDATE focus_validation_state SET pending_rows_scanned=777
+                   WHERE singleton_id=1"""
+            )
+            with pytest.raises(
+                market_focus_service.FocusRevalidationLeaseLost,
+                match="focus_revalidation_lease_lost",
+            ):
+                await market_focus_service._commit_focus_revalidation_batch(
+                    stale,
+                    owner=owner,
+                    fencing_token=fencing_token,
+                )
+
+            row = await (await observer.execute(
+                """SELECT pending_rows_scanned,revalidation_lease_owner,
+                          revalidation_lease_expires_at,revalidation_fencing_token
+                   FROM focus_validation_state WHERE singleton_id=1"""
+            )).fetchone()
+            assert tuple(row) == (0, owner, expired_at, fencing_token)
+        finally:
+            await stale.close()
+            await observer.close()
+
+    run(scenario())
+
+
+def test_event_group_as_of_excludes_member_published_after_cutoff(
+    isolated_market_db,
+):
+    async def scenario():
+        db = await database.get_db()
+        try:
+            base = datetime.now(timezone.utc) - timedelta(minutes=10)
+            cutoff = base + timedelta(minutes=2)
+            item = news(
+                1105,
+                source="finnhub/Reuters",
+                title="NVDA raises annual earnings guidance materially",
+            )
+            item["published_at"] = item["fetched_at"] = base.isoformat()
+            news_id = await database.insert_news_item(db, item)
+            event_group_id = await ingest_event_evidence(
+                db,
+                item,
+                news_id=news_id,
+            )
+
+            future_fingerprint = hashlib.sha256(
+                b"future-published-member"
+            ).hexdigest()
+            cursor = await db.execute(
+                """INSERT INTO news_event_members
+                   (event_group_id,news_id,source,normalized_url,title,
+                    published_at,fetched_at,source_tickers_json,
+                    validated_tickers_json,publisher_identity,event_type,
+                    evidence_fingerprint,content_hash,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_group_id,
+                    news_id,
+                    "massive/Bloomberg",
+                    "https://example.test/future-published/member",
+                    item["title"],
+                    (cutoff + timedelta(minutes=1)).isoformat(),
+                    (cutoff - timedelta(minutes=1)).isoformat(),
+                    '["NVDA"]',
+                    '["NVDA"]',
+                    "bloomberg",
+                    "earnings_guidance",
+                    future_fingerprint,
+                    future_fingerprint,
+                    (cutoff - timedelta(minutes=1)).isoformat(),
+                ),
+            )
+            future_member_id = int(cursor.lastrowid)
+            await db.commit()
+
+            state = await event_group_state_as_of(
+                db,
+                event_group_id,
+                cutoff,
+            )
+            assert future_member_id not in state["visible_member_ids"]
+            assert len(state["visible_member_ids"]) == 1
+            assert state["source_count"] == 1
+            assert state["publishers"] == ["reuters"]
+        finally:
+            await db.close()
 
     run(scenario())

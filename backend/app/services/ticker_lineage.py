@@ -12,6 +12,9 @@ VALIDATION_STATUSES = frozenset(
     {"canonical", "valid_external", "ambiguous", "invalid", "unverified"}
 )
 TRUSTED_VALIDATION_STATUSES = frozenset({"canonical", "valid_external"})
+NON_LLM_ASSOCIATION_METHODS = frozenset(
+    {"provider_tag", "company_endpoint", "exact_alias", "event_propagation"}
+)
 VALIDATION_RULES_VERSION = "ticker-validation-v1"
 
 
@@ -337,4 +340,108 @@ async def validation_as_of(
         "reason_code": str(row[5]),
         "legacy_backfill": bool(row[6]),
         "validation_basis_hash": str(row[7]),
+    }
+
+
+async def trusted_tickers_for_news_as_of(
+    db: aiosqlite.Connection,
+    *,
+    news_id: int,
+    as_of: datetime | str,
+) -> dict[str, Any]:
+    """Return the trusted point-in-time projection for one news item.
+
+    Non-model associations retain their own lineage. Model associations are
+    visible only from the newest analysis revision available at ``as_of``;
+    older model revisions remain queryable at their historical boundaries but
+    cannot leak into the current event projection.
+    """
+
+    cutoff = utc_text(as_of)
+    async with db.execute(
+        """SELECT id,revision,available_at
+           FROM analysis_revisions
+           WHERE news_id=? AND REPLACE(available_at,'Z','+00:00')<=?
+           ORDER BY REPLACE(available_at,'Z','+00:00') DESC,
+                    revision DESC,id DESC
+           LIMIT 1""",
+        (news_id, cutoff),
+    ) as cursor:
+        analysis_row = await cursor.fetchone()
+    latest_analysis_revision_id = int(analysis_row[0]) if analysis_row else None
+
+    async def visible_mentions(
+        *,
+        llm: bool,
+    ) -> list[dict[str, Any]]:
+        if llm and latest_analysis_revision_id is None:
+            return []
+        method_predicate = (
+            "m.association_method='llm_inference' AND m.analysis_revision_id=?"
+            if llm
+            else "m.association_method IN ('provider_tag','company_endpoint','exact_alias','event_propagation')"
+        )
+        params: list[Any] = [cutoff, news_id]
+        if llm:
+            params.append(latest_analysis_revision_id)
+        params.append(cutoff)
+        async with db.execute(
+            f"""SELECT m.id,m.ticker,m.association_method,m.association_confidence,
+                       m.analysis_revision_id,v.id,v.validation_status,v.available_at,
+                       v.focus_revision,v.universe_version,v.reason_code
+                FROM news_ticker_mentions m
+                LEFT JOIN ticker_validation_revisions v ON v.id=(
+                  SELECT latest.id FROM ticker_validation_revisions latest
+                  WHERE latest.mention_id=m.id
+                    AND REPLACE(latest.available_at,'Z','+00:00')<=?
+                  ORDER BY REPLACE(latest.available_at,'Z','+00:00') DESC,
+                           latest.id DESC LIMIT 1
+                )
+                WHERE m.news_id=? AND {method_predicate}
+                  AND REPLACE(m.created_at,'Z','+00:00')<=?
+                ORDER BY m.ticker,m.id""",
+            tuple(params),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "mention_id": int(row[0]),
+                "ticker": str(row[1]),
+                "association_method": str(row[2]),
+                "association_confidence": float(row[3]),
+                "analysis_revision_id": int(row[4]) if row[4] is not None else None,
+                "validation_revision_id": int(row[5]) if row[5] is not None else None,
+                "validation_status": str(row[6] or "unverified"),
+                "validated_at": str(row[7]) if row[7] is not None else None,
+                "focus_revision": int(row[8]) if row[8] is not None else None,
+                "universe_version": str(row[9]) if row[9] is not None else None,
+                "reason_code": str(row[10]) if row[10] is not None else None,
+                "projection_scope": "llm" if llm else "provider",
+            }
+            for row in rows
+        ]
+
+    provider_provenance = await visible_mentions(llm=False)
+    llm_provenance = await visible_mentions(llm=True)
+    provider_tickers = sorted(
+        {
+            row["ticker"]
+            for row in provider_provenance
+            if row["validation_status"] in TRUSTED_VALIDATION_STATUSES
+        }
+    )
+    llm_tickers = sorted(
+        {
+            row["ticker"]
+            for row in llm_provenance
+            if row["validation_status"] in TRUSTED_VALIDATION_STATUSES
+        }
+    )
+    return {
+        "as_of": cutoff,
+        "provider_tickers": provider_tickers,
+        "latest_analysis_revision_id": latest_analysis_revision_id,
+        "llm_tickers": llm_tickers,
+        "trusted_tickers": sorted(set(provider_tickers) | set(llm_tickers)),
+        "validation_provenance": provider_provenance + llm_provenance,
     }

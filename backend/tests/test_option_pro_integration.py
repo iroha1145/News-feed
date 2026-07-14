@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from app.config import Settings, settings
 from app.integrations.option_pro import router as integration_router
+from app.integrations.option_pro import repository as option_pro_repository
 from app.integrations.option_pro.auth import (
     IntegrationAPIError,
     calculate_signature,
@@ -2069,7 +2070,10 @@ def test_feed_drops_provider_tickers_that_violate_the_public_contract(isolated_i
                 "NOT A TICKER",
                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             ]
-            await database.insert_news_item(db, record)
+            news_id = await database.insert_news_item(db, record)
+            assert news_id is not None
+            await ingest_event_evidence(db, record, news_id=news_id)
+            await db.commit()
             items, _, _, _ = await query_feed(
                 db,
                 as_of=datetime.now(timezone.utc) + timedelta(seconds=1),
@@ -2093,6 +2097,87 @@ def test_feed_drops_provider_tickers_that_violate_the_public_contract(isolated_i
             )
             assert len(latest_items) == 1
             assert latest_items[0].source_tickers == ["AMD", "MSFT"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_feed_source_tickers_use_only_trusted_non_llm_projection(
+    isolated_integration_db,
+):
+    async def scenario():
+        db = await database.get_db()
+        try:
+            record = news_record(218)
+            record["source_tickers"] = ["XYZ"]
+            news_id = await database.insert_news_item(db, record)
+            assert news_id is not None
+            basis = build_validation_basis_hash(
+                canonical_symbols=set(),
+                external_symbols=set(),
+                universe_version="provider-projection-test",
+            )
+            mention = await record_ticker_mention(
+                db,
+                news_id=news_id,
+                ticker="XYZ",
+                association_method="exact_alias",
+                association_confidence=0.8,
+                source="alias_dictionary",
+                validation_status="unverified",
+                available_at=datetime.now(timezone.utc),
+                focus_revision=None,
+                universe_version="provider-projection-test",
+                validation_basis_hash=basis,
+                reason_code="fixture_unverified",
+            )
+            await db.commit()
+            first_as_of = datetime.now(timezone.utc) + timedelta(seconds=1)
+            untrusted, _, _, _ = await query_feed(
+                db,
+                as_of=first_as_of,
+                window_hours=24,
+                limit=20,
+                cursor=None,
+                source=None,
+                classification=None,
+                min_confidence=0,
+                min_abs_impact=0,
+                analysis_status=None,
+            )
+            assert untrusted[0].source_tickers == []
+
+            canonical_at = first_as_of + timedelta(seconds=1)
+            canonical_basis = build_validation_basis_hash(
+                canonical_symbols={"XYZ"},
+                external_symbols=set(),
+                universe_version="provider-projection-test",
+            )
+            await append_validation_revision(
+                db,
+                mention_id=int(mention["mention_id"]),
+                validation_status="canonical",
+                available_at=canonical_at,
+                focus_revision=1,
+                universe_version="provider-projection-test",
+                reason_code="fixture_canonical",
+                validation_basis_hash=canonical_basis,
+            )
+            await db.commit()
+            trusted, _, _, _ = await query_feed(
+                db,
+                as_of=canonical_at + timedelta(seconds=1),
+                window_hours=24,
+                limit=20,
+                cursor=None,
+                source=None,
+                classification=None,
+                min_confidence=0,
+                min_abs_impact=0,
+                analysis_status=None,
+            )
+            assert trusted[0].source_tickers == ["XYZ"]
         finally:
             await db.close()
 
@@ -2675,6 +2760,45 @@ def test_signed_latest_cursor_requires_original_explicit_updated_after(
         )
         assert changed_filter.status_code == 400
         assert changed_filter.json()["code"] == "invalid_cursor"
+
+
+def test_latest_cursor_keeps_first_page_retention_boundary_when_time_advances(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_read_secret", "test-read-secret")
+    observed = (
+        datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=1)
+    )
+    later = observed + timedelta(seconds=6)
+    call_times = iter((observed, later))
+    monkeypatch.setattr(option_pro_repository, "utc_now", lambda: next(call_times))
+
+    async def exercise():
+        db = await database.get_db()
+        try:
+            for index in range(3):
+                await database.insert_news_item(db, news_record(830 + index))
+            boundary = observed - timedelta(days=7)
+            first = await query_latest(
+                db,
+                updated_after=boundary,
+                limit=1,
+                cursor=None,
+            )
+            assert first[4] is True
+            assert first[3]
+            second = await query_latest(
+                db,
+                updated_after=boundary,
+                limit=1,
+                cursor=first[3],
+            )
+            assert second[0] == first[0]
+            assert second[1]
+        finally:
+            await db.close()
+
+    run(exercise())
 
 
 def test_canonical_path_discards_legacy_testclient_query_suffix():

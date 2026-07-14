@@ -33,6 +33,7 @@ from app.services.ticker_lineage import (
     append_validation_revision,
     build_validation_basis_hash,
     record_ticker_mention,
+    trusted_tickers_for_news_as_of,
     utc_text as validation_utc_text,
 )
 from app.utils.dedup import normalize_title, normalize_url, similar_titles
@@ -94,6 +95,7 @@ CATALYST_CONTEXT_FORMULA_VERSION = "catalyst-context-v2"
 EVENT_SUPPORT_WEIGHT_VERSION = "event-support-dedup-v1"
 TICKER_VALIDATION_RULES_VERSION = VALIDATION_RULES_VERSION
 BREAKOUT_CONFIRMATION_MAP_VERSION = "breakout-confirmation-context-v1"
+FOCUS_REVALIDATION_HANDOFF_RUN_KEY = "__current_projection_handoff__"
 BREAKOUT_CONFIRMATION_POINTS: dict[str, float] = {
     "DISCOVERED": 0.0,
     "WATCHING": 0.0,
@@ -624,6 +626,130 @@ async def event_group_evidence_state(
     }
 
 
+async def event_group_state_as_of(
+    db: aiosqlite.Connection,
+    event_group_id: str,
+    as_of: datetime | str,
+) -> dict[str, Any]:
+    """Build an event-group snapshot without changing the live projection."""
+
+    cutoff = validation_utc_text(as_of)
+    async with db.execute(
+        """SELECT id,news_id,publisher_identity,evidence_fingerprint,event_type,
+                  source_tickers_json
+           FROM news_event_members
+           WHERE event_group_id=?
+             AND REPLACE(fetched_at,'Z','+00:00')<=?
+             AND REPLACE(COALESCE(published_at,fetched_at),'Z','+00:00')<=?
+           ORDER BY id""",
+        (event_group_id, cutoff, cutoff),
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    projection_by_news: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if row[1] is None:
+            continue
+        news_id = int(row[1])
+        if news_id not in projection_by_news:
+            projection_by_news[news_id] = await trusted_tickers_for_news_as_of(
+                db,
+                news_id=news_id,
+                as_of=cutoff,
+            )
+
+    representative_by_fact: dict[str, str] = {}
+    fact_keys: set[str] = set()
+    fact_fingerprints: set[str] = set()
+    event_type = "other"
+    source_tickers: set[str] = set()
+    trusted_tickers: set[str] = set()
+    for row in rows:
+        member_id = int(row[0])
+        fact_fingerprint = str(row[3] or "")
+        fact_key = fact_fingerprint or f"legacy-member:{member_id}"
+        fact_keys.add(fact_key)
+        if fact_fingerprint:
+            fact_fingerprints.add(fact_fingerprint)
+        publisher = normalize_source_identity(str(row[2] or "unknown"))
+        if publisher != "unknown" and fact_key not in representative_by_fact:
+            representative_by_fact[fact_key] = publisher
+        member_event_type = str(row[4] or "other")
+        if member_event_type != "other":
+            event_type = member_event_type
+        source_tickers.update(
+            ticker
+            for value in _json_list(row[5])
+            if (ticker := normalize_ticker(value))
+        )
+        if row[1] is not None:
+            trusted_tickers.update(
+                projection_by_news[int(row[1])]["trusted_tickers"]
+            )
+
+    publishers = sorted(set(representative_by_fact.values()))
+    trusted = sorted(trusted_tickers)
+    facts = sorted(fact_fingerprints)
+    aggregate = hashlib.sha256(
+        json.dumps(
+            {
+                "facts": facts,
+                "event_type": event_type,
+                "validated_tickers": trusted,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    return {
+        "as_of": cutoff,
+        "visible_member_ids": [int(row[0]) for row in rows],
+        "publishers": publishers,
+        "source_count": len(publishers),
+        "independent_source_count": len(publishers),
+        "independent_fact_count": len(fact_keys),
+        "source_tickers": sorted(source_tickers),
+        "trusted_tickers": trusted,
+        "validated_tickers": trusted,
+        "event_type": event_type,
+        "fact_fingerprints": facts,
+        "evidence_fingerprint": aggregate,
+    }
+
+
+async def _record_focus_event_group_snapshot(
+    db: aiosqlite.Connection,
+    *,
+    focus_revision: int,
+    event_group_id: str,
+    as_of: str,
+    created_at: str,
+) -> dict[str, Any]:
+    """Persist one immutable point-in-time group state for research replay."""
+
+    state = await event_group_state_as_of(db, event_group_id, as_of)
+    await db.execute(
+        """INSERT OR IGNORE INTO focus_event_group_snapshots
+           (focus_revision,event_group_id,as_of,state_json,
+            evidence_fingerprint,created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (
+            focus_revision,
+            event_group_id,
+            state["as_of"],
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            state["evidence_fingerprint"],
+            created_at,
+        ),
+    )
+    return state
+
+
 # Kept as an internal alias for older imports while callers migrate to the
 # clearer publisher-oriented name.
 _source_identity = normalize_source_identity
@@ -840,13 +966,30 @@ async def _gate_group(
     group["last_hot_score"] = score.score
     if not qualifies:
         return None
+    projection_as_of = validation_utc_text()
     async with db.execute(
         """SELECT m.ticker,MAX(m.association_confidence)
            FROM news_ticker_mentions m
            JOIN news_event_members em ON em.news_id=m.news_id
-           WHERE em.event_group_id=? AND m.validation_status IN ('canonical','valid_external')
+           WHERE em.event_group_id=?
+             AND m.current_validation_status IN ('canonical','valid_external')
+             AND REPLACE(m.created_at,'Z','+00:00')<=?
+             AND EXISTS (
+               SELECT 1 FROM json_each(em.validated_tickers_json) visible
+               WHERE visible.value=m.ticker
+             )
+             AND (
+               m.association_method<>'llm_inference'
+               OR m.analysis_revision_id=(
+                 SELECT r.id FROM analysis_revisions r
+                 WHERE r.news_id=m.news_id
+                   AND REPLACE(r.available_at,'Z','+00:00')<=?
+                 ORDER BY REPLACE(r.available_at,'Z','+00:00') DESC,
+                          r.revision DESC,r.id DESC LIMIT 1
+               )
+             )
            GROUP BY m.ticker""",
-        (event_group_id,),
+        (event_group_id, projection_as_of, projection_as_of),
     ) as confidence_cursor:
         ticker_confidence = {
             str(row[0]): max(0.0, min(1.0, float(row[1])))
@@ -1251,21 +1394,185 @@ async def _commit_focus_revalidation_batch(
         60.0,
         float(settings.focus_revalidation_max_seconds_per_run) * 3.0,
     )
-    expires_at = validation_utc_text(
-        utc_now() + timedelta(seconds=lease_seconds)
-    )
+    observed = utc_now()
+    observed_text = validation_utc_text(observed)
+    expires_at = validation_utc_text(observed + timedelta(seconds=lease_seconds))
     async with db.execute(
         """UPDATE focus_validation_state SET revalidation_lease_expires_at=?
            WHERE singleton_id=1 AND revalidation_lease_owner=?
              AND revalidation_fencing_token=?
+             AND REPLACE(revalidation_lease_expires_at,'Z','+00:00')>?
            RETURNING revalidation_fencing_token""",
-        (expires_at, owner, fencing_token),
+        (expires_at, owner, fencing_token, observed_text),
     ) as cursor:
         renewed = await cursor.fetchone()
     if renewed is None:
         await db.rollback()
         raise FocusRevalidationLeaseLost("focus_revalidation_lease_lost")
     await db.commit()
+
+
+async def _move_focus_revalidation_groups(
+    db: aiosqlite.Connection,
+    *,
+    source_run_key: str,
+    target_run_key: str,
+) -> None:
+    """Move dirty live groups between durable runs without losing gate work."""
+
+    if not source_run_key or source_run_key == target_run_key:
+        return
+    await db.execute(
+        """INSERT OR IGNORE INTO focus_revalidation_groups
+           (run_key,event_group_id,version_advanced)
+           SELECT ?,event_group_id,version_advanced
+           FROM focus_revalidation_groups WHERE run_key=?""",
+        (target_run_key, source_run_key),
+    )
+    await db.execute(
+        """UPDATE focus_revalidation_groups SET version_advanced=1
+           WHERE run_key=? AND event_group_id IN (
+             SELECT event_group_id FROM focus_revalidation_groups
+             WHERE run_key=? AND version_advanced=1
+           )""",
+        (target_run_key, source_run_key),
+    )
+    await db.execute(
+        "DELETE FROM focus_revalidation_groups WHERE run_key=?",
+        (source_run_key,),
+    )
+
+
+async def _move_focus_revalidation_changed_news(
+    db: aiosqlite.Connection,
+    *,
+    source_run_key: str,
+    target_run_key: str,
+) -> None:
+    """Move unfinished member reconciliation to the next focus owner."""
+
+    if not source_run_key or source_run_key == target_run_key:
+        return
+    await db.execute(
+        """INSERT OR IGNORE INTO focus_revalidation_changed_news(run_key,news_id)
+           SELECT ?,news_id FROM focus_revalidation_changed_news
+           WHERE run_key=?""",
+        (target_run_key, source_run_key),
+    )
+    await db.execute(
+        "DELETE FROM focus_revalidation_changed_news WHERE run_key=?",
+        (source_run_key,),
+    )
+
+
+async def _claim_current_event_projection_batch(
+    db: aiosqlite.Connection,
+    *,
+    target_focus_revision: int,
+    owner: str,
+    fencing_token: int,
+) -> bool:
+    """Fence a live-projection batch and verify its focus revision atomically."""
+
+    observed_text = validation_utc_text()
+    async with db.execute(
+        """UPDATE focus_validation_state
+           SET pending_focus_revision=pending_focus_revision
+           WHERE singleton_id=1 AND pending_focus_revision=?
+             AND revalidation_lease_owner=? AND revalidation_fencing_token=?
+             AND REPLACE(revalidation_lease_expires_at,'Z','+00:00')>?
+             AND ?=(SELECT COALESCE(MAX(revision),0)
+                    FROM focus_context_snapshots)
+           RETURNING singleton_id""",
+        (
+            target_focus_revision,
+            owner,
+            fencing_token,
+            observed_text,
+            target_focus_revision,
+        ),
+    ) as cursor:
+        claimed = await cursor.fetchone()
+    return claimed is not None
+
+
+async def reconcile_current_event_projection(
+    db: aiosqlite.Connection,
+    *,
+    target_focus_revision: int,
+    run_key: str,
+    event_group_id: str,
+    prior_fingerprint: str,
+    publishers: list[str],
+    source_tickers: list[str],
+    trusted_tickers: list[str],
+    event_type: str,
+    fact_fingerprints: list[str],
+    checked_at: str,
+    lease_owner: str,
+    fencing_token: int,
+) -> tuple[Literal["published", "generation_changed", "superseded_focus"], bool]:
+    """Atomically publish one recovered live event projection.
+
+    Member rows are accumulated in bounded, persisted cursor slices by the
+    caller.  This final publication step rechecks both the newest focus
+    revision and the lease fence in the same write transaction.  The event
+    fingerprint is also a compare-and-swap generation: a newer analysis may
+    refresh the live group between bounded member slices, and an older
+    accumulator must never overwrite that newer projection.
+    """
+
+    if not await _claim_current_event_projection_batch(
+        db,
+        target_focus_revision=target_focus_revision,
+        owner=lease_owner,
+        fencing_token=fencing_token,
+    ):
+        return "superseded_focus", False
+    evidence_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "facts": sorted(fact_fingerprints),
+                "event_type": event_type,
+                "validated_tickers": sorted(trusted_tickers),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    material = bool(
+        prior_fingerprint and prior_fingerprint != evidence_fingerprint
+    )
+    async with db.execute(
+        """UPDATE news_event_groups SET source_count=?,source_names_json=?,
+           source_tickers_json=?,validated_tickers_json=?,event_type=?,
+           evidence_fingerprint=?,version=version+?,updated_at=?
+           WHERE event_group_id=? AND evidence_fingerprint=?
+           RETURNING version""",
+        (
+            len(publishers),
+            json.dumps(sorted(publishers)),
+            json.dumps(sorted(source_tickers)),
+            json.dumps(sorted(trusted_tickers)),
+            event_type,
+            evidence_fingerprint,
+            int(material),
+            checked_at,
+            event_group_id,
+            prior_fingerprint,
+        ),
+    ) as cursor:
+        updated = await cursor.fetchone()
+    if updated is None:
+        return "generation_changed", False
+    await db.execute(
+        """INSERT INTO focus_revalidation_groups
+           (run_key,event_group_id,version_advanced) VALUES (?,?,?)
+           ON CONFLICT(run_key,event_group_id) DO UPDATE SET
+             version_advanced=MAX(version_advanced,excluded.version_advanced)""",
+        (run_key, event_group_id, int(material)),
+    )
+    return "published", material
 
 
 async def revalidate_events_for_focus_context(
@@ -1468,17 +1775,29 @@ async def _revalidate_events_for_focus_context_locked(
     if str(state.get("pending_run_key") or "") != run_key:
         old_run_key = str(state.get("pending_run_key") or "")
         if old_run_key:
-            await db.execute(
-                "DELETE FROM focus_revalidation_changed_news WHERE run_key=?",
-                (old_run_key,),
+            await _move_focus_revalidation_changed_news(
+                db,
+                source_run_key=old_run_key,
+                target_run_key=FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
             )
-            await db.execute(
-                "DELETE FROM focus_revalidation_groups WHERE run_key=?",
-                (old_run_key,),
+            await _move_focus_revalidation_groups(
+                db,
+                source_run_key=old_run_key,
+                target_run_key=FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
             )
+        async with db.execute(
+            """SELECT EXISTS(
+                 SELECT 1 FROM focus_revalidation_changed_news WHERE run_key=?
+               )""",
+            (FOCUS_REVALIDATION_HANDOFF_RUN_KEY,),
+        ) as cursor:
+            has_projection_handoff = bool((await cursor.fetchone())[0])
         phase = (
             "mentions"
-            if basis_changed and (rules_changed or changed_validation_tickers or universe_changed)
+            if basis_changed
+            and (rules_changed or changed_validation_tickers or universe_changed)
+            else "refresh_validation"
+            if has_projection_handoff
             else "collect_market"
         )
         async with db.execute(
@@ -1487,6 +1806,16 @@ async def _revalidate_events_for_focus_context_locked(
             (revision_available_at,),
         ) as cursor:
             pending_mention_max_id = int((await cursor.fetchone())[0] or 0)
+        await _move_focus_revalidation_groups(
+            db,
+            source_run_key=FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
+            target_run_key=run_key,
+        )
+        await _move_focus_revalidation_changed_news(
+            db,
+            source_run_key=FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
+            target_run_key=run_key,
+        )
         await db.execute(
             """UPDATE focus_validation_state SET
                  pending_run_key=?,pending_focus_revision=?,
@@ -1587,13 +1916,64 @@ async def _revalidate_events_for_focus_context_locked(
     deadline = slice_started + settings.focus_revalidation_max_seconds_per_run
     processed_rows = 0
     regated_this_slice = 0
-    recent_cutoff = utc_text(utc_now() - timedelta(hours=72))
+    revision_boundary = parse_utc(revision_available_at) or utc_now()
+    recent_cutoff = utc_text(revision_boundary - timedelta(hours=72))
 
     def budget_available() -> bool:
         return processed_rows < max_rows and time.monotonic() < deadline
 
     while budget_available():
         limit = min(batch_size, max_rows - processed_rows)
+        if phase in {"refresh_validation", "collect_market", "regate"}:
+            current_projection_allowed = await _claim_current_event_projection_batch(
+                db,
+                target_focus_revision=focus_revision,
+                owner=lease_owner,
+                fencing_token=fencing_token,
+            )
+            if not current_projection_allowed:
+                # The historical validation rows remain useful, but a newer
+                # focus snapshot now owns every live member/group/hotspot write.
+                await _move_focus_revalidation_groups(
+                    db,
+                    source_run_key=run_key,
+                    target_run_key=FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
+                )
+                if phase == "refresh_validation":
+                    if active_group_id:
+                        group_cursor = active_group_id
+                    next_phase = "refresh_validation"
+                else:
+                    await _move_focus_revalidation_changed_news(
+                        db,
+                        source_run_key=run_key,
+                        target_run_key=FOCUS_REVALIDATION_HANDOFF_RUN_KEY,
+                    )
+                    next_phase = "regate"
+                    group_cursor = ""
+                phase = next_phase
+                active_group_id = ""
+                group_member_cursor = 0
+                group_fact_publishers = {}
+                group_fact_fingerprints = set()
+                group_event_type = "other"
+                group_validated_tickers = set()
+                group_source_tickers = set()
+                group_prior_fingerprint = ""
+                await db.execute(
+                    """UPDATE focus_validation_state SET pending_phase=?,
+                       pending_group_cursor=?,pending_active_group_id='',
+                       pending_group_member_cursor=0,
+                       pending_group_fact_publishers_json='{}',
+                       pending_group_fact_fingerprints_json='[]',
+                       pending_group_event_type='other',
+                       pending_group_validated_tickers_json='[]',
+                       pending_group_source_tickers_json='[]',
+                       pending_group_prior_fingerprint=''
+                       WHERE singleton_id=1""",
+                    (phase, group_cursor),
+                )
+                await commit_batch()
         if phase == "mentions":
             predicates: list[str] = []
             predicate_params: list[Any] = []
@@ -1650,19 +2030,15 @@ async def _revalidate_events_for_focus_context_locked(
 
             news_ids = sorted({int(row[1]) for row in mention_rows})
             stable_by_news: dict[int, set[str]] = {news_id: set() for news_id in news_ids}
-            if news_ids:
-                placeholders = ",".join("?" for _ in news_ids)
-                async with db.execute(
-                    f"""SELECT news_id,ticker FROM news_ticker_mentions
-                         WHERE news_id IN ({placeholders})
-                           AND association_method IN ('provider_tag','company_endpoint')
-                           AND REPLACE(created_at,'Z','+00:00')<=?""",
-                    (*news_ids, revision_available_at),
-                ) as cursor:
-                    for trusted_row in await cursor.fetchall():
-                        trusted = normalize_ticker(trusted_row[1])
-                        if trusted:
-                            stable_by_news[int(trusted_row[0])].add(trusted)
+            for news_id in news_ids:
+                point_in_time_projection = await trusted_tickers_for_news_as_of(
+                    db,
+                    news_id=news_id,
+                    as_of=revision_available_at,
+                )
+                stable_by_news[news_id].update(
+                    point_in_time_projection["provider_tickers"]
+                )
 
             scanned_now = changed_now = revisions_now = 0
             changed_news_ids: set[int] = set()
@@ -1731,15 +2107,14 @@ async def _revalidate_events_for_focus_context_locked(
                         """UPDATE analysis_stock_impacts SET validation_status=?,
                            validated_at=CASE WHEN ?=1 THEN COALESCE(validated_at,?) ELSE validated_at END,
                            focus_revision=?,universe_version=?
-                           WHERE news_id=? AND ticker=?""",
+                           WHERE mention_id=?""",
                         (
                             current_status,
                             is_trusted,
                             current_state.get("validated_at"),
                             current_state.get("focus_revision"),
                             current_state.get("universe_version"),
-                            news_id,
-                            ticker,
+                            mention_id,
                         ),
                     )
                 if status_changed:
@@ -1837,7 +2212,33 @@ async def _revalidate_events_for_focus_context_locked(
                     )
                     await commit_batch()
                     continue
-                active_group_id = str(group_row[0])
+                historical_group_id = str(group_row[0])
+                await _record_focus_event_group_snapshot(
+                    db,
+                    focus_revision=focus_revision,
+                    event_group_id=historical_group_id,
+                    as_of=revision_available_at,
+                    created_at=checked_at,
+                )
+                if not current_projection_allowed:
+                    group_cursor = historical_group_id
+                    processed_rows += 1
+                    await db.execute(
+                        """UPDATE focus_validation_state SET
+                           pending_group_cursor=?,pending_active_group_id='',
+                           pending_group_member_cursor=0,
+                           pending_group_fact_publishers_json='{}',
+                           pending_group_fact_fingerprints_json='[]',
+                           pending_group_event_type='other',
+                           pending_group_validated_tickers_json='[]',
+                           pending_group_source_tickers_json='[]',
+                           pending_group_prior_fingerprint=''
+                           WHERE singleton_id=1""",
+                        (group_cursor,),
+                    )
+                    await commit_batch()
+                    continue
+                active_group_id = historical_group_id
                 group_member_cursor = 0
                 group_fact_publishers = {}
                 group_fact_fingerprints = set()
@@ -1874,6 +2275,10 @@ async def _revalidate_events_for_focus_context_locked(
             ) as cursor:
                 members = await cursor.fetchall()
             if members:
+                projection_boundary = parse_utc(revision_available_at) or utc_now()
+                projection_as_of = validation_utc_text(
+                    max(utc_now(), projection_boundary)
+                )
                 completed_batch = True
                 for member in members:
                     if not budget_available():
@@ -1881,64 +2286,40 @@ async def _revalidate_events_for_focus_context_locked(
                         break
                     member_id = int(member[0])
                     news_id = int(member[1]) if member[1] is not None else None
-                    member_visible = (
-                        validation_utc_text(str(member[6]))
-                        <= revision_available_at
-                    )
                     validated: list[str] = []
-                    if news_id is not None and member_visible:
-                        async with db.execute(
-                            """SELECT DISTINCT m.ticker
-                               FROM news_ticker_mentions m
-                               JOIN ticker_validation_revisions v ON v.id=(
-                                 SELECT latest.id
-                                 FROM ticker_validation_revisions latest
-                                 WHERE latest.mention_id=m.id
-                                   AND latest.available_at<=?
-                                 ORDER BY latest.available_at DESC,latest.id DESC
-                                 LIMIT 1
-                               )
-                               WHERE m.news_id=?
-                                 AND REPLACE(m.created_at,'Z','+00:00')<=?
-                                 AND v.validation_status IN (
-                                   'canonical','valid_external'
-                                 )
-                               ORDER BY m.ticker""",
-                            (
-                                revision_available_at,
-                                news_id,
-                                revision_available_at,
-                            ),
-                        ) as cursor:
-                            validated = [
-                                str(value[0]) for value in await cursor.fetchall()
-                            ]
+                    if news_id is not None:
+                        current_projection = await trusted_tickers_for_news_as_of(
+                            db,
+                            news_id=news_id,
+                            as_of=projection_as_of,
+                        )
+                        validated = list(current_projection["trusted_tickers"])
                     await db.execute(
-                        "UPDATE news_event_members SET validated_tickers_json=? WHERE id=?",
-                        (json.dumps(validated), member_id),
+                        """UPDATE news_event_members SET validated_tickers_json=?
+                           WHERE id=? AND validated_tickers_json<>?""",
+                        (json.dumps(validated), member_id, json.dumps(validated)),
                     )
-                    if member_visible:
-                        fact_fingerprint = str(member[3] or "")
-                        fact_key = fact_fingerprint or f"legacy-member:{member_id}"
-                        publisher = normalize_source_identity(
-                            str(member[2] or "unknown")
-                        )
-                        if (
-                            publisher != "unknown"
-                            and fact_key not in group_fact_publishers
-                        ):
-                            group_fact_publishers[fact_key] = publisher
-                        if fact_fingerprint:
-                            group_fact_fingerprints.add(fact_fingerprint)
-                        member_event_type = str(member[4] or "other")
-                        if member_event_type != "other":
-                            group_event_type = member_event_type
-                        group_validated_tickers.update(validated)
-                        group_source_tickers.update(
-                            ticker
-                            for value in _json_list(member[5])
-                            if (ticker := normalize_ticker(value))
-                        )
+                    fact_fingerprint = str(member[3] or "")
+                    fact_key = fact_fingerprint or f"legacy-member:{member_id}"
+                    publisher = normalize_source_identity(
+                        str(member[2] or "unknown")
+                    )
+                    if (
+                        publisher != "unknown"
+                        and fact_key not in group_fact_publishers
+                    ):
+                        group_fact_publishers[fact_key] = publisher
+                    if fact_fingerprint:
+                        group_fact_fingerprints.add(fact_fingerprint)
+                    member_event_type = str(member[4] or "other")
+                    if member_event_type != "other":
+                        group_event_type = member_event_type
+                    group_validated_tickers.update(validated)
+                    group_source_tickers.update(
+                        ticker
+                        for value in _json_list(member[5])
+                        if (ticker := normalize_ticker(value))
+                    )
                     group_member_cursor = member_id
                     processed_rows += 1
                 await db.execute(
@@ -1964,53 +2345,68 @@ async def _revalidate_events_for_focus_context_locked(
                     continue
                 continue
 
-            # The cursor exhausted the point-in-time member set.  Finalization
-            # touches a constant number of rows; all member work is already
-            # committed and resumable.
+            # The current-member cursor is exhausted. Final publication touches
+            # a constant number of rows; all member work is committed and
+            # resumable, and the helper fences this live write once more.
             publishers = sorted(set(group_fact_publishers.values()))
             validated_tickers = sorted(group_validated_tickers)
             source_tickers = sorted(group_source_tickers)
-            evidence_fingerprint = hashlib.sha256(
-                json.dumps(
-                    {
-                        "facts": sorted(group_fact_fingerprints),
-                        "event_type": group_event_type,
-                        "validated_tickers": validated_tickers,
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode()
-            ).hexdigest()
-            material = bool(
-                group_prior_fingerprint
-                and group_prior_fingerprint != evidence_fingerprint
+            publish_status, _ = await reconcile_current_event_projection(
+                db,
+                target_focus_revision=focus_revision,
+                run_key=run_key,
+                event_group_id=active_group_id,
+                prior_fingerprint=group_prior_fingerprint,
+                publishers=publishers,
+                source_tickers=source_tickers,
+                trusted_tickers=validated_tickers,
+                event_type=group_event_type,
+                fact_fingerprints=sorted(group_fact_fingerprints),
+                checked_at=checked_at,
+                lease_owner=lease_owner,
+                fencing_token=fencing_token,
             )
-            await db.execute(
-                """UPDATE news_event_groups SET source_count=?,source_names_json=?,
-                   source_tickers_json=?,validated_tickers_json=?,event_type=?,
-                   evidence_fingerprint=?,version=version+?,updated_at=?
-                   WHERE event_group_id=?""",
-                (
-                    len(publishers),
-                    json.dumps(publishers),
-                    json.dumps(source_tickers),
-                    json.dumps(validated_tickers),
-                    group_event_type,
-                    evidence_fingerprint,
-                    int(material),
-                    checked_at,
-                    active_group_id,
-                ),
-            )
-            await db.execute(
-                """INSERT INTO focus_revalidation_groups
-                   (run_key,event_group_id,version_advanced) VALUES (?,?,?)
-                   ON CONFLICT(run_key,event_group_id) DO UPDATE SET
-                     version_advanced=MAX(
-                       version_advanced,excluded.version_advanced
-                     )""",
-                (run_key, active_group_id, int(material)),
-            )
+            if publish_status == "superseded_focus":
+                await db.rollback()
+                raise FocusRevalidationLeaseLost("focus_revalidation_lease_lost")
+            if publish_status == "generation_changed":
+                async with db.execute(
+                    """SELECT evidence_fingerprint FROM news_event_groups
+                       WHERE event_group_id=?""",
+                    (active_group_id,),
+                ) as cursor:
+                    current_group = await cursor.fetchone()
+                if current_group is None:
+                    group_cursor = active_group_id
+                    active_group_id = ""
+                    group_prior_fingerprint = ""
+                else:
+                    group_prior_fingerprint = str(current_group[0] or "")
+                group_member_cursor = 0
+                group_fact_publishers = {}
+                group_fact_fingerprints = set()
+                group_event_type = "other"
+                group_validated_tickers = set()
+                group_source_tickers = set()
+                await db.execute(
+                    """UPDATE focus_validation_state SET
+                       pending_group_cursor=?,pending_active_group_id=?,
+                       pending_group_member_cursor=0,
+                       pending_group_fact_publishers_json='{}',
+                       pending_group_fact_fingerprints_json='[]',
+                       pending_group_event_type='other',
+                       pending_group_validated_tickers_json='[]',
+                       pending_group_source_tickers_json='[]',
+                       pending_group_prior_fingerprint=?
+                       WHERE singleton_id=1""",
+                    (
+                        group_cursor,
+                        active_group_id,
+                        group_prior_fingerprint,
+                    ),
+                )
+                await commit_batch()
+                continue
             group_cursor = active_group_id
             active_group_id = ""
             group_member_cursor = 0
@@ -2223,7 +2619,7 @@ async def refresh_event_groups_for_news(
     db: aiosqlite.Connection,
     news_id: int,
 ) -> int:
-    """Apply newly trusted ticker associations to existing immutable event versions."""
+    """Apply the newest trusted projection to live event caches idempotently."""
 
     async with db.execute(
         """SELECT DISTINCT event_group_id FROM news_event_members
@@ -2233,29 +2629,49 @@ async def refresh_event_groups_for_news(
         group_ids = [str(row[0]) for row in await cursor.fetchall()]
     if not group_ids:
         return 0
-    async with db.execute(
-        """SELECT DISTINCT ticker FROM news_ticker_mentions
-           WHERE news_id=? AND validation_status IN ('canonical','valid_external')""",
-        (news_id,),
-    ) as cursor:
-        validated = sorted(str(row[0]) for row in await cursor.fetchall())
-    await db.execute(
-        "UPDATE news_event_members SET validated_tickers_json=? WHERE news_id=?",
-        (json.dumps(validated), news_id),
+    now = validation_utc_text()
+    projection = await trusted_tickers_for_news_as_of(
+        db,
+        news_id=news_id,
+        as_of=now,
     )
-    now = utc_text()
+    validated = list(projection["trusted_tickers"])
+    encoded_validated = json.dumps(validated)
+    await db.execute(
+        """UPDATE news_event_members SET validated_tickers_json=?
+           WHERE news_id=? AND validated_tickers_json<>?""",
+        (encoded_validated, news_id, encoded_validated),
+    )
     changed = 0
     for event_group_id in group_ids:
         async with db.execute(
-            "SELECT evidence_fingerprint FROM news_event_groups WHERE event_group_id=?",
+            """SELECT source_count,source_names_json,source_tickers_json,
+                      validated_tickers_json,event_type,evidence_fingerprint
+               FROM news_event_groups WHERE event_group_id=?""",
             (event_group_id,),
         ) as cursor:
             previous = await cursor.fetchone()
         state = await event_group_evidence_state(db, event_group_id)
+        next_source_names = json.dumps(state["publishers"])
+        next_source_tickers = json.dumps(state["source_tickers"])
+        next_validated_tickers = json.dumps(state["validated_tickers"])
+        projection_changed = bool(
+            previous
+            and (
+                int(previous[0]) != int(state["independent_source_count"])
+                or str(previous[1]) != next_source_names
+                or str(previous[2]) != next_source_tickers
+                or str(previous[3]) != next_validated_tickers
+                or str(previous[4]) != str(state["event_type"])
+                or str(previous[5]) != str(state["evidence_fingerprint"])
+            )
+        )
+        if previous is not None and not projection_changed:
+            continue
         material = bool(
             previous
-            and previous[0]
-            and str(previous[0]) != state["evidence_fingerprint"]
+            and previous[5]
+            and str(previous[5]) != state["evidence_fingerprint"]
         )
         await db.execute(
             """UPDATE news_event_groups SET source_count=?,source_names_json=?,
@@ -2264,9 +2680,9 @@ async def refresh_event_groups_for_news(
                WHERE event_group_id=?""",
             (
                 state["independent_source_count"],
-                json.dumps(state["publishers"]),
-                json.dumps(state["source_tickers"]),
-                json.dumps(state["validated_tickers"]),
+                next_source_names,
+                next_source_tickers,
+                next_validated_tickers,
                 state["event_type"],
                 state["evidence_fingerprint"],
                 1 if material else 0,
@@ -2290,7 +2706,11 @@ async def get_hotspot_status(db: aiosqlite.Connection, *, now: datetime | None =
     prepared_revision = int(state_row["prepared_revision"] if state_row else 0)
     last_consumed = int(state_row["last_consumed_revision"] if state_row else 0)
     async with db.execute(
-        "SELECT COUNT(*),MIN(prepared_at) FROM hotspot_preparation_sets WHERE status='PREPARED' AND prepared_revision>?",
+        """SELECT COUNT(*),MIN(h.prepared_at)
+           FROM hotspot_preparation_sets h
+           JOIN news_event_groups g ON g.event_group_id=h.event_group_id
+           WHERE h.status='PREPARED' AND h.prepared_revision>?
+             AND h.event_group_version=g.version AND g.status='PREPARED'""",
         (last_consumed,),
     ) as cursor:
         prepared_count, prepared_since = await cursor.fetchone()
@@ -2462,6 +2882,7 @@ async def create_market_focus_cycle(
             """SELECT h.*,g.* FROM hotspot_preparation_sets h
                JOIN news_event_groups g ON g.event_group_id=h.event_group_id
                WHERE h.status='PREPARED' AND h.prepared_revision>?
+                 AND h.event_group_version=g.version AND g.status='PREPARED'
                ORDER BY h.prepared_revision
                LIMIT ?""",
             (status["last_consumed_revision"], settings.hot_cycle_max_events),
@@ -2836,13 +3257,17 @@ async def _finish_cycle(
             state_row = await state_cursor.fetchone()
         contiguous_revision = int(state_row[0] if state_row else 0)
         async with db.execute(
-            """SELECT prepared_revision,status FROM hotspot_preparation_sets
-               WHERE prepared_revision>? ORDER BY prepared_revision""",
+            """SELECT h.prepared_revision,h.status,
+                      CASE WHEN h.event_group_version=g.version
+                                AND g.status='PREPARED' THEN 1 ELSE 0 END
+               FROM hotspot_preparation_sets h
+               JOIN news_event_groups g ON g.event_group_id=h.event_group_id
+               WHERE h.prepared_revision>? ORDER BY h.prepared_revision""",
             (contiguous_revision,),
         ) as prepared_cursor:
             later_rows = await prepared_cursor.fetchall()
-        for prepared_revision, prepared_status in later_rows:
-            if prepared_status != "CONSUMED":
+        for prepared_revision, prepared_status, is_current in later_rows:
+            if prepared_status != "CONSUMED" and bool(is_current):
                 break
             contiguous_revision = int(prepared_revision)
         cooldown = utc_text((parse_utc(now) or utc_now()) + timedelta(seconds=settings.hot_cycle_manual_cooldown_seconds))
