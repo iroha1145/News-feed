@@ -3047,7 +3047,13 @@ class BlockingCompletedCycleProvider(BlockingCycleProvider):
             "no_new_material_catalyst": self.snapshot["no_new_hot_events"],
             "insufficient_context": False,
         }
-        return ResponseResult(None, "completed", output_text=json.dumps(payload))
+        return ResponseResult(
+            None,
+            "completed",
+            output_text=json.dumps(payload),
+            model=settings.hot_cycle_model,
+            reasoning_effort=settings.hot_cycle_reasoning,
+        )
 
 
 def test_cycle_lease_and_fencing_prevent_two_workers_from_submitting(
@@ -3280,7 +3286,13 @@ class CancelCompletedProvider(BlockingCycleProvider):
             "no_new_material_catalyst": False,
             "insufficient_context": False,
         }
-        return ResponseResult(response_id, "completed", output_text=json.dumps(payload))
+        return ResponseResult(
+            response_id,
+            "completed",
+            output_text=json.dumps(payload),
+            model=settings.hot_cycle_model,
+            reasoning_effort=settings.hot_cycle_reasoning,
+        )
 
 
 class BlockingCancelObserveProvider(BlockingCycleProvider):
@@ -3430,11 +3442,17 @@ class CompletedCycleProvider(BlockingCycleProvider):
             "no_new_material_catalyst": snapshot["no_new_hot_events"],
             "insufficient_context": False,
         }
-        return ResponseResult(None, "completed", output_text=json.dumps(payload))
+        return ResponseResult(
+            None,
+            "completed",
+            output_text=json.dumps(payload),
+            model=settings.hot_cycle_model,
+            reasoning_effort=settings.hot_cycle_reasoning,
+        )
 
 
 class AuditedRuntimeCycleProvider(CompletedCycleProvider):
-    def __init__(self, *, model: str, reasoning_effort: str):
+    def __init__(self, *, model: str | None, reasoning_effort: str | None):
         self.model = model
         self.reasoning_effort = reasoning_effort
 
@@ -3502,7 +3520,13 @@ class TickerAssessmentProvider(BlockingCycleProvider):
             "no_new_material_catalyst": False,
             "insufficient_context": False,
         }
-        return ResponseResult(None, "completed", output_text=json.dumps(payload))
+        return ResponseResult(
+            None,
+            "completed",
+            output_text=json.dumps(payload),
+            model=settings.hot_cycle_model,
+            reasoning_effort=settings.hot_cycle_reasoning,
+        )
 
 
 def test_incomplete_cycle_records_usage_without_publishing_or_consuming(
@@ -3523,10 +3547,12 @@ def test_incomplete_cycle_records_usage_without_publishing_or_consuming(
         db = await database.get_db()
         try:
             row = await (await db.execute(
-                """SELECT status,result_json,usage_cache_write_tokens,
+                """SELECT status,error_code,result_json,usage_cache_write_tokens,
                           usage_reasoning_tokens,usage_total_tokens FROM market_focus_cycles"""
             )).fetchone()
-            assert tuple(row) == ("incomplete_output", None, 10, 40, 150)
+            assert tuple(row) == (
+                "incomplete_output", "incomplete_output", None, 10, 40, 150
+            )
             state = await get_hotspot_status(db)
             assert state["last_consumed_revision"] == 0
             assert state["prepared_hot_count"] == 1
@@ -3536,7 +3562,7 @@ def test_incomplete_cycle_records_usage_without_publishing_or_consuming(
     run(scenario())
 
 
-def test_matching_cycle_runtime_completes_and_consumes_prepared_revision(
+def test_matching_cycle_runtime_identity_completes_and_consumes_prepared_revision(
     isolated_market_db, monkeypatch
 ):
     _enable_cycles(monkeypatch)
@@ -3573,6 +3599,71 @@ def test_matching_cycle_runtime_completes_and_consumes_prepared_revision(
             state = await get_hotspot_status(db)
             assert state["last_consumed_revision"] == 1
             assert state["prepared_hot_count"] == 0
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "expected_error"),
+    (
+        ("model", "provider_model_unverified"),
+        ("reasoning_effort", "provider_reasoning_unverified"),
+    ),
+)
+def test_cycle_runtime_missing_identity_fails_closed_without_consuming(
+    isolated_market_db,
+    monkeypatch,
+    missing_field,
+    expected_error,
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 334)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+        finally:
+            await db.close()
+
+        provider = AuditedRuntimeCycleProvider(
+            model=None if missing_field == "model" else settings.hot_cycle_model,
+            reasoning_effort=(
+                None
+                if missing_field == "reasoning_effort"
+                else settings.hot_cycle_reasoning
+            ),
+        )
+        assert await run_market_focus_worker_once(
+            provider=provider, worker_id=f"runtime-missing-{missing_field}"
+        ) is True
+
+        db = await database.get_db()
+        try:
+            row = await (await db.execute(
+                """SELECT status,error_code,result_json,usage_input_tokens,
+                          usage_cached_input_tokens,usage_cache_write_tokens,
+                          usage_reasoning_tokens,usage_output_tokens,usage_total_tokens,
+                          lease_owner,lease_expires_at
+                   FROM market_focus_cycles WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(row[:3]) == ("failed", expected_error, None)
+            assert tuple(row[3:9]) == (101, 20, 11, 44, 123, 224)
+            assert tuple(row[9:]) == (None, None)
+
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                   WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("PREPARED", None)
+            state = await get_hotspot_status(db)
+            assert state["active_cycle_id"] is None
+            assert state["last_consumed_revision"] == 0
+            assert state["prepared_hot_count"] == 1
         finally:
             await db.close()
 
@@ -4134,7 +4225,13 @@ def test_cycle_output_requires_aware_as_of_not_before_snapshot(
                 "no_new_material_catalyst": False,
                 "insufficient_context": False,
             }
-            return ResponseResult(None, "completed", output_text=json.dumps(payload))
+            return ResponseResult(
+                None,
+                "completed",
+                output_text=json.dumps(payload),
+                model=settings.hot_cycle_model,
+                reasoning_effort=settings.hot_cycle_reasoning,
+            )
 
     async def scenario():
         db = await database.get_db()
