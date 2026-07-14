@@ -472,6 +472,10 @@ def test_low_context_job_is_terminal_without_provider_call(isolated_integration_
             assert payload.insufficient_context is True
             assert payload.confidence == 0
             assert payload.affected_stocks == []
+            async with db.execute(
+                "SELECT analysis_status FROM news_items WHERE id=?", (news_id,)
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "insufficient_context"
         finally:
             await db.close()
 
@@ -482,7 +486,9 @@ def test_low_context_job_is_terminal_without_provider_call(isolated_integration_
     run(scenario())
 
 
-def test_background_job_recovers_by_response_id_and_records_usage(isolated_integration_db):
+def test_background_job_recovers_by_response_id_and_records_usage_and_latency(
+    isolated_integration_db,
+):
     completed = ResponseResult(
         "resp_private",
         "completed",
@@ -514,9 +520,14 @@ def test_background_job_recovers_by_response_id_and_records_usage(isolated_integ
                 queued = dict(await cursor.fetchone())
             assert queued["status"] == "queued"
             assert queued["openai_response_id"] == "resp_private"
+            submitted_at = datetime.now(timezone.utc) - timedelta(seconds=5)
             await db.execute(
-                "UPDATE analysis_jobs SET next_attempt_at=? WHERE job_id=?",
-                ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), queued["job_id"]),
+                "UPDATE analysis_jobs SET next_attempt_at=?,submitted_at=? WHERE job_id=?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    submitted_at.isoformat(),
+                    queued["job_id"],
+                ),
             )
             await db.commit()
         finally:
@@ -533,10 +544,149 @@ def test_background_job_recovers_by_response_id_and_records_usage(isolated_integ
             assert finished["usage_input_tokens"] == 100
             assert finished["usage_cached_input_tokens"] == 40
             assert finished["usage_output_tokens"] == 80
+            assert finished["latency_ms"] >= 4_000
             async with db.execute("SELECT COUNT(*) FROM analysis_stock_impacts WHERE news_id=?", (news_id,)) as cursor:
                 assert (await cursor.fetchone())[0] == 1
         finally:
             await db.close()
+
+    run(scenario())
+
+
+def test_paid_insufficient_context_preserves_result_and_sets_terminal_status(
+    isolated_integration_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
+    honest_low_confidence = {
+        **valid_analysis(),
+        "classification": "bullish",
+        "confidence": 25,
+        "market_relevance": 20,
+        "insufficient_context": True,
+    }
+    provider = FakeProvider(
+        created=ResponseResult(
+            "resp_private",
+            "completed",
+            output_text=json.dumps(honest_low_confidence, ensure_ascii=False),
+            usage_input_tokens=100,
+            usage_output_tokens=80,
+        )
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            system_news_id = await database.insert_news_item(
+                db, news_record(201, summary="")
+            )
+            system_job = await create_or_get_job(db, system_news_id)
+            assert system_job.job["provider"] == "system"
+            assert system_job.job["status"] == "insufficient_context"
+            news_id = await database.insert_news_item(db, news_record(202))
+            created = await create_or_get_job(db, news_id)
+        finally:
+            await db.close()
+
+        assert await run_worker_once(provider=provider, worker_id="worker-low-confidence") is True
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT status,error_code,latency_ms FROM analysis_jobs WHERE job_id=?",
+                (created.job["job_id"],),
+            ) as cursor:
+                job = dict(await cursor.fetchone())
+            assert job["status"] == "insufficient_context"
+            assert job["error_code"] is None
+            assert job["latency_ms"] is not None
+            async with db.execute(
+                "SELECT payload_json FROM analysis_revisions WHERE news_id=?",
+                (news_id,),
+            ) as cursor:
+                revision = await cursor.fetchone()
+            payload = NewsImpactAnalysis.model_validate_json(revision[0])
+            assert payload.insufficient_context is True
+            assert payload.classification.value == "bullish"
+            assert payload.confidence == 25
+            assert [stock.ticker for stock in payload.affected_stocks] == ["AMD"]
+            async with db.execute(
+                "SELECT ticker,validation_status FROM analysis_stock_impacts WHERE news_id=?",
+                (news_id,),
+            ) as cursor:
+                impact = await cursor.fetchone()
+            assert tuple(impact) == ("AMD", "valid_external")
+            async with db.execute(
+                "SELECT analysis_status FROM news_items WHERE id=?", (news_id,)
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == "insufficient_context"
+
+            second_news_id = await database.insert_news_item(db, news_record(203))
+            second = await create_or_get_job(db, second_news_id)
+            assert second.job["status"] == "budget_blocked"
+            assert second.job["error_code"] == "daily_job_limit_reached"
+        finally:
+            await db.close()
+
+        assert await run_worker_once(
+            provider=provider, worker_id="worker-budget-blocked"
+        ) is False
+        assert provider.create_calls == 1
+
+    run(scenario())
+
+
+def test_paid_insufficient_context_counts_actual_output_tokens(
+    isolated_integration_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 100)
+    monkeypatch.setattr(settings, "news_item_max_output_tokens", 1024)
+    monkeypatch.setattr(settings, "news_llm_manual_daily_output_token_limit", 1123)
+    provider = FakeProvider(
+        created=ResponseResult(
+            "resp_private",
+            "completed",
+            output_text=json.dumps(
+                valid_analysis(
+                    confidence=25,
+                    market_relevance=20,
+                    insufficient_context=True,
+                ),
+                ensure_ascii=False,
+            ),
+            usage_output_tokens=100,
+        )
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            first_news_id = await database.insert_news_item(db, news_record(204))
+            first = await create_or_get_job(db, first_news_id)
+        finally:
+            await db.close()
+
+        assert await run_worker_once(provider=provider, worker_id="worker-token-budget") is True
+
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT status,usage_output_tokens FROM analysis_jobs WHERE job_id=?",
+                (first.job["job_id"],),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("insufficient_context", 100)
+            second_news_id = await database.insert_news_item(db, news_record(205))
+            second = await create_or_get_job(db, second_news_id)
+            assert second.job["status"] == "budget_blocked"
+            assert second.job["error_code"] == "daily_output_token_limit_reached"
+        finally:
+            await db.close()
+
+        assert await run_worker_once(
+            provider=provider, worker_id="worker-token-budget-blocked"
+        ) is False
+        assert provider.create_calls == 1
 
     run(scenario())
 

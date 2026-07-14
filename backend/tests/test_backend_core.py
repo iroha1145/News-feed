@@ -430,7 +430,7 @@ def test_low_context_news_skips_llm_but_keeps_neutral_analysis(isolated_db):
             stored = await database.get_analysis_for_news(db, news_id)
             refreshed = await database.get_news_item_by_id(db, news_id)
             assert stored is not None
-            assert refreshed["analysis_status"] == "completed"
+            assert refreshed["analysis_status"] == "insufficient_context"
         finally:
             await db.close()
 
