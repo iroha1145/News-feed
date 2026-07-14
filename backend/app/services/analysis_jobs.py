@@ -80,6 +80,24 @@ def parse_utc(value: str | datetime) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _with_terminal_latency(
+    job: dict[str, Any],
+    result: ResponseResult,
+    observed_at: datetime,
+) -> ResponseResult:
+    if result.latency_ms is not None or not job.get("submitted_at"):
+        return result
+    try:
+        submitted_at = parse_utc(job["submitted_at"])
+    except (TypeError, ValueError):
+        return result
+    elapsed_ms = max(
+        0,
+        round((observed_at - submitted_at).total_seconds() * 1000),
+    )
+    return replace(result, latency_ms=elapsed_ms)
+
+
 def _source_tickers(value: Any) -> list[str]:
     if isinstance(value, str):
         try:
@@ -477,9 +495,9 @@ async def _publish_analysis_locked(
     )
     await db.execute(
         """UPDATE news_items
-           SET analysis_status='completed', analysis_error='', analysis_claimed_at=NULL,
+           SET analysis_status=?, analysis_error='', analysis_claimed_at=NULL,
                analysis_lease_expires_at=NULL, updated_at=? WHERE id=?""",
-        (available_at, news["id"]),
+        (terminal_status, available_at, news["id"]),
     )
     await db.execute(
         """UPDATE analysis_jobs
@@ -1013,6 +1031,8 @@ async def _handle_provider_result(
 ) -> None:
     status = result.status.lower()
     now = utc_now()
+    if status not in {"queued", "in_progress", "cancelled"}:
+        result = _with_terminal_latency(job, result, now)
     if result.model is not None and result.model != str(job["model"]):
         await _fail_claimed(db, job, "provider_model_mismatch", result)
         return
@@ -1129,6 +1149,9 @@ async def _handle_provider_result(
             usage_output_tokens=result.usage_output_tokens,
             usage_total_tokens=result.usage_total_tokens,
             latency_ms=result.latency_ms,
+            terminal_status=(
+                "insufficient_context" if payload.insufficient_context else "completed"
+            ),
         )
         await db.commit()
     except Exception:
