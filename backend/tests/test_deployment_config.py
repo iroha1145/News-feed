@@ -43,6 +43,8 @@ def test_backend_and_worker_share_model_database_and_retention_environment():
         "ANALYSIS_RETENTION_LIMIT",
         "NEWS_RETENTION_DAYS",
         "X_SENTIMENT_RETENTION_DAYS",
+        "HOT_CYCLE_MAX_EVENTS",
+        "HOT_CYCLE_MAX_FOCUS_SYMBOLS",
         "HOTSPOT_PREPARATION_RETENTION_DAYS",
         "MARKET_FOCUS_COMPLETED_RETENTION_DAYS",
         "MARKET_FOCUS_FAILED_RETENTION_DAYS",
