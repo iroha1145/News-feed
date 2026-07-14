@@ -259,7 +259,7 @@ async def _budget_error(
             """SELECT COUNT(*) FROM analysis_jobs
                WHERE provider='openai' AND created_at >= ?
                  AND request_origin=?
-                 AND status NOT IN ('insufficient_context','budget_blocked')""",
+                 AND status<>'budget_blocked'""",
             (day_start, request_origin),
         ) as cursor:
             if int((await cursor.fetchone())[0]) >= job_limit:

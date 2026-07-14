@@ -8,6 +8,10 @@ import { safeExternalUrl } from '../../utils/url'
 import { useEffect, useRef, useState } from 'react'
 import { retryFailedAnalysis } from '../../services/api'
 import { useAdminSession } from '../../context/AdminSessionContext'
+import {
+  getNewsAnalysisPresentation,
+  INSUFFICIENT_CONTEXT_NOTICE,
+} from '../../utils/newsAnalysis'
 
 interface NewsCardProps {
   item: NewsItem
@@ -27,7 +31,8 @@ export default function NewsCard({ item, onTickerClick, onRetryQueued, manualAna
   const rawImageUrl = item.image_url || item.urlToImage
   const imageUrl = getRealImageUrl(rawImageUrl)
   const articleUrl = safeExternalUrl(item.url)
-  const hasAnalysis = item.analysis_status === 'completed' && analysis
+  const analysisPresentation = getNewsAnalysisPresentation(item)
+  const hasAnalysis = analysisPresentation.hasAnalysisDetails
   const isPinned = item.is_pinned
   const evidenceCount = analysis ? [
     analysis.headline_summary,
@@ -80,10 +85,14 @@ export default function NewsCard({ item, onTickerClick, onRetryQueued, manualAna
             <span className="text-primary dark:text-violet-400">{item.source}</span>
             <span className="w-1 h-1 bg-slate-300 dark:bg-slate-600 rounded-full" />
             <span className="text-slate-400 dark:text-slate-500">{timeAgo(item.published_at)}</span>
-            {hasAnalysis && (
+            {analysisPresentation.statusLabel && (
               <>
                 <span className="w-1 h-1 bg-slate-300 dark:bg-slate-600 rounded-full" />
-                <span className="text-emerald-500 dark:text-emerald-400">模型已分析</span>
+                <span className={analysisPresentation.isInsufficientContext
+                  ? 'text-amber-600 dark:text-amber-400'
+                  : 'text-emerald-500 dark:text-emerald-400'}>
+                  {analysisPresentation.statusLabel}
+                </span>
               </>
             )}
             {isPinned && (
@@ -163,6 +172,11 @@ export default function NewsCard({ item, onTickerClick, onRetryQueued, manualAna
           {analysis?.headline_summary && (
             <p className="text-xs text-slate-400 dark:text-slate-500 italic">
               {analysis.headline_summary}
+            </p>
+          )}
+          {analysisPresentation.isInsufficientContext && analysis && (
+            <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:bg-amber-950/30 dark:text-amber-300" role="status">
+              {INSUFFICIENT_CONTEXT_NOTICE}
             </p>
           )}
 

@@ -2,6 +2,14 @@ export interface NewsItemImageFallback {
   urlToImage?: string | null;
 }
 
+export type AnalysisStatus =
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'insufficient_context'
+  | 'failed'
+  | 'skipped';
+
 export interface NewsItem extends NewsItemImageFallback {
   id: number;
   source: string;
@@ -11,7 +19,7 @@ export interface NewsItem extends NewsItemImageFallback {
   image_url: string | null;
   published_at: string | null;
   fetched_at: string;
-  analysis_status?: 'pending' | 'processing' | 'completed' | 'failed' | 'skipped';
+  analysis_status?: AnalysisStatus;
   analysis?: Analysis | null;
   is_pinned?: boolean;
 }

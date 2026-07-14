@@ -12,6 +12,7 @@ import { getRealImageUrl } from '../../utils/image'
 import { useAdminSession } from '../../context/AdminSessionContext'
 import { safeExternalUrl } from '../../utils/url'
 import { paidCapabilityEnabled, paidCapabilityLabel } from '../../utils/paidCapability'
+import { INSUFFICIENT_CONTEXT_NOTICE } from '../../utils/newsAnalysis'
 
 export default function DeepAnalysis() {
   const { id } = useParams<{ id: string }>()
@@ -160,6 +161,7 @@ export default function DeepAnalysis() {
     affectedStocks.length > 0 || affectedSectors.length > 0 || affectedCommodities.length > 0,
   ]
   const evidenceCount = evidenceParts.filter(Boolean).length
+  const isInsufficientContext = matchedNews?.analysis_status === 'insufficient_context'
 
   return (
     <div className="xl:grid xl:grid-cols-[1fr_20rem] gap-0">
@@ -188,6 +190,13 @@ export default function DeepAnalysis() {
               分析依据完整度 {evidenceCount}/4
             </span>
           </div>
+
+          {isInsufficientContext && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200" role="status">
+              <p className="font-bold">上下文不足</p>
+              <p className="mt-1 leading-relaxed">{INSUFFICIENT_CONTEXT_NOTICE}</p>
+            </div>
+          )}
 
           <h1 className="text-xl md:text-2xl lg:text-3xl font-extrabold font-headline tracking-tight leading-tight dark:text-white break-words">
             {selectedAnalysis.title_zh || matchedNews?.title || '市场分析'}
