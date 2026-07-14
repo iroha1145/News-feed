@@ -101,6 +101,8 @@ def test_setup_is_idempotent_preserves_special_values_and_future_keys(tmp_path: 
         "NEWS_LLM_MAX_QUEUED": "37",
         "NEWS_LLM_DAILY_JOB_LIMIT": "19",
         "NEWS_LLM_DAILY_OUTPUT_TOKEN_LIMIT": "88000",
+        "HOT_CYCLE_MAX_EVENTS": "3",
+        "HOT_CYCLE_MAX_FOCUS_SYMBOLS": "5",
         "CALENDAR_LLM_MAX_QUEUED": "4",
         "CALENDAR_LLM_DAILY_JOB_LIMIT": "3",
         "CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT": "44000",

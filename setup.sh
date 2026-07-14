@@ -324,6 +324,8 @@ write_env_value HOT_CYCLE_SCHEDULE_ENABLED "$(setting_or_default HOT_CYCLE_SCHED
 write_env_value HOT_CYCLE_TIMES_ET "$(setting_or_default HOT_CYCLE_TIMES_ET 08:00,12:00,16:00)"
 write_env_value HOT_CYCLE_OPTIONAL_20_ET "$(setting_or_default HOT_CYCLE_OPTIONAL_20_ET false)"
 write_env_value HOT_CYCLE_MANUAL_ENABLED "$(setting_or_default HOT_CYCLE_MANUAL_ENABLED false)"
+write_env_value HOT_CYCLE_MAX_EVENTS "$(setting_or_default HOT_CYCLE_MAX_EVENTS 8)"
+write_env_value HOT_CYCLE_MAX_FOCUS_SYMBOLS "$(setting_or_default HOT_CYCLE_MAX_FOCUS_SYMBOLS 20)"
 write_env_value HOT_CYCLE_MAX_OUTPUT_TOKENS "$(setting_or_default HOT_CYCLE_MAX_OUTPUT_TOKENS 49152)"
 write_env_value HOT_CYCLE_DAILY_JOB_LIMIT "$(existing_value HOT_CYCLE_DAILY_JOB_LIMIT)"
 write_env_value HOT_CYCLE_DAILY_OUTPUT_TOKEN_LIMIT "$(existing_value HOT_CYCLE_DAILY_OUTPUT_TOKEN_LIMIT)"
