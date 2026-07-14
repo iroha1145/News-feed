@@ -3605,6 +3605,45 @@ def test_matching_cycle_runtime_identity_completes_and_consumes_prepared_revisio
     run(scenario())
 
 
+def test_dated_snapshot_for_configured_model_alias_completes_and_consumes(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 3331)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+        finally:
+            await db.close()
+
+        provider = AuditedRuntimeCycleProvider(
+            model=f"{settings.hot_cycle_model}-2026-07-14",
+            reasoning_effort=settings.hot_cycle_reasoning,
+        )
+        assert await run_market_focus_worker_once(
+            provider=provider, worker_id="runtime-dated-snapshot"
+        ) is True
+
+        db = await database.get_db()
+        try:
+            row = await (await db.execute(
+                "SELECT status,error_code,result_json FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert row["status"] == "completed"
+            assert row["error_code"] is None
+            assert row["result_json"] is not None
+            state = await get_hotspot_status(db)
+            assert state["last_consumed_revision"] == cycle["prepared_revision"]
+            assert state["prepared_hot_count"] == 0
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
 @pytest.mark.parametrize(
     ("missing_field", "expected_error"),
     (
