@@ -13,7 +13,10 @@ from app.models.database import (
     get_analysis_for_news,
     get_news_item_by_id,
 )
-from app.services.analysis_jobs import enqueue_manual_jobs, retry_failed_jobs
+from app.services.analysis_jobs import (
+    enqueue_manual_jobs_with_status,
+    retry_failed_jobs,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
@@ -101,13 +104,22 @@ async def trigger_analysis(
                 "message": "Manual analysis is disabled until both daily budgets are configured.",
             },
         )
-    enqueued = await enqueue_manual_jobs(batch_size)
-    return {
-        "status": "queued" if enqueued else "no_eligible_news",
+    result = await enqueue_manual_jobs_with_status(batch_size)
+    response = {
+        "status": (
+            "queued"
+            if result.enqueued
+            else "budget_blocked"
+            if result.stop_reason
+            else "no_eligible_news"
+        ),
         "batch_size": batch_size,
-        "enqueued": enqueued,
+        "enqueued": result.enqueued,
         "capability": capability,
     }
+    if result.stop_reason:
+        response["stop_reason"] = result.stop_reason
+    return response
 
 
 @router.post("/retry-failed")

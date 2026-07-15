@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.models.database import get_db
+from app.services.openai_capacity import openai_inflight_counts
 from app.services.calendar_analyzer import (
     CALENDAR_ANALYSIS_INSTRUCTIONS,
     CalendarAnalysisPayload,
@@ -445,43 +446,6 @@ async def recover_expired_calendar_job_leases(db: aiosqlite.Connection) -> int:
     return max(0, interrupted.rowcount) + max(0, recovered.rowcount)
 
 
-async def _background_inflight_counts(
-    db: aiosqlite.Connection,
-    now_text: str,
-    unknown_submission_cutoff: str,
-) -> tuple[int, int]:
-    async with db.execute(
-        """SELECT COUNT(*) FROM calendar_analysis_jobs
-           WHERE (openai_response_id IS NOT NULL AND status IN ('queued','in_progress'))
-              OR (openai_response_id IS NULL AND lease_owner IS NOT NULL
-                  AND lease_expires_at > ? AND status IN ('pending','queued','in_progress'))
-              OR (openai_response_id IS NULL AND status='failed'
-                  AND error_code='submission_outcome_unknown'
-                  AND execution_mode='background' AND submitted_at IS NOT NULL
-                  AND submitted_at >= ?)""",
-        (now_text, unknown_submission_cutoff),
-    ) as cursor:
-        calendar_count = int((await cursor.fetchone())[0])
-    async with db.execute(
-        """SELECT COUNT(*) FROM analysis_jobs
-           WHERE (openai_response_id IS NOT NULL AND (
-                    status IN ('queued','in_progress')
-                    OR (status='cancelled' AND error_code IN (
-                        'upstream_cancel_pending','upstream_cancel_observe'
-                    ))
-                 ))
-              OR (openai_response_id IS NULL AND lease_owner IS NOT NULL
-                  AND lease_expires_at > ? AND status IN ('pending','queued','in_progress'))
-              OR (openai_response_id IS NULL AND status='failed'
-                  AND error_code='submission_outcome_unknown'
-                  AND execution_mode='background' AND submitted_at IS NOT NULL
-                  AND submitted_at >= ?)""",
-        (now_text, unknown_submission_cutoff),
-    ) as cursor:
-        news_count = int((await cursor.fetchone())[0])
-    return calendar_count, calendar_count + news_count
-
-
 async def claim_next_calendar_job(
     db: aiosqlite.Connection,
     worker_id: str,
@@ -496,10 +460,10 @@ async def claim_next_calendar_job(
     )
     await db.execute("BEGIN IMMEDIATE")
     try:
-        calendar_inflight, global_inflight = await _background_inflight_counts(
+        counts = await openai_inflight_counts(
             db,
-            now_text,
-            unknown_submission_cutoff,
+            now_text=now_text,
+            unknown_submission_cutoff=unknown_submission_cutoff,
         )
         if allow_new_submissions is None:
             allow_new_submissions = (
@@ -507,8 +471,8 @@ async def claim_next_calendar_job(
             )
         allow_submission = (
             allow_new_submissions
-            and calendar_inflight < settings.calendar_llm_max_inflight
-            and global_inflight < settings.openai_max_concurrency
+            and counts.calendar < settings.calendar_llm_max_inflight
+            and counts.total < settings.openai_max_concurrency
         )
         submission_clause = "" if allow_submission else "AND openai_response_id IS NOT NULL"
         response_priority = "CASE WHEN openai_response_id IS NOT NULL THEN 0 ELSE 1 END,"

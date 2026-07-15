@@ -9,7 +9,18 @@ import pytest
 
 from app.config import Settings, settings
 from app.models import database
-from app.services.analysis_jobs import claim_next_job, create_or_get_job, enqueue_auto_jobs
+from app.services.analysis_jobs import (
+    CreateJobResult,
+    claim_next_job,
+    create_or_get_job,
+    enqueue_auto_jobs,
+    enqueue_manual_jobs,
+    enqueue_manual_jobs_with_status,
+)
+from app.services.calendar_analysis_jobs import (
+    claim_next_calendar_job,
+    create_or_get_calendar_job,
+)
 from app.services.focus_context import (
     FOCUS_SCHEMA_SHA256,
     FocusContext,
@@ -41,6 +52,8 @@ from app.services.ticker_lineage import (
     validation_as_of,
 )
 from app.services.responses_runtime import ProviderCapabilities, ResponseResult
+from app.services.worker_health import select_worker_heartbeat
+from app.services import analysis_jobs as analysis_jobs_service
 from app.services import market_focus as market_focus_service
 from app.services.retention import cleanup_extended_retention, _new_york_trading_date
 from app.integrations.option_pro.repository import query_feed, query_ticker
@@ -233,6 +246,198 @@ def test_manual_analysis_budget_is_independent_from_automatic_budget(
             assert manual.job["status"] == "pending"
             assert manual.job["request_origin"] == "manual"
             assert manual.job["job_id"] != automatic_blocked.job["job_id"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("request_origin", "enqueue"),
+    (
+        ("manual", enqueue_manual_jobs),
+        ("automatic", enqueue_auto_jobs),
+    ),
+)
+def test_batch_enqueue_defers_budget_overflow_and_resumes_next_day(
+    isolated_market_db,
+    monkeypatch,
+    request_origin,
+    enqueue,
+):
+    if request_origin == "automatic":
+        monkeypatch.setattr(settings, "news_llm_auto_analyze_enabled", True)
+        monkeypatch.setattr(settings, "news_llm_daily_job_limit", 1)
+        monkeypatch.setattr(
+            settings,
+            "news_llm_daily_output_token_limit",
+            settings.news_item_max_output_tokens,
+        )
+    else:
+        monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
+        monkeypatch.setattr(
+            settings,
+            "news_llm_manual_daily_output_token_limit",
+            settings.news_item_max_output_tokens,
+        )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            for index in range(940, 943):
+                await database.insert_news_item(db, news(index))
+        finally:
+            await db.close()
+
+        assert await enqueue(limit=3) == 1
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT status,COUNT(*) FROM analysis_jobs GROUP BY status"
+            ) as cursor:
+                assert [tuple(row) for row in await cursor.fetchall()] == [("pending", 1)]
+            async with db.execute(
+                """SELECT COUNT(*) FROM news_items n
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM analysis_jobs j WHERE j.news_id=n.id
+                   )"""
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 2
+            previous_day = (
+                datetime.now(timezone.utc) - timedelta(days=1)
+            ).isoformat()
+            await db.execute(
+                "UPDATE analysis_jobs SET created_at=?,updated_at=?",
+                (previous_day, previous_day),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        assert await enqueue(limit=3) == 1
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT status,COUNT(*) FROM analysis_jobs GROUP BY status"
+            ) as cursor:
+                assert [tuple(row) for row in await cursor.fetchall()] == [("pending", 2)]
+            async with db.execute(
+                "SELECT COUNT(*) FROM analysis_jobs WHERE status='budget_blocked'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with db.execute(
+                """SELECT COUNT(*) FROM news_items n
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM analysis_jobs j WHERE j.news_id=n.id
+                   )"""
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_batch_enqueue_counts_a_raced_valid_job_as_reused(
+    isolated_market_db, monkeypatch
+):
+    calls: list[dict] = []
+
+    async def raced_create(db, news_id, **kwargs):
+        calls.append({"news_id": news_id, **kwargs})
+        return CreateJobResult(
+            job={"job_id": "mlj_reused", "status": "pending"},
+            created=False,
+        )
+
+    monkeypatch.setattr(analysis_jobs_service, "create_or_get_job", raced_create)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await database.insert_news_item(db, news(943))
+        finally:
+            await db.close()
+        assert await enqueue_manual_jobs(limit=1) == 1
+
+    run(scenario())
+    assert len(calls) == 1
+    assert calls[0]["defer_when_budget_unavailable"] is True
+
+
+def test_batch_enqueue_reports_budget_stop_without_persisting_blocked_job(
+    isolated_market_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
+    monkeypatch.setattr(
+        settings,
+        "news_llm_manual_daily_output_token_limit",
+        settings.news_item_max_output_tokens,
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await database.insert_news_item(db, news(952))
+            await database.insert_news_item(db, news(953))
+        finally:
+            await db.close()
+
+        first = await enqueue_manual_jobs_with_status(limit=2)
+        assert first.enqueued == 1
+        assert first.stop_reason == "daily_job_limit_reached"
+
+        second = await enqueue_manual_jobs_with_status(limit=2)
+        assert second.enqueued == 0
+        assert second.stop_reason == "daily_job_limit_reached"
+
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                "SELECT COUNT(*) FROM analysis_jobs WHERE status='budget_blocked'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_explicit_force_recovers_a_direct_budget_block_after_window_rollover(
+    isolated_market_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
+    monkeypatch.setattr(
+        settings,
+        "news_llm_manual_daily_output_token_limit",
+        settings.news_item_max_output_tokens,
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            first_id = await database.insert_news_item(db, news(944))
+            blocked_id = await database.insert_news_item(db, news(945))
+            first = await create_or_get_job(db, first_id)
+            blocked = await create_or_get_job(db, blocked_id)
+            assert first.job["status"] == "pending"
+            assert blocked.job["status"] == "budget_blocked"
+
+            previous_day = (
+                datetime.now(timezone.utc) - timedelta(days=1)
+            ).isoformat()
+            await db.execute(
+                "UPDATE analysis_jobs SET created_at=?,updated_at=? WHERE job_id=?",
+                (previous_day, previous_day, first.job["job_id"]),
+            )
+            await db.commit()
+
+            recovered = await create_or_get_job(db, blocked_id, force=True)
+            assert recovered.created is True
+            assert recovered.job["status"] == "pending"
+            assert recovered.job["job_id"] != blocked.job["job_id"]
+            assert recovered.job["retry_of_job_id"] == blocked.job["job_id"]
         finally:
             await db.close()
 
@@ -3026,6 +3231,361 @@ class BlockingCycleProvider:
         return ResponseResult(response_id, "cancelled")
 
 
+class CountingQueuedCycleProvider:
+    def __init__(self):
+        self.create_calls = 0
+        self.retrieve_calls = 0
+
+    def capabilities(self):
+        return ProviderCapabilities("ok", True, True, True, True, True)
+
+    async def create_background(self, model_input, **kwargs):
+        self.create_calls += 1
+        return ResponseResult("resp-new-focus", "queued")
+
+    async def create_sync(self, model_input, **kwargs):
+        return await self.create_background(model_input, **kwargs)
+
+    async def retrieve(self, response_id):
+        self.retrieve_calls += 1
+        return ResponseResult(response_id, "queued")
+
+    async def cancel(self, response_id):
+        return ResponseResult(response_id, "cancelled")
+
+
+class BlockingRetrieveCycleProvider:
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.retrieve_calls = 0
+
+    def capabilities(self):
+        return ProviderCapabilities("ok", True, True, True, True, True)
+
+    async def create_background(self, model_input, **kwargs):
+        raise AssertionError("Existing response must be retrieved, not submitted")
+
+    async def create_sync(self, model_input, **kwargs):
+        return await self.create_background(model_input, **kwargs)
+
+    async def retrieve(self, response_id):
+        self.retrieve_calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return ResponseResult(response_id, "queued")
+
+    async def cancel(self, response_id):
+        return ResponseResult(response_id, "cancelled")
+
+
+def test_market_focus_renewal_interval_is_bounded(monkeypatch):
+    monkeypatch.setattr(settings, "analysis_worker_lease_seconds", 3)
+    assert market_focus_service._market_focus_renewal_interval_seconds() == 5
+    monkeypatch.setattr(settings, "analysis_worker_lease_seconds", 30)
+    assert market_focus_service._market_focus_renewal_interval_seconds() == 10
+    monkeypatch.setattr(settings, "analysis_worker_lease_seconds", 300)
+    assert market_focus_service._market_focus_renewal_interval_seconds() == 15
+
+
+def test_market_focus_long_retrieve_renews_lease_and_worker_heartbeat(
+    isolated_market_db,
+    monkeypatch,
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(
+        market_focus_service,
+        "_market_focus_renewal_interval_seconds",
+        lambda: 0.01,
+    )
+    worker_id = "long-focus-retrieve-worker"
+
+    async def scenario():
+        provider = BlockingRetrieveCycleProvider()
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 950)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            now_text = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """UPDATE market_focus_cycles SET status='queued',
+                   openai_response_id='resp-long-focus',next_attempt_at=?
+                   WHERE cycle_id=?""",
+                (now_text, cycle["cycle_id"]),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        worker_task = asyncio.create_task(
+            run_market_focus_worker_once(provider=provider, worker_id=worker_id)
+        )
+        try:
+            await asyncio.wait_for(provider.entered.wait(), timeout=1)
+            db = await database.get_db()
+            try:
+                async with db.execute(
+                    """SELECT lease_expires_at FROM market_focus_cycles
+                       WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                ) as cursor:
+                    lease_before = str((await cursor.fetchone())[0])
+                stale = (
+                    datetime.now(timezone.utc) - timedelta(minutes=5)
+                ).isoformat()
+                await db.execute(
+                    """UPDATE analysis_worker_state SET heartbeat_at=?
+                       WHERE worker_id=?""",
+                    (stale, worker_id),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+            await asyncio.sleep(0.05)
+            db = await database.get_db()
+            try:
+                selection = await select_worker_heartbeat(db)
+                async with db.execute(
+                    """SELECT lease_expires_at FROM market_focus_cycles
+                       WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                ) as cursor:
+                    lease_after = str((await cursor.fetchone())[0])
+            finally:
+                await db.close()
+
+            assert selection.health_status == "ok"
+            assert selection.worker_id == worker_id
+            assert selection.heartbeat_at != stale
+            assert lease_after > lease_before
+        finally:
+            provider.release.set()
+            worker_result = await worker_task
+
+        assert worker_result is False
+        assert provider.retrieve_calls == 1
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                """SELECT status,error_code FROM analysis_worker_state
+                   WHERE worker_id=?""",
+                (worker_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("idle", None)
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_market_focus_submission_shares_capacity_with_news_and_calendar(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(settings, "openai_max_concurrency", 1)
+    monkeypatch.setattr(settings, "calendar_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "calendar_llm_daily_job_limit", 10)
+    monkeypatch.setattr(
+        settings,
+        "calendar_llm_daily_output_token_limit",
+        10 * settings.calendar_max_output_tokens,
+    )
+    provider = CountingQueuedCycleProvider()
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 946)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            news_id = await database.insert_news_item(db, news(947))
+            news_job = await create_or_get_job(db, news_id)
+            calendar_job = await create_or_get_calendar_job(
+                db,
+                [{
+                    "date": "2026-07-16T08:30:00-04:00",
+                    "title": "Producer Price Index",
+                    "country_code": "USD",
+                    "impact": "high",
+                    "forecast": "0.2%",
+                    "previous": "0.1%",
+                    "actual": "",
+                }],
+                provider="openai",
+                model=settings.default_llm_model,
+            )
+            now_text = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """UPDATE analysis_jobs SET status='queued',
+                   openai_response_id='resp-active-news',next_attempt_at=?
+                   WHERE job_id=?""",
+                (now_text, news_job.job["job_id"]),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        assert await run_market_focus_worker_once(
+            provider=provider,
+            worker_id="focus-blocked-by-news",
+        ) is False
+        assert provider.create_calls == 0
+
+        db = await database.get_db()
+        try:
+            now_text = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                "UPDATE analysis_jobs SET status='completed',updated_at=? WHERE job_id=?",
+                (now_text, news_job.job["job_id"]),
+            )
+            await db.execute(
+                """UPDATE calendar_analysis_jobs SET status='queued',
+                   openai_response_id='resp-active-calendar',next_attempt_at=?
+                   WHERE job_id=?""",
+                (now_text, calendar_job.job["job_id"]),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        assert await run_market_focus_worker_once(
+            provider=provider,
+            worker_id="focus-blocked-by-calendar",
+        ) is False
+        assert provider.create_calls == 0
+
+        db = await database.get_db()
+        try:
+            now_text = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """UPDATE calendar_analysis_jobs
+                   SET status='completed',updated_at=? WHERE job_id=?""",
+                (now_text, calendar_job.job["job_id"]),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        assert await run_market_focus_worker_once(
+            provider=provider,
+            worker_id="focus-capacity-available",
+        ) is True
+        assert provider.create_calls == 1
+
+        db = await database.get_db()
+        try:
+            now_text = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """UPDATE analysis_jobs SET status='queued',
+                   openai_response_id='resp-active-news-again',next_attempt_at=?
+                   WHERE job_id=?""",
+                (now_text, news_job.job["job_id"]),
+            )
+            await db.execute(
+                "UPDATE market_focus_cycles SET next_attempt_at=? WHERE cycle_id=?",
+                (now_text, cycle["cycle_id"]),
+            )
+            await db.commit()
+            async with db.execute(
+                """SELECT status,openai_response_id FROM market_focus_cycles
+                   WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (
+                    "in_progress",
+                    "resp-new-focus",
+                )
+        finally:
+            await db.close()
+
+        assert await run_market_focus_worker_once(
+            provider=provider,
+            worker_id="focus-existing-response-observer",
+        ) is False
+        assert provider.create_calls == 1
+        assert provider.retrieve_calls == 1
+
+    run(scenario())
+
+
+def test_news_and_calendar_claims_respect_an_active_market_focus_response(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(settings, "openai_max_concurrency", 1)
+    monkeypatch.setattr(settings, "calendar_llm_manual_enabled", True)
+    monkeypatch.setattr(settings, "calendar_llm_daily_job_limit", 10)
+    monkeypatch.setattr(
+        settings,
+        "calendar_llm_daily_output_token_limit",
+        10 * settings.calendar_max_output_tokens,
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 948)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            news_id = await database.insert_news_item(db, news(949))
+            news_job = await create_or_get_job(db, news_id)
+            calendar_job = await create_or_get_calendar_job(
+                db,
+                [{
+                    "date": "2026-07-17T08:30:00-04:00",
+                    "title": "Retail Sales",
+                    "country_code": "USD",
+                    "impact": "high",
+                    "forecast": "0.3%",
+                    "previous": "0.2%",
+                    "actual": "",
+                }],
+                provider="openai",
+                model=settings.default_llm_model,
+            )
+            now_text = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """UPDATE market_focus_cycles SET status='queued',
+                   openai_response_id='resp-active-focus',next_attempt_at=?
+                   WHERE cycle_id=?""",
+                (now_text, cycle["cycle_id"]),
+            )
+            await db.commit()
+
+            assert await claim_next_job(db, "news-blocked-by-focus") is None
+            assert await claim_next_calendar_job(
+                db,
+                "calendar-blocked-by-focus",
+            ) is None
+
+            await db.execute(
+                """UPDATE market_focus_cycles SET status='completed',updated_at=?
+                   WHERE cycle_id=?""",
+                (now_text, cycle["cycle_id"]),
+            )
+            await db.commit()
+
+            claimed_news = await claim_next_job(db, "news-after-focus")
+            assert claimed_news is not None
+            assert claimed_news["job_id"] == news_job.job["job_id"]
+            await db.execute(
+                """UPDATE analysis_jobs SET status='completed',lease_owner=NULL,
+                   lease_expires_at=NULL,updated_at=? WHERE job_id=?""",
+                (now_text, news_job.job["job_id"]),
+            )
+            await db.commit()
+
+            claimed_calendar = await claim_next_calendar_job(
+                db,
+                "calendar-after-focus",
+            )
+            assert claimed_calendar is not None
+            assert claimed_calendar["job_id"] == calendar_job.job["job_id"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
 class BlockingCompletedCycleProvider(BlockingCycleProvider):
     def __init__(self):
         super().__init__()
@@ -3084,6 +3644,74 @@ def test_cycle_lease_and_fencing_prevent_two_workers_from_submitting(
                 "SELECT fencing_token,openai_response_id FROM market_focus_cycles"
             )).fetchone()
             assert tuple(row) == (1, "resp-cycle")
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_market_focus_lost_lease_before_submission_never_calls_provider(
+    isolated_market_db,
+    monkeypatch,
+):
+    _enable_cycles(monkeypatch)
+    original_marker = market_focus_service._mark_market_focus_submission_started
+    replacement_owner = "replacement-before-submit"
+
+    async def replace_before_marker(db, **kwargs):
+        observer = await database.get_db()
+        try:
+            replaced = await observer.execute(
+                """UPDATE market_focus_cycles SET fencing_token=fencing_token+1,
+                   lease_owner=?,lease_expires_at=? WHERE cycle_id=?""",
+                (
+                    replacement_owner,
+                    (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+                    kwargs["cycle"]["cycle_id"],
+                ),
+            )
+            assert replaced.rowcount == 1
+            await observer.commit()
+        finally:
+            await observer.close()
+        return await original_marker(db, **kwargs)
+
+    monkeypatch.setattr(
+        market_focus_service,
+        "_mark_market_focus_submission_started",
+        replace_before_marker,
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 951)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+        finally:
+            await db.close()
+
+        provider = CountingQueuedCycleProvider()
+        assert await run_market_focus_worker_once(
+            provider=provider,
+            worker_id="stale-before-submit",
+        ) is False
+        assert provider.create_calls == 0
+
+        db = await database.get_db()
+        try:
+            async with db.execute(
+                """SELECT status,attempt_count,lease_owner,fencing_token,
+                          openai_response_id FROM market_focus_cycles
+                   WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (
+                    "in_progress",
+                    0,
+                    replacement_owner,
+                    2,
+                    None,
+                )
         finally:
             await db.close()
 
@@ -3858,6 +4486,62 @@ def test_explicit_retry_is_append_only_and_reuses_immutable_event_snapshot(
             parent_input.pop("cycle_id")
             child_input.pop("cycle_id")
             assert child_input == parent_input
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_retry_budget_and_persisted_limit_use_current_downgraded_cap(
+    isolated_market_db,
+    monkeypatch,
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(settings, "hot_cycle_max_output_tokens", 49_152)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 954)
+            parent = await create_market_focus_cycle(db, trigger_type="manual")
+            assert parent["max_output_tokens"] == 49_152
+        finally:
+            await db.close()
+
+        assert await run_market_focus_worker_once(
+            provider=IncompleteCycleProvider(),
+            worker_id="retry-budget-parent",
+        ) is True
+
+        monkeypatch.setattr(settings, "hot_cycle_max_output_tokens", 256)
+        db = await database.get_db()
+        try:
+            monkeypatch.setattr(
+                settings,
+                "hot_cycle_daily_output_token_limit",
+                305,
+            )
+            with pytest.raises(CycleConflict) as caught:
+                await retry_market_focus_cycle(db, parent["cycle_id"])
+            assert caught.value.code == "daily_output_token_limit_reached"
+
+            monkeypatch.setattr(
+                settings,
+                "hot_cycle_daily_output_token_limit",
+                306,
+            )
+            child = await retry_market_focus_cycle(db, parent["cycle_id"])
+            assert child["retry_of_cycle_id"] == parent["cycle_id"]
+            assert child["max_output_tokens"] == 256
+
+            async with db.execute(
+                """SELECT usage_output_tokens FROM market_focus_cycles
+                   WHERE cycle_id=?""",
+                (parent["cycle_id"],),
+            ) as cursor:
+                parent_usage = int((await cursor.fetchone())[0])
+            assert parent_usage == 50
+            assert parent_usage + child["max_output_tokens"] == 306
         finally:
             await db.close()
 

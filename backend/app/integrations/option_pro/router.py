@@ -54,12 +54,13 @@ from app.models.database import get_db
 from app.services.analysis_jobs import (
     InputVersionConflict,
     create_or_get_job,
+    get_news_budget_error,
     parse_utc,
     request_cancel,
     utc_now,
 )
 from app.services.responses_runtime import OpenAIResponsesProvider
-from app.services.worker_health import evaluate_worker_heartbeat
+from app.services.worker_health import select_worker_heartbeat
 from app.services.market_focus import (
     CycleConflict,
     create_market_focus_cycle,
@@ -166,16 +167,22 @@ async def integration_health(
         data_through = parse_utc(data_row[0]) if data_row and data_row[0] else None
         async with db.execute("SELECT * FROM source_health ORDER BY source") as cursor:
             source_rows = [dict(row) for row in await cursor.fetchall()]
-        async with db.execute(
-            "SELECT heartbeat_at,status FROM analysis_worker_state "
-            "ORDER BY heartbeat_at DESC LIMIT 1"
-        ) as cursor:
-            worker_row = await cursor.fetchone()
+        worker_selection = await select_worker_heartbeat(db, now=now)
         async with db.execute(
             """SELECT COUNT(*) FROM market_focus_cycles
                WHERE status='failed' AND error_code='submission_outcome_unknown'"""
         ) as cursor:
             unknown_cycle_count = int((await cursor.fetchone())[0])
+        manual_budget_error = (
+            await get_news_budget_error(db, request_origin="manual", now=now)
+            if settings.news_llm_manual_enabled
+            else None
+        )
+        automatic_budget_error = (
+            await get_news_budget_error(db, request_origin="automatic", now=now)
+            if settings.news_llm_auto_analyze_enabled
+            else None
+        )
     finally:
         await db.close()
 
@@ -201,13 +208,19 @@ async def integration_health(
         and capabilities.status == "ok"
         and settings.manual_news_analysis_capability == "enabled"
     )
-    budget_status: Literal["ok", "budget_configuration_required", "budget_blocked"] = "ok"
-    if settings.news_llm_auto_analyze_enabled and settings.automatic_news_analysis_capability != "enabled":
+    budget_status: Literal[
+        "ok", "budget_configuration_required", "budget_blocked"
+    ] = "ok"
+    budget_errors = (manual_budget_error, automatic_budget_error)
+    if "budget_configuration_required" in budget_errors:
         budget_status = "budget_configuration_required"
-        warnings_auto_budget = True
-    else:
-        warnings_auto_budget = False
-    if counts.get("budget_blocked", 0):
+    warnings_auto_budget = (
+        automatic_budget_error == "budget_configuration_required"
+    )
+    if any(
+        error is not None and error != "budget_configuration_required"
+        for error in budget_errors
+    ):
         budget_status = "budget_blocked"
     warnings: list[str] = []
     if warnings_auto_budget:
@@ -226,13 +239,13 @@ async def integration_health(
         warnings.append("unsupported_provider_capability")
     if not scheduler_running:
         warnings.append("scheduler_not_running")
-    worker_status, worker_warning = evaluate_worker_heartbeat(
-        worker_row["heartbeat_at"] if worker_row else None,
-        worker_row["status"] if worker_row else None,
-        now=now,
-    )
+    worker_status = worker_selection.health_status
+    worker_warning = worker_selection.warning
     if worker_warning:
         warnings.append(worker_warning)
+    for diagnostic in worker_selection.diagnostics:
+        if diagnostic not in warnings:
+            warnings.append(diagnostic)
     trigger_enabled = trigger_enabled and worker_status == "ok"
     sources = {
         row["source"]: ComponentHealth(
@@ -253,7 +266,16 @@ async def integration_health(
         for row in source_rows
     }
     status_value: Literal["ok", "degraded", "unavailable", "not_configured"] = "ok"
-    if warnings or any(source.status in {"degraded", "unavailable"} for source in sources.values()):
+    non_degrading_diagnostics = (
+        set(worker_selection.diagnostics) if worker_status == "ok" else set()
+    )
+    if (
+        any(warning not in non_degrading_diagnostics for warning in warnings)
+        or any(
+            source.status in {"degraded", "unavailable"}
+            for source in sources.values()
+        )
+    ):
         status_value = "degraded"
     return IntegrationHealthResponse(
         **metadata(request),

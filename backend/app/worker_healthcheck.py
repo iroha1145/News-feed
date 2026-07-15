@@ -11,7 +11,7 @@ import aiosqlite
 from app.config import settings
 from app.integrations.option_pro.contract import CONTRACT_PATH, generated_bytes
 from app.models.database import get_db
-from app.services.worker_health import evaluate_worker_heartbeat
+from app.services.worker_health import select_worker_heartbeat
 
 
 QUICK_CHECK_MARKER = Path("/tmp/macrolens-analysis-worker-quick-check.ok")
@@ -78,15 +78,8 @@ async def check(*, quick_check_marker: Path = QUICK_CHECK_MARKER) -> int:
         ) as cursor:
             if await cursor.fetchone() is None:
                 return 1
-        async with db.execute(
-            "SELECT heartbeat_at,status FROM analysis_worker_state ORDER BY heartbeat_at DESC LIMIT 1"
-        ) as cursor:
-            heartbeat = await cursor.fetchone()
-        worker_status, _ = evaluate_worker_heartbeat(
-            heartbeat[0] if heartbeat else None,
-            heartbeat[1] if heartbeat else None,
-        )
-        if worker_status != "ok":
+        worker_selection = await select_worker_heartbeat(db)
+        if worker_selection.health_status != "ok":
             return 1
         async with db.execute(
             """SELECT COUNT(*) FROM analysis_jobs
