@@ -51,7 +51,11 @@ from app.services.ticker_lineage import (
     trusted_tickers_for_news_as_of,
     validation_as_of,
 )
-from app.services.responses_runtime import ProviderCapabilities, ResponseResult
+from app.services.responses_runtime import (
+    ProviderCapabilities,
+    ProviderRequestRejected,
+    ResponseResult,
+)
 from app.services.worker_health import select_worker_heartbeat
 from app.services import analysis_jobs as analysis_jobs_service
 from app.services import market_focus as market_focus_service
@@ -1401,6 +1405,9 @@ def test_manual_cycle_is_idempotent_and_uses_immutable_prepared_snapshot(
             )
             assert first["cycle_id"] == replay["cycle_id"]
             assert first["event_group_count"] == 1
+            assert first["prompt_cache_key"] == replay["prompt_cache_key"]
+            assert first["prompt_cache_key"].startswith("market_focus_cycle:")
+            assert len(first["prompt_cache_key"]) == 64
             snapshot = await (await db.execute(
                 "SELECT snapshot_json FROM market_focus_cycle_events WHERE cycle_id=?",
                 (first["cycle_id"],),
@@ -3791,7 +3798,87 @@ def test_worker_sync_lease_covers_timeout_and_stale_worker_cannot_publish(
 class OutcomeUnknownProvider(BlockingCycleProvider):
     async def create_background(self, model_input, **kwargs):
         self.create_calls += 1
-        raise RuntimeError("transport outcome unknown")
+        raise TimeoutError("transport outcome unknown")
+
+
+class RejectedCycleProvider(BlockingCycleProvider):
+    def __init__(self):
+        super().__init__()
+        self.prompt_cache_key = None
+
+    async def create_background(self, model_input, **kwargs):
+        self.create_calls += 1
+        self.prompt_cache_key = kwargs["prompt_cache_key"]
+        raise ProviderRequestRejected(status_code=400)
+
+
+def test_definitive_provider_rejection_releases_snapshot_and_budget_for_retry(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(settings, "hot_cycle_daily_job_limit", 1)
+    monkeypatch.setattr(
+        settings,
+        "hot_cycle_daily_output_token_limit",
+        settings.hot_cycle_max_output_tokens,
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 313)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            await db.execute(
+                "UPDATE market_focus_cycles SET prompt_cache_key=? WHERE cycle_id=?",
+                ("x" * 75, cycle["cycle_id"]),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        provider = RejectedCycleProvider()
+        assert await run_market_focus_worker_once(
+            provider=provider,
+            worker_id="rejected-before-task-creation",
+        ) is True
+        assert provider.create_calls == 1
+        assert provider.prompt_cache_key is not None
+        assert provider.prompt_cache_key.startswith("market_focus_cycle:")
+        assert len(provider.prompt_cache_key) == 64
+
+        db = await database.get_db()
+        try:
+            failed = await (await db.execute(
+                """SELECT status,error_code,prompt_cache_key,attempt_count
+                   FROM market_focus_cycles WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(failed) == (
+                "failed",
+                "provider_request_rejected",
+                provider.prompt_cache_key,
+                1,
+            )
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                   WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("PREPARED", None)
+            state = await get_hotspot_status(db)
+            assert state["active_cycle_id"] is None
+            assert state["last_consumed_revision"] == 0
+            assert state["prepared_hot_count"] == 1
+
+            retry = await retry_market_focus_cycle(db, cycle["cycle_id"])
+            assert retry["retry_of_cycle_id"] == cycle["cycle_id"]
+            assert retry["status"] == "pending"
+            assert retry["prompt_cache_key"] == provider.prompt_cache_key
+            assert len(retry["prompt_cache_key"]) == 64
+        finally:
+            await db.close()
+
+    run(scenario())
 
 
 def test_submission_outcome_unknown_never_retries_or_consumes_revision(
