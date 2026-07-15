@@ -3216,6 +3216,7 @@ def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
     public = integration_router._public_cycle(
         {
             "cycle_id": cycle_id,
+            "status": "completed",
             "result_json": json.dumps(persisted, separators=(",", ":")),
             "no_new_hot_events": 1,
         }
@@ -3229,6 +3230,7 @@ def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
     normalized = integration_router._public_cycle(
         {
             "cycle_id": cycle_id,
+            "status": "completed",
             "result_json": json.dumps(offset, separators=(",", ":")),
             "no_new_hot_events": 1,
         }
@@ -3242,6 +3244,7 @@ def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
         integration_router._public_cycle(
             {
                 "cycle_id": cycle_id,
+                "status": "completed",
                 "result_json": json.dumps(invalid, separators=(",", ":")),
                 "no_new_hot_events": 1,
             }
@@ -3255,11 +3258,41 @@ def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
         integration_router._public_cycle(
             {
                 "cycle_id": cycle_id,
+                "status": "completed",
                 "result_json": json.dumps(naive, separators=(",", ":")),
                 "no_new_hot_events": 1,
             }
         )
     assert naive_error.value.code == "persisted_market_focus_result_invalid"
+
+
+@pytest.mark.parametrize(
+    ("row_overrides", "result_overrides"),
+    (
+        ({}, {"cycle_id": "mfc_fedcba9876543210fedcba9876543210"}),
+        ({"result_json": None}, {}),
+        ({"status": "failed"}, {}),
+        ({"no_new_hot_events": 0}, {}),
+    ),
+)
+def test_public_cycle_rejects_persisted_result_invariant_mismatches(
+    row_overrides, result_overrides
+):
+    cycle_id = "mfc_0123456789abcdef0123456789abcdef"
+    persisted = {**completed_market_focus_result(cycle_id), **result_overrides}
+    row = {
+        "cycle_id": cycle_id,
+        "status": "completed",
+        "result_json": json.dumps(persisted, separators=(",", ":")),
+        "no_new_hot_events": 1,
+        **row_overrides,
+    }
+
+    with pytest.raises(IntegrationAPIError) as captured:
+        integration_router._public_cycle(row)
+
+    assert captured.value.status_code == 500
+    assert captured.value.code == "persisted_market_focus_result_invalid"
 
 
 def test_completed_market_focus_cycle_latest_and_point_reads_persisted_result(
@@ -3358,6 +3391,70 @@ def test_invalid_persisted_market_focus_result_returns_safe_integration_error(
             assert response.status_code == 500
             assert response.json()["code"] == "persisted_market_focus_result_invalid"
             assert "must-not-leak" not in response.text
+
+
+def test_create_and_cancel_replays_reject_mismatched_persisted_focus_results(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_action_key_id", "action-key")
+    monkeypatch.setattr(settings, "option_pro_action_secret", "action-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+    cycle_id = "mfc_0123456789abcdef0123456789abcdef"
+    wrong_cycle_id = "mfc_fedcba9876543210fedcba9876543210"
+    invalid_cycle = {
+        "cycle_id": cycle_id,
+        "status": "completed",
+        "result_json": json.dumps(
+            completed_market_focus_result(wrong_cycle_id),
+            separators=(",", ":"),
+        ),
+        "no_new_hot_events": 1,
+    }
+
+    async def return_invalid_cycle(*_args, **_kwargs):
+        return dict(invalid_cycle)
+
+    monkeypatch.setattr(
+        integration_router,
+        "create_market_focus_cycle",
+        return_invalid_cycle,
+    )
+    monkeypatch.setattr(
+        integration_router,
+        "request_market_focus_cancel",
+        return_invalid_cycle,
+    )
+    app = _integration_app()
+    prefix = "/api/integrations/option-pro/v1"
+    requests = (
+        (
+            f"{prefix}/market-focus-cycles",
+            json.dumps({"trigger": "manual"}, separators=(",", ":")).encode(),
+            "nonce-invalid-cycle-create",
+        ),
+        (
+            f"{prefix}/market-focus-cycles/{cycle_id}/cancel",
+            b"",
+            "nonce-invalid-cycle-cancel",
+        ),
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        for target, body, nonce in requests:
+            headers = _signed_headers(
+                "POST",
+                target,
+                body,
+                "action-key",
+                "action-secret",
+                nonce,
+            )
+            response = client.post(target, content=body, headers=headers)
+
+            assert response.status_code == 500
+            assert response.json()["code"] == "persisted_market_focus_result_invalid"
+            assert wrong_cycle_id not in response.text
 
 
 def test_signed_integration_endpoints_match_committed_contract(isolated_integration_db, monkeypatch):
