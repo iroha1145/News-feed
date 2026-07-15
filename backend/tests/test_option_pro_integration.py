@@ -134,6 +134,69 @@ def valid_analysis(**overrides) -> dict:
     return payload
 
 
+def completed_market_focus_result(
+    cycle_id: str,
+    *,
+    as_of: str = "2026-07-15T09:20:47.333424Z",
+) -> dict:
+    return {
+        "cycle_id": cycle_id,
+        "as_of": as_of,
+        "market_summary": "The persisted market-focus cycle completed successfully.",
+        "dominant_events": [],
+        "market_uncertainties": ["Later evidence may change the display-only summary."],
+        "affected_sectors": [],
+        "focus_ticker_assessments": [],
+        "no_new_material_catalyst": True,
+        "insufficient_context": False,
+        "display_only": True,
+    }
+
+
+async def seed_completed_market_focus_cycle(
+    db: aiosqlite.Connection,
+    *,
+    cycle_id: str = "mfc_0123456789abcdef0123456789abcdef",
+    result_as_of: str = "2026-07-15T09:20:47.333424Z",
+) -> None:
+    snapshot_as_of = "2026-07-15T09:20:00Z"
+    result = completed_market_focus_result(cycle_id, as_of=result_as_of)
+    await db.execute(
+        """INSERT INTO market_focus_cycles
+           (cycle_id,idempotency_key,trigger_type,status,no_new_hot_events,
+            snapshot_as_of,input_schema_version,input_hash,input_json,
+            event_group_count,focus_symbol_count,model,reasoning_effort,
+            execution_mode,max_output_tokens,prompt_version,output_schema_version,
+            prompt_cache_key,result_json,created_at,completed_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            cycle_id,
+            f"manual:historical:{cycle_id}",
+            "manual",
+            "completed",
+            1,
+            snapshot_as_of,
+            "market-focus-input-v1",
+            "a" * 64,
+            "{}",
+            0,
+            0,
+            "gpt-5.6-terra",
+            "max",
+            "background",
+            49_152,
+            "market-focus-v1",
+            "market-focus-output-v1",
+            "market-focus:historical-result",
+            json.dumps(result, separators=(",", ":")),
+            snapshot_as_of,
+            result_as_of,
+            result_as_of,
+        ),
+    )
+    await db.commit()
+
+
 class FakeProvider:
     def __init__(self, *, created: ResponseResult, retrieved: list[ResponseResult] | None = None):
         self.created_result = created
@@ -3145,6 +3208,85 @@ def test_latest_cursor_keeps_first_page_retention_boundary_when_time_advances(
 def test_canonical_path_discards_legacy_testclient_query_suffix():
     assert canonical_path(b"/v1/health?b=two&a=hello%20world&a=") == "/v1/health"
     assert canonical_path(b"/v1/news%3Farchive?limit=20") == "/v1/news%3Farchive"
+
+
+def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
+    cycle_id = "mfc_0123456789abcdef0123456789abcdef"
+    persisted = completed_market_focus_result(cycle_id)
+    public = integration_router._public_cycle(
+        {
+            "cycle_id": cycle_id,
+            "result_json": json.dumps(persisted, separators=(",", ":")),
+            "no_new_hot_events": 1,
+        }
+    )
+
+    assert isinstance(public["result"]["as_of"], datetime)
+    assert public["result"]["as_of"].tzinfo is not None
+    assert public["result"]["as_of"].utcoffset() == timedelta(0)
+
+    invalid = {**persisted, "unexpected_internal_field": "must remain rejected"}
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        integration_router._public_cycle(
+            {
+                "cycle_id": cycle_id,
+                "result_json": json.dumps(invalid, separators=(",", ":")),
+                "no_new_hot_events": 1,
+            }
+        )
+
+
+def test_completed_market_focus_cycle_latest_and_point_reads_persisted_result(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_read_key_id", "read-key")
+    monkeypatch.setattr(settings, "option_pro_read_secret", "read-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+    cycle_id = "mfc_0123456789abcdef0123456789abcdef"
+    result_as_of = "2026-07-15T09:20:47.333424Z"
+
+    async def seed():
+        db = await database.get_db()
+        try:
+            await seed_completed_market_focus_cycle(
+                db,
+                cycle_id=cycle_id,
+                result_as_of=result_as_of,
+            )
+        finally:
+            await db.close()
+
+    run(seed())
+    app = _integration_app()
+    prefix = "/api/integrations/option-pro/v1"
+    targets = (
+        f"{prefix}/market-focus-cycles/latest",
+        f"{prefix}/market-focus-cycles/{cycle_id}",
+    )
+    expected_as_of = datetime.fromisoformat(result_as_of.replace("Z", "+00:00"))
+
+    with TestClient(app) as client:
+        for index, target in enumerate(targets, start=1):
+            headers = _signed_headers(
+                "GET",
+                target,
+                b"",
+                "read-key",
+                "read-secret",
+                f"nonce-completed-cycle-read-{index}",
+            )
+            response = client.get(target, headers=headers)
+
+            assert response.status_code == 200, (target, response.text)
+            cycle = response.json()["cycle"]
+            assert cycle["cycle_id"] == cycle_id
+            assert cycle["status"] == "completed"
+            assert datetime.fromisoformat(
+                cycle["result"]["as_of"].replace("Z", "+00:00")
+            ) == expected_as_of
+            assert cycle["result"]["display_only"] is True
+            assert "openai_response_id" not in response.text
 
 
 def test_signed_integration_endpoints_match_committed_contract(isolated_integration_db, monkeypatch):

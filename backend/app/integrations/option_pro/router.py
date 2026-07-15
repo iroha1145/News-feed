@@ -51,6 +51,7 @@ from app.models.catalysts import (
     SCHEMA_VERSION,
 )
 from app.models.database import get_db
+from app.models.market_focus import MarketFocusCyclePublicAnalysis
 from app.services.analysis_jobs import (
     InputVersionConflict,
     create_or_get_job,
@@ -571,7 +572,13 @@ def _public_cycle(row: dict) -> dict:
     ):
         result.pop(key, None)
     value = result.pop("result_json", None)
-    result["result"] = json.loads(value) if value else None
+    result["result"] = (
+        MarketFocusCyclePublicAnalysis.model_validate_json(value).model_dump(
+            mode="python"
+        )
+        if value
+        else None
+    )
     result["no_new_hot_events"] = bool(result["no_new_hot_events"])
     return result
 
