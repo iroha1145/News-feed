@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.deps.bearer import require_owner_token
+from app.deps.bearer import require_internal_bearer
 from app.models.database import (
     calendar_watermark,
     get_db,
@@ -24,7 +24,7 @@ from app.models.database import (
 )
 from app.utils.scheduler import get_scheduler
 
-router = APIRouter(prefix="/internal/v1", dependencies=[Depends(require_owner_token)])
+router = APIRouter(prefix="/internal/v1", dependencies=[Depends(require_internal_bearer)])
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 

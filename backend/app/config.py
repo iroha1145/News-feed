@@ -9,7 +9,8 @@ from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "personal.toml"
-INTERNAL_TOKEN_ENV = "MACROLENS_INTERNAL_TOKEN"
+INTERNAL_TOKEN_ENV = "INTERNAL_API_TOKEN"
+DATA_DIR_ENV = "DATA_DIR"
 
 
 class ConfigurationError(ValueError):
@@ -47,10 +48,7 @@ class PersonalSettings:
 
     @property
     def database_path(self) -> Path:
-        override = self.environment.get("MACROLENS_DATABASE_PATH", "").strip()
-        if override:
-            return Path(override).expanduser().resolve()
-        data_dir = self.environment.get("MACROLENS_DATA_DIR", "").strip()
+        data_dir = self.environment.get(DATA_DIR_ENV, "").strip()
         if data_dir:
             return (Path(data_dir).expanduser() / "macrolens.db").resolve()
         return self.storage.database_path
@@ -126,7 +124,7 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
 ) -> PersonalSettings:
     environment = dict(os.environ if environ is None else environ)
-    configured_path = path or environment.get("MACROLENS_CONFIG_PATH") or DEFAULT_CONFIG_PATH
+    configured_path = path or DEFAULT_CONFIG_PATH
     config_path = Path(configured_path).expanduser().resolve()
     try:
         with config_path.open("rb") as handle:

@@ -25,8 +25,8 @@ jobs:
       - name: Run offline ETL tests
         env:
           PYTHONPATH: backend
-          MACROLENS_INTERNAL_TOKEN: ci-owner-token
-          MACROLENS_DATABASE_PATH: /tmp/macrolens-ci.db
+          INTERNAL_API_TOKEN: ci-internal-token
+          DATA_DIR: /tmp
         run: pytest -q backend/tests
 
   container:
@@ -36,22 +36,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate single-service Compose files
         env:
-          MACROLENS_INTERNAL_TOKEN: ci-owner-token
+          INTERNAL_API_TOKEN: ci-internal-token
         run: |
           docker compose config --services | diff -u <(printf 'macrolens\n') -
           docker compose -f docker-compose.personal.yml config --services | diff -u <(printf 'macrolens\n') -
       - name: Build and start MacroLens ETL
         env:
-          MACROLENS_INTERNAL_TOKEN: ci-owner-token
+          INTERNAL_API_TOKEN: ci-internal-token
         run: docker compose up -d --build --wait --wait-timeout 180 macrolens
       - name: Verify health, authentication, and read-only root
         env:
-          MACROLENS_INTERNAL_TOKEN: ci-owner-token
+          INTERNAL_API_TOKEN: ci-internal-token
         run: |
           curl --fail --silent --show-error http://127.0.0.1:8000/health |
             python -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok"'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8000/internal/v1/health)" = "401"
-          curl --fail --silent --show-error -H "Authorization: Bearer $MACROLENS_INTERNAL_TOKEN" \
+          curl --fail --silent --show-error -H "Authorization: Bearer $INTERNAL_API_TOKEN" \
             http://127.0.0.1:8000/internal/v1/health |
             python -c 'import json,sys; assert json.load(sys.stdin)["database"] == "ok"'
           if docker compose exec -T macrolens touch /app/.rootfs-write-probe; then exit 1; fi

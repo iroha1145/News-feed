@@ -7,7 +7,7 @@ from fastapi import HTTPException, Request, status
 from app.config import settings
 
 
-async def require_owner_token(request: Request) -> None:
+async def require_internal_bearer(request: Request) -> None:
     expected = settings.internal_api_token
     if not expected:
         raise HTTPException(

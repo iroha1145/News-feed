@@ -8,7 +8,7 @@ from app.main import app
 from app.models import database
 
 
-AUTH = {"Authorization": "Bearer test-owner-token"}
+AUTH = {"Authorization": "Bearer test-internal-token"}
 
 
 def _item(number: int) -> dict:
@@ -44,6 +44,8 @@ async def test_only_expected_http_routes_are_exposed(clean_db):
         "/internal/v1/news/{news_id}",
         "/internal/v1/calendar",
     }
+    for route in app.routes:
+        assert route.methods == {"GET"}
 
 
 @pytest.mark.asyncio
@@ -58,8 +60,8 @@ async def test_bearer_auth_rejects_missing_wrong_and_duplicate_headers(clean_db)
         duplicate = await client.get(
             "/internal/v1/health",
             headers=[
-                ("Authorization", "Bearer test-owner-token"),
-                ("Authorization", "Bearer test-owner-token"),
+                ("Authorization", "Bearer test-internal-token"),
+                ("Authorization", "Bearer test-internal-token"),
             ],
         )
         assert duplicate.status_code == 401
@@ -81,20 +83,34 @@ async def test_bearer_auth_uses_constant_time_comparison(clean_db, monkeypatch):
     async with await _client() as client:
         response = await client.get("/internal/v1/health", headers=AUTH)
     assert response.status_code == 200
-    assert calls == [("test-owner-token", "test-owner-token")]
+    assert calls == [("test-internal-token", "test-internal-token")]
 
 
 @pytest.mark.asyncio
-async def test_internal_api_fails_closed_when_owner_token_is_unset(clean_db, monkeypatch):
+async def test_internal_api_fails_closed_when_internal_token_is_unset(clean_db, monkeypatch):
     from app.config import INTERNAL_TOKEN_ENV, settings
 
     monkeypatch.delitem(settings.environment, INTERNAL_TOKEN_ENV, raising=False)
     async with await _client() as client:
         response = await client.get(
-            "/internal/v1/health", headers={"Authorization": "Bearer test-owner-token"}
+            "/internal/v1/health", headers={"Authorization": "Bearer test-internal-token"}
         )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "internal_token_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_internal_token_never_appears_in_http_responses(clean_db):
+    async with await _client() as client:
+        responses = [
+            await client.get("/health"),
+            await client.get("/internal/v1/health", headers=AUTH),
+            await client.get("/internal/v1/news/changes", headers=AUTH),
+            await client.get("/internal/v1/news/1", headers=AUTH),
+            await client.get("/internal/v1/calendar", headers=AUTH),
+        ]
+    for response in responses:
+        assert "test-internal-token" not in response.text
 
 
 @pytest.mark.asyncio

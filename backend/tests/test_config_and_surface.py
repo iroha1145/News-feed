@@ -36,11 +36,11 @@ def test_personal_toml_is_loaded_by_standard_library(tmp_path):
     path.write_text(_config_text(), encoding="utf-8")
     loaded = load_settings(
         path,
-        environ={"MACROLENS_INTERNAL_TOKEN": "owner", "MACROLENS_DATA_DIR": str(tmp_path)},
+        environ={"INTERNAL_API_TOKEN": "internal", "DATA_DIR": str(tmp_path)},
     )
     assert loaded.database_path == tmp_path / "macrolens.db"
     assert loaded.source("google").interval_seconds == 900
-    assert loaded.internal_api_token == "owner"
+    assert loaded.internal_api_token == "internal"
     assert not any(
         hasattr(loaded, name)
         for name in ("model", "reasoning", "llm", "provider", "openai_api_key")
@@ -64,6 +64,38 @@ def test_runtime_configuration_contains_no_model_settings():
     ]
     forbidden = re.compile(r"openai|\bgpt\b|\bllm\b|reasoning|model[_-]|provider[_-]|hmac|focus", re.I)
     for path in paths:
+        assert forbidden.search(path.read_text(encoding="utf-8")) is None, path
+
+
+def test_environment_example_contains_only_personal_etl_inputs():
+    declarations = {
+        match.group(1)
+        for match in re.finditer(
+            r"^([A-Z][A-Z0-9_]*)=", (ROOT / ".env.example").read_text(encoding="utf-8"), re.M
+        )
+    }
+    assert declarations == {
+        "INTERNAL_API_TOKEN",
+        "FINNHUB_API_KEY",
+        "MASSIVE_API_KEY",
+        "NEWSAPI_API_KEY",
+        "GNEWS_API_KEY",
+        "DATA_DIR",
+        "HOST_BIND",
+        "PORT",
+    }
+
+
+def test_no_browser_or_action_surface_is_packaged():
+    frontend = ROOT / "frontend"
+    assert not frontend.exists() or not any(path.is_file() for path in frontend.rglob("*"))
+    runtime_files = sorted((ROOT / "backend/app").rglob("*.py"))
+    forbidden = re.compile(
+        r"sessionStorage|localStorage|action[_-]?(?:api|key)|capabilit|"
+        r"require_(?:owner|admin|expensive)|openai|\bllm\b|focus[_-]?pull",
+        re.I,
+    )
+    for path in runtime_files:
         assert forbidden.search(path.read_text(encoding="utf-8")) is None, path
 
 
@@ -98,8 +130,13 @@ def _compose_services(path: Path) -> list[str]:
 
 
 def test_both_compose_files_have_one_long_running_service():
-    assert _compose_services(ROOT / "docker-compose.yml") == ["macrolens"]
-    assert _compose_services(ROOT / "docker-compose.personal.yml") == ["macrolens"]
+    for name in ("docker-compose.yml", "docker-compose.personal.yml"):
+        path = ROOT / name
+        assert _compose_services(path) == ["macrolens"]
+        text = path.read_text(encoding="utf-8")
+        assert '"${HOST_BIND:-127.0.0.1}:${PORT:-8000}:8000"' in text
+        assert "INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}" in text
+        assert "DATA_DIR: /app/data" in text
     dockerfile = (ROOT / "backend/Dockerfile").read_text(encoding="utf-8")
     assert '"--workers"' not in dockerfile
     assert "analysis-worker" not in dockerfile
