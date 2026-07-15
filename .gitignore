@@ -3,6 +3,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+secrets.env
+secrets.env.bak.*
+.secrets.env.lock
+.secrets.env.*.tmp
 *.db
 node_modules/
 dist/
@@ -12,6 +16,7 @@ backend/data/*.db
 backend/data/
 backend/.env
 .pytest_cache/
+.venv/
 CLAUDE_*.md
 /tmp/
 *.jpg

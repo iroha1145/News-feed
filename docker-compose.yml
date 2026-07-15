@@ -9,15 +9,8 @@ services:
     ports:
       - "${HOST_BIND:-127.0.0.1}:${PORT:-8000}:8000"
     env_file:
-      - path: .env
+      - path: secrets.env
         required: false
-    environment:
-      DATA_DIR: /app/data
-      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
-      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
-      MASSIVE_API_KEY: ${MASSIVE_API_KEY:-}
-      NEWSAPI_API_KEY: ${NEWSAPI_API_KEY:-}
-      GNEWS_API_KEY: ${GNEWS_API_KEY:-}
     volumes:
       - macrolens-data:/app/data
     restart: unless-stopped

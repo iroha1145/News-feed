@@ -69,6 +69,7 @@ def test_runtime_configuration_contains_no_model_settings():
     paths = [
         ROOT / "config/personal.toml",
         ROOT / ".env.example",
+        ROOT / "secrets.env.example",
         ROOT / "docker-compose.yml",
         ROOT / "docker-compose.personal.yml",
         ROOT / "backend/requirements.txt",
@@ -78,23 +79,32 @@ def test_runtime_configuration_contains_no_model_settings():
         assert forbidden.search(path.read_text(encoding="utf-8")) is None, path
 
 
-def test_environment_example_contains_only_personal_etl_inputs():
-    declarations = {
+def test_environment_examples_keep_machine_and_secret_inputs_separate():
+    machine_declarations = {
         match.group(1)
         for match in re.finditer(
             r"^([A-Z][A-Z0-9_]*)=", (ROOT / ".env.example").read_text(encoding="utf-8"), re.M
         )
     }
-    assert declarations == {
+    secret_declarations = {
+        match.group(1)
+        for match in re.finditer(
+            r"^([A-Z][A-Z0-9_]*)=",
+            (ROOT / "secrets.env.example").read_text(encoding="utf-8"),
+            re.M,
+        )
+    }
+    assert machine_declarations == {"HOST_BIND", "PORT"}
+    assert secret_declarations == {
         "INTERNAL_API_TOKEN",
         "FINNHUB_API_KEY",
         "MASSIVE_API_KEY",
         "NEWSAPI_API_KEY",
         "GNEWS_API_KEY",
         "DATA_DIR",
-        "HOST_BIND",
-        "PORT",
     }
+    ignored = set((ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+    assert {"secrets.env", "secrets.env.bak.*", ".secrets.env.lock", ".venv/"} <= ignored
 
 
 def test_no_browser_or_action_surface_is_packaged():
@@ -141,13 +151,24 @@ def _compose_services(path: Path) -> list[str]:
 
 
 def test_both_compose_files_have_one_long_running_service():
+    secret_keys = {
+        "INTERNAL_API_TOKEN",
+        "FINNHUB_API_KEY",
+        "MASSIVE_API_KEY",
+        "NEWSAPI_API_KEY",
+        "GNEWS_API_KEY",
+        "DATA_DIR",
+    }
     for name in ("docker-compose.yml", "docker-compose.personal.yml"):
         path = ROOT / name
         assert _compose_services(path) == ["macrolens"]
         text = path.read_text(encoding="utf-8")
         assert '"${HOST_BIND:-127.0.0.1}:${PORT:-8000}:8000"' in text
-        assert "INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}" in text
-        assert "DATA_DIR: /app/data" in text
+        assert "- path: secrets.env" in text
+        assert "- path: .env" not in text
+        assert "\n    environment:" not in text
+        for key in secret_keys:
+            assert f"${{{key}" not in text
     dockerfile = (ROOT / "backend/Dockerfile").read_text(encoding="utf-8")
     assert '"--workers"' not in dockerfile
     assert "analysis-worker" not in dockerfile
