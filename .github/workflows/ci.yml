@@ -34,15 +34,19 @@ jobs:
     needs: backend
     steps:
       - uses: actions/checkout@v4
-      - name: Validate single-service Compose files
+      - name: Create isolated server Secret file
         env:
           INTERNAL_API_TOKEN: ci-internal-token
+          DATA_DIR: /app/data
+        run: |
+          printf '%s\n' "$INTERNAL_API_TOKEN" | ./personal.sh secrets set INTERNAL_API_TOKEN
+          printf '%s\n' "$DATA_DIR" | ./personal.sh secrets set DATA_DIR
+          ./personal.sh secrets validate
+      - name: Validate single-service Compose files
         run: |
           docker compose config --services | diff -u <(printf 'macrolens\n') -
           docker compose -f docker-compose.personal.yml config --services | diff -u <(printf 'macrolens\n') -
       - name: Build and start MacroLens ETL
-        env:
-          INTERNAL_API_TOKEN: ci-internal-token
         run: docker compose up -d --build --wait --wait-timeout 180 macrolens
       - name: Verify health, authentication, and read-only root
         env:

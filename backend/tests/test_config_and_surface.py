@@ -173,3 +173,13 @@ def test_both_compose_files_have_one_long_running_service():
     assert '"--workers"' not in dockerfile
     assert "analysis-worker" not in dockerfile
     assert "frontend" not in dockerfile
+
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    token_set = './personal.sh secrets set INTERNAL_API_TOKEN'
+    data_dir_set = './personal.sh secrets set DATA_DIR'
+    container_start = 'docker compose up -d --build --wait --wait-timeout 180 macrolens'
+    assert 'printf \'%s\\n\' "$INTERNAL_API_TOKEN" | ' + token_set in workflow
+    assert 'printf \'%s\\n\' "$DATA_DIR" | ' + data_dir_set in workflow
+    assert './personal.sh secrets validate' in workflow
+    assert workflow.index(token_set) < workflow.index(container_start)
+    assert workflow.index(data_dir_set) < workflow.index(container_start)
