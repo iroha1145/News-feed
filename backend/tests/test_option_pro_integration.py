@@ -58,6 +58,7 @@ from app.services.analysis_jobs import (
     claim_next_job,
     create_or_get_job,
     enqueue_auto_jobs,
+    enqueue_manual_jobs_with_status,
     recover_expired_job_leases,
     retry_failed_jobs,
     request_cancel,
@@ -407,6 +408,145 @@ def test_worker_health_checks_real_contract_and_database(isolated_integration_db
         assert await worker_healthcheck() == 0
 
     run(scenario())
+
+
+def test_http_and_container_health_share_clock_skew_safe_worker_selection(
+    isolated_integration_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "option_pro_read_key_id", "read-key")
+    monkeypatch.setattr(settings, "option_pro_read_secret", "read-secret")
+    monkeypatch.setattr(settings, "option_pro_action_key_id", "action-key")
+    monkeypatch.setattr(settings, "option_pro_action_secret", "action-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+    monkeypatch.setattr(settings, "openai_api_key", "test-openai-key")
+
+    class HealthCheckProvider:
+        def capabilities(self):
+            return ProviderCapabilities("ok", True, True, True, True, True)
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        integration_router,
+        "OpenAIResponsesProvider",
+        HealthCheckProvider,
+    )
+    from app.utils import scheduler as scheduler_module
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "get_scheduler",
+        lambda: SimpleNamespace(running=True),
+    )
+
+    async def seed_future_worker():
+        db = await database.get_db()
+        try:
+            now = datetime.now(timezone.utc)
+            await db.execute(
+                """INSERT INTO analysis_worker_state
+                   (worker_id,started_at,heartbeat_at,status)
+                   VALUES (?,?,?, 'idle')""",
+                (
+                    "clock-skewed-old-worker",
+                    (now - timedelta(days=1)).isoformat(),
+                    (now + timedelta(minutes=5)).isoformat(),
+                ),
+            )
+            await db.execute("DELETE FROM source_health")
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def seed_live_worker():
+        db = await database.get_db()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """INSERT INTO analysis_worker_state
+                   (worker_id,started_at,heartbeat_at,status)
+                   VALUES ('current-live-worker',?,?, 'working')""",
+                (now, now),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    run(seed_future_worker())
+    assert run(worker_healthcheck()) == 1
+
+    app = _integration_app()
+    target = "/api/integrations/option-pro/v1/health"
+    with TestClient(app) as client:
+        future_only = client.get(
+            target,
+            headers=_signed_headers(
+                "GET", target, b"", "read-key", "read-secret", "future-only-worker"
+            ),
+        )
+        assert future_only.status_code == 200
+        assert future_only.json()["analysis_queue"]["status"] == "unavailable"
+        assert future_only.json()["analysis_trigger_enabled"] is False
+        assert (
+            "analysis_worker_heartbeat_future" in future_only.json()["warnings"]
+        )
+
+        run(seed_live_worker())
+        assert run(worker_healthcheck()) == 0
+        coexistence = client.get(
+            target,
+            headers=_signed_headers(
+                "GET", target, b"", "read-key", "read-secret", "live-and-future-worker"
+            ),
+        )
+        assert coexistence.status_code == 200
+        assert coexistence.json()["warnings"] == [
+            "analysis_worker_heartbeat_future"
+        ], coexistence.json()["warnings"]
+        assert coexistence.json()["status"] == "ok", coexistence.json()
+        assert coexistence.json()["analysis_queue"]["status"] == "ok"
+        assert coexistence.json()["analysis_trigger_enabled"] is True
+        assert (
+            "analysis_worker_heartbeat_future" in coexistence.json()["warnings"]
+        )
+
+        monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
+
+        async def exhaust_manual_budget():
+            db = await database.get_db()
+            try:
+                await database.insert_news_item(db, news_record(970))
+                await database.insert_news_item(db, news_record(971))
+            finally:
+                await db.close()
+            enqueue_result = await enqueue_manual_jobs_with_status(limit=2)
+            assert enqueue_result.enqueued == 1
+            assert enqueue_result.stop_reason == "daily_job_limit_reached"
+            db = await database.get_db()
+            try:
+                async with db.execute(
+                    """SELECT COUNT(*) FROM analysis_jobs
+                       WHERE status='budget_blocked'"""
+                ) as cursor:
+                    assert int((await cursor.fetchone())[0]) == 0
+            finally:
+                await db.close()
+
+        run(exhaust_manual_budget())
+        budget_health = client.get(
+            target,
+            headers=_signed_headers(
+                "GET", target, b"", "read-key", "read-secret", "budget-health-check"
+            ),
+        )
+        assert budget_health.status_code == 200
+        assert (
+            budget_health.json()["analysis_queue"]["budget_status"]
+            == "budget_blocked"
+        )
 
 
 def test_structured_output_validates_complete_json_and_rejects_unknown_fields():

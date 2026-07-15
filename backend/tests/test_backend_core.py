@@ -295,6 +295,17 @@ def test_manual_analysis_routes_fail_closed_and_report_real_enqueue_count(
         assert no_more.json()["status"] == "no_eligible_news"
         assert no_more.json()["enqueued"] == 0
 
+        run(seed_news(902))
+        monkeypatch.setattr(settings, "news_llm_manual_daily_job_limit", 1)
+        budget_full = client.post(
+            "/api/analysis/trigger?batch_size=5",
+            headers=headers,
+        )
+        assert budget_full.status_code == 200
+        assert budget_full.json()["status"] == "budget_blocked"
+        assert budget_full.json()["enqueued"] == 0
+        assert budget_full.json()["stop_reason"] == "daily_job_limit_reached"
+
     async def assert_manual_job():
         db = await database.get_db()
         try:

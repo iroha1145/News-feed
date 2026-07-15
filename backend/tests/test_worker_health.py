@@ -7,7 +7,10 @@ from datetime import datetime, timedelta, timezone
 import aiosqlite
 
 from app import worker_healthcheck as worker_healthcheck_module
-from app.services.worker_health import evaluate_worker_heartbeat
+from app.services.worker_health import (
+    evaluate_worker_heartbeat,
+    select_worker_heartbeat,
+)
 from app.worker_healthcheck import (
     _periodic_quick_check,
     _quick_check_marker_is_fresh,
@@ -57,6 +60,124 @@ def test_worker_health_rejects_non_serving_status():
         "unavailable",
         "analysis_worker_status_invalid",
     )
+
+
+def test_worker_selection_prefers_live_worker_and_retains_future_diagnostic():
+    async def scenario():
+        db = await aiosqlite.connect(":memory:")
+        try:
+            await db.execute(
+                """CREATE TABLE analysis_worker_state (
+                   worker_id TEXT PRIMARY KEY, heartbeat_at TEXT, status TEXT
+                )"""
+            )
+            await db.executemany(
+                "INSERT INTO analysis_worker_state VALUES (?,?,?)",
+                (
+                    (
+                        "clock-skewed-old-worker",
+                        (NOW + timedelta(minutes=5)).isoformat(),
+                        "idle",
+                    ),
+                    (
+                        "current-live-worker",
+                        (NOW - timedelta(seconds=2)).isoformat(),
+                        "working",
+                    ),
+                ),
+            )
+            selection = await select_worker_heartbeat(db, now=NOW)
+        finally:
+            await db.close()
+
+        assert selection.health_status == "ok"
+        assert selection.warning is None
+        assert selection.worker_id == "current-live-worker"
+        assert selection.diagnostics == ("analysis_worker_heartbeat_future",)
+
+    asyncio.run(scenario())
+
+
+def test_worker_selection_with_only_future_heartbeats_is_unavailable():
+    async def scenario():
+        db = await aiosqlite.connect(":memory:")
+        try:
+            await db.execute(
+                """CREATE TABLE analysis_worker_state (
+                   worker_id TEXT PRIMARY KEY, heartbeat_at TEXT, status TEXT
+                )"""
+            )
+            await db.execute(
+                "INSERT INTO analysis_worker_state VALUES (?,?,?)",
+                (
+                    "clock-skewed-worker",
+                    (NOW + timedelta(minutes=5)).isoformat(),
+                    "idle",
+                ),
+            )
+            selection = await select_worker_heartbeat(db, now=NOW)
+        finally:
+            await db.close()
+
+        assert selection.health_status == "unavailable"
+        assert selection.warning == "analysis_worker_heartbeat_future"
+        assert selection.diagnostics == ("analysis_worker_heartbeat_future",)
+
+    asyncio.run(scenario())
+
+
+def test_worker_selection_prefers_live_worker_over_newer_failed_history():
+    async def scenario():
+        db = await aiosqlite.connect(":memory:")
+        try:
+            await db.execute(
+                """CREATE TABLE analysis_worker_state (
+                   worker_id TEXT PRIMARY KEY, heartbeat_at TEXT, status TEXT
+                )"""
+            )
+            await db.executemany(
+                "INSERT INTO analysis_worker_state VALUES (?,?,?)",
+                (
+                    (
+                        "newer-failed-worker",
+                        (NOW - timedelta(seconds=1)).isoformat(),
+                        "failed",
+                    ),
+                    (
+                        "slightly-older-live-worker",
+                        (NOW - timedelta(seconds=3)).isoformat(),
+                        "idle",
+                    ),
+                ),
+            )
+            selection = await select_worker_heartbeat(db, now=NOW)
+        finally:
+            await db.close()
+
+        assert selection.health_status == "ok"
+        assert selection.worker_id == "slightly-older-live-worker"
+        assert selection.diagnostics == ()
+
+    asyncio.run(scenario())
+
+
+def test_worker_selection_reports_missing_heartbeat_for_empty_table():
+    async def scenario():
+        db = await aiosqlite.connect(":memory:")
+        try:
+            await db.execute(
+                """CREATE TABLE analysis_worker_state (
+                   worker_id TEXT PRIMARY KEY, heartbeat_at TEXT, status TEXT
+                )"""
+            )
+            return await select_worker_heartbeat(db, now=NOW)
+        finally:
+            await db.close()
+
+    selection = asyncio.run(scenario())
+    assert selection.health_status == "unavailable"
+    assert selection.warning == "analysis_worker_heartbeat_missing"
+    assert selection.worker_id is None
 
 
 def test_quick_check_runs_once_per_interval_and_refreshes_marker(tmp_path):
@@ -153,13 +274,16 @@ def test_cached_quick_check_still_validates_contract_heartbeat_and_leases(
         async def fetchone(self):
             return self.row
 
+        async def fetchall(self):
+            return [self.row]
+
     class Database:
         def execute(self, statement):
             queries.append(statement)
             if "sqlite_master" in statement:
                 return Cursor((1,))
             if "analysis_worker_state" in statement:
-                return Cursor((heartbeat_at, "idle"))
+                return Cursor(("health-worker", heartbeat_at, "idle"))
             if "COUNT(*)" in statement:
                 return Cursor((0,))
             raise AssertionError(f"Unexpected database probe: {statement}")

@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from app.config import settings
 from app.models.catalysts import NewsImpactAnalysis
 from app.models.database import get_db
+from app.services.openai_capacity import openai_inflight_counts
 from app.services.responses_runtime import (
     OpenAIResponsesProvider,
     ResponseResult,
@@ -36,6 +37,7 @@ from app.services.ticker_lineage import (
 logger = logging.getLogger(__name__)
 
 ACTIVE_JOB_STATUSES = {"pending", "queued", "in_progress"}
+BATCH_ACCEPTED_JOB_STATUSES = ACTIVE_JOB_STATUSES | {"completed", "insufficient_context"}
 TERMINAL_JOB_STATUSES = {
     "completed", "failed", "cancelled", "insufficient_context", "budget_blocked",
     "incomplete_output",
@@ -58,8 +60,22 @@ class CreateJobResult:
     retry_after: int | None = None
 
 
+@dataclass(frozen=True)
+class EnqueueJobsResult:
+    enqueued: int
+    stop_reason: str | None = None
+
+
 class InputVersionConflict(Exception):
     """The caller tried to enqueue a news revision that is no longer current."""
+
+
+class BudgetUnavailable(Exception):
+    """A batch must leave the candidate pending until capacity becomes available."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def utc_now() -> datetime:
@@ -288,6 +304,21 @@ async def _budget_error(
             ):
                 return "daily_output_token_limit_reached"
     return None
+
+
+async def get_news_budget_error(
+    db: aiosqlite.Connection,
+    *,
+    request_origin: Literal["manual", "automatic"],
+    now: datetime | None = None,
+) -> str | None:
+    """Return the current queue or daily-budget stop reason without writing."""
+
+    return await _budget_error(
+        db,
+        now or utc_now(),
+        request_origin=request_origin,
+    )
 
 
 async def _publish_analysis_locked(
@@ -524,6 +555,7 @@ async def create_or_get_job(
     expected_content_hash: str | None = None,
     expected_change_sequence: int | None = None,
     request_origin: Literal["manual", "automatic"] = "manual",
+    defer_when_budget_unavailable: bool = False,
 ) -> CreateJobResult:
     now = utc_now()
     await db.execute("BEGIN IMMEDIATE")
@@ -602,6 +634,8 @@ async def create_or_get_job(
             if provider_supported and (sufficient or request_origin == "manual")
             else None
         )
+        if budget_error and defer_when_budget_unavailable:
+            raise BudgetUnavailable(budget_error)
         if existing_row and dict(existing_row)["status"] == "budget_blocked" and budget_error:
             existing = dict(existing_row)
             await db.commit()
@@ -711,65 +745,20 @@ async def claim_next_job(db: aiosqlite.Connection, worker_id: str) -> dict[str, 
     await recover_expired_job_leases(db)
     await db.execute("BEGIN IMMEDIATE")
     try:
-        concurrency_limit = min(
-            settings.news_llm_max_inflight,
-            settings.openai_max_concurrency,
-        )
         # Existing Background responses remain in-flight even when an operator
         # changes the process default to worker_sync.  They are always claimed
         # first for retrieve/cancel and never consume a second submission slot.
-        async with db.execute(
-            """SELECT COUNT(*) FROM analysis_jobs
-               WHERE (
-                   openai_response_id IS NOT NULL
-                   AND (
-                       status IN ('queued','in_progress')
-                       OR (status='cancelled' AND error_code IN (
-                           'upstream_cancel_pending','upstream_cancel_observe'
-                       ))
-                   )
-               ) OR (
-                   openai_response_id IS NULL
-                   AND lease_expires_at > ? AND lease_owner IS NOT NULL
-                   AND status IN ('pending','queued','in_progress')
-               ) OR (
-                   openai_response_id IS NULL
-                   AND status='failed'
-                   AND error_code='submission_outcome_unknown'
-                   AND execution_mode='background'
-                   AND submitted_at IS NOT NULL
-                   AND submitted_at >= ?
-               )""",
-            (utc_text(now), unknown_submission_cutoff),
-        ) as cursor:
-            inflight = int((await cursor.fetchone())[0])
-        async with db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='calendar_analysis_jobs'"
-        ) as cursor:
-            calendar_table = await cursor.fetchone()
-        if calendar_table is not None:
-            async with db.execute(
-                """SELECT COUNT(*) FROM calendar_analysis_jobs
-                   WHERE (
-                     openai_response_id IS NOT NULL
-                     AND status IN ('queued','in_progress')
-                   ) OR (
-                     openai_response_id IS NULL AND lease_expires_at > ?
-                     AND lease_owner IS NOT NULL
-                     AND status IN ('pending','queued','in_progress')
-                   ) OR (
-                     openai_response_id IS NULL
-                     AND status='failed'
-                     AND error_code='submission_outcome_unknown'
-                     AND execution_mode='background'
-                     AND submitted_at IS NOT NULL
-                     AND submitted_at >= ?
-                   )""",
-                (utc_text(now), unknown_submission_cutoff),
-            ) as cursor:
-                inflight += int((await cursor.fetchone())[0])
+        counts = await openai_inflight_counts(
+            db,
+            now_text=utc_text(now),
+            unknown_submission_cutoff=unknown_submission_cutoff,
+        )
+        allow_new_submission = (
+            counts.news < settings.news_llm_max_inflight
+            and counts.total < settings.openai_max_concurrency
+        )
         submission_clause = (
-            "" if inflight < concurrency_limit else "AND openai_response_id IS NOT NULL"
+            "" if allow_new_submission else "AND openai_response_id IS NOT NULL"
         )
         cost_gate_clause = """AND (
             openai_response_id IS NOT NULL
@@ -1457,14 +1446,14 @@ async def _enqueue_jobs(
     limit: int | None,
     *,
     request_origin: Literal["manual", "automatic"],
-) -> int:
+) -> EnqueueJobsResult:
     capability = (
         settings.automatic_news_analysis_capability
         if request_origin == "automatic"
         else settings.manual_news_analysis_capability
     )
     if capability != "enabled":
-        return 0
+        return EnqueueJobsResult(0, capability)
     db = await get_db()
     try:
         limit = min(limit or settings.analysis_batch_size, settings.news_llm_max_queued)
@@ -1478,6 +1467,7 @@ async def _enqueue_jobs(
         ) as cursor:
             candidates = [dict(row) for row in await cursor.fetchall()]
         count = 0
+        stop_reason: str | None = None
         for candidate in candidates:
             if count >= limit:
                 break
@@ -1497,29 +1487,48 @@ async def _enqueue_jobs(
                 await db.commit()
                 continue
             priority = 100 if request_origin == "manual" else (50 if has_ticker else 0)
-            result = await create_or_get_job(
-                db,
-                news_id,
-                priority=priority,
-                request_origin=request_origin,
-            )
-            if result.created:
+            try:
+                result = await create_or_get_job(
+                    db,
+                    news_id,
+                    priority=priority,
+                    request_origin=request_origin,
+                    defer_when_budget_unavailable=True,
+                )
+            except BudgetUnavailable as exc:
+                # Leave this candidate and the rest of the batch untouched. A
+                # later budget window or explicit request can pick them up.
+                stop_reason = exc.code
+                break
+            if result.job["status"] in BATCH_ACCEPTED_JOB_STATUSES:
                 count += 1
-        return count
+        return EnqueueJobsResult(count, stop_reason)
     finally:
         await db.close()
+
+
+async def enqueue_auto_jobs_with_status(
+    limit: int | None = None,
+) -> EnqueueJobsResult:
+    return await _enqueue_jobs(limit, request_origin="automatic")
 
 
 async def enqueue_auto_jobs(limit: int | None = None) -> int:
     # Automatic paid work is fail-closed. Both daily limits must be explicit;
     # absent limits never mean unlimited.
-    return await _enqueue_jobs(limit, request_origin="automatic")
+    return (await enqueue_auto_jobs_with_status(limit)).enqueued
+
+
+async def enqueue_manual_jobs_with_status(
+    limit: int | None = None,
+) -> EnqueueJobsResult:
+    return await _enqueue_jobs(limit, request_origin="manual")
 
 
 async def enqueue_manual_jobs(limit: int | None = None) -> int:
     # The manual batch path has separate switches and budgets. It only persists
     # Jobs; the dedicated worker owns every provider request.
-    return await _enqueue_jobs(limit, request_origin="manual")
+    return (await enqueue_manual_jobs_with_status(limit)).enqueued
 
 
 async def retry_failed_jobs(

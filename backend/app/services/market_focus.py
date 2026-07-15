@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -22,6 +23,7 @@ from app.config import settings
 from app.models.database import get_db
 from app.models.market_focus import MarketFocusCycleAnalysis, MarketFocusCyclePublicAnalysis
 from app.services.focus_context import latest_focus_context
+from app.services.openai_capacity import openai_inflight_counts
 from app.services.responses_runtime import (
     OpenAIResponsesProvider,
     ResponseResult,
@@ -2790,7 +2792,12 @@ async def get_hotspot_status(db: aiosqlite.Connection, *, now: datetime | None =
     }
 
 
-async def _cycle_budget_error(db: aiosqlite.Connection, now: datetime) -> str | None:
+async def _cycle_budget_error(
+    db: aiosqlite.Connection,
+    now: datetime,
+    *,
+    requested_max_output_tokens: int,
+) -> str | None:
     if settings.hot_cycle_daily_job_limit is None or settings.hot_cycle_daily_output_token_limit is None:
         return "budget_configuration_required"
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -2811,7 +2818,10 @@ async def _cycle_budget_error(db: aiosqlite.Connection, now: datetime) -> str | 
         (day_start,),
     ) as cursor:
         reserved = int((await cursor.fetchone())[0])
-    if reserved + settings.hot_cycle_max_output_tokens > settings.hot_cycle_daily_output_token_limit:
+    if (
+        reserved + requested_max_output_tokens
+        > settings.hot_cycle_daily_output_token_limit
+    ):
         return "daily_output_token_limit_reached"
     return None
 
@@ -2904,7 +2914,12 @@ async def create_market_focus_cycle(
             raise CycleConflict(settings.automatic_hot_cycle_capability)
         elif trigger_type == "scheduled_2000" and not settings.hot_cycle_optional_20_et:
             raise CycleConflict("optional_2000_cycle_disabled")
-        budget_error = await _cycle_budget_error(db, now)
+        requested_max_output_tokens = settings.hot_cycle_max_output_tokens
+        budget_error = await _cycle_budget_error(
+            db,
+            now,
+            requested_max_output_tokens=requested_max_output_tokens,
+        )
         if budget_error:
             raise CycleConflict(budget_error)
         async with db.execute(
@@ -3038,7 +3053,7 @@ async def create_market_focus_cycle(
                 settings.hot_cycle_schema_version, input_hash, input_json, len(bounded_events),
                 len(input_payload["focus_symbols"]), settings.hot_cycle_model,
                 settings.hot_cycle_reasoning, settings.openai_execution_mode,
-                settings.hot_cycle_max_output_tokens, settings.hot_cycle_prompt_version,
+                requested_max_output_tokens, settings.hot_cycle_prompt_version,
                 settings.hot_cycle_schema_version, prompt_cache_key, utc_text(now), utc_text(now),
             ),
         )
@@ -3454,7 +3469,15 @@ async def retry_market_focus_cycle(
         retry_at = updated + timedelta(seconds=settings.hot_cycle_manual_cooldown_seconds)
         if now < retry_at:
             raise CycleConflict("retry_cooldown", max(1, int((retry_at - now).total_seconds())))
-        budget_error = await _cycle_budget_error(db, now)
+        requested_max_output_tokens = min(
+            int(parent["max_output_tokens"]),
+            settings.hot_cycle_max_output_tokens,
+        )
+        budget_error = await _cycle_budget_error(
+            db,
+            now,
+            requested_max_output_tokens=requested_max_output_tokens,
+        )
         if budget_error:
             raise CycleConflict(budget_error)
         execution_number = int(parent.get("execution_number") or 1) + 1
@@ -3484,7 +3507,8 @@ async def retry_market_focus_cycle(
                 parent["snapshot_as_of"], parent["input_schema_version"], input_hash,
                 input_json, parent["event_group_count"], parent["focus_symbol_count"],
                 parent["provider"], parent["model"], parent["reasoning_effort"],
-                parent["execution_mode"], parent["max_output_tokens"], parent["prompt_version"],
+                parent["execution_mode"], requested_max_output_tokens,
+                parent["prompt_version"],
                 parent["output_schema_version"], parent["prompt_cache_key"], utc_text(now), utc_text(now),
             ),
         )
@@ -3523,6 +3547,96 @@ async def retry_market_focus_cycle(
         raise
 
 
+def _market_focus_renewal_interval_seconds() -> float:
+    """Keep renewals frequent enough for health without creating DB churn."""
+
+    return max(5, min(15, settings.analysis_worker_lease_seconds // 3))
+
+
+async def _renew_market_focus_lease(
+    cycle: dict[str, Any],
+    stop: asyncio.Event,
+) -> None:
+    lease_seconds = settings.analysis_worker_lease_seconds
+    if cycle.get("execution_mode") == "worker_sync":
+        lease_seconds = max(
+            lease_seconds,
+            settings.openai_sync_timeout_seconds + 30,
+        )
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=_market_focus_renewal_interval_seconds(),
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        renewal_db = None
+        try:
+            renewal_db = await get_db()
+            now = utc_now()
+            renewed = await renewal_db.execute(
+                """UPDATE market_focus_cycles SET lease_expires_at=?,updated_at=?
+                   WHERE cycle_id=? AND fencing_token=? AND lease_owner=?
+                     AND status='in_progress'""",
+                (
+                    utc_text(now + timedelta(seconds=lease_seconds)),
+                    utc_text(now),
+                    cycle["cycle_id"],
+                    cycle["fencing_token"],
+                    cycle["lease_owner"],
+                ),
+            )
+            if renewed.rowcount == 1:
+                await renewal_db.execute(
+                    """UPDATE analysis_worker_state SET heartbeat_at=?
+                       WHERE worker_id=? AND status='working'""",
+                    (utc_text(now), cycle["lease_owner"]),
+                )
+            await renewal_db.commit()
+        except Exception:
+            if renewal_db is not None:
+                await renewal_db.rollback()
+            logger.warning("Market focus worker lease renewal was deferred")
+        finally:
+            if renewal_db is not None:
+                await renewal_db.close()
+
+
+async def _mark_market_focus_submission_started(
+    db: aiosqlite.Connection,
+    *,
+    cycle: dict[str, Any],
+    worker_id: str,
+    fencing_token: int,
+    lease_seconds: int,
+) -> bool:
+    """Revalidate ownership immediately before opening a paid request."""
+
+    now = utc_now()
+    now_text = utc_text(now)
+    changed = await db.execute(
+        """UPDATE market_focus_cycles SET attempt_count=attempt_count+1,
+           error_code='submission_in_progress',lease_expires_at=?,updated_at=?
+           WHERE cycle_id=? AND fencing_token=? AND lease_owner=?
+             AND status='in_progress' AND lease_expires_at>?""",
+        (
+            utc_text(now + timedelta(seconds=lease_seconds)),
+            now_text,
+            cycle["cycle_id"],
+            fencing_token,
+            worker_id,
+            now_text,
+        ),
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        return False
+    await db.commit()
+    return True
+
+
 async def run_market_focus_worker_once(
     *,
     provider: ResponsesProvider | None = None,
@@ -3532,10 +3646,27 @@ async def run_market_focus_worker_once(
     provider = provider or OpenAIResponsesProvider()
     worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     db = await get_db()
+    renewal_stop: asyncio.Event | None = None
+    renewal_task: asyncio.Task[None] | None = None
+    worker_state_initialized = False
+    worker_iteration_failed = False
     try:
+        worker_now = utc_text()
+        await db.execute(
+            """INSERT INTO analysis_worker_state(worker_id,started_at,heartbeat_at,status)
+               VALUES (?,?,?,'idle')
+               ON CONFLICT(worker_id) DO UPDATE SET heartbeat_at=excluded.heartbeat_at,
+                 status='idle',error_code=NULL""",
+            (worker_id, worker_now, worker_now),
+        )
+        await db.commit()
+        worker_state_initialized = True
         await db.execute("BEGIN IMMEDIATE")
         now = utc_now()
         now_text = utc_text(now)
+        unknown_submission_cutoff = utc_text(
+            now - timedelta(seconds=settings.openai_background_poll_timeout_seconds)
+        )
         # A submitted response can be recovered by id. An unlinked submission
         # is never retried automatically because its cost outcome is unknown.
         async with db.execute(
@@ -3572,8 +3703,18 @@ async def run_market_focus_worker_once(
                    WHERE singleton_id=1 AND active_cycle_id=?""",
                 (now_text, now_text, expired_cycle_id),
             )
+        counts = await openai_inflight_counts(
+            db,
+            now_text=now_text,
+            unknown_submission_cutoff=unknown_submission_cutoff,
+        )
+        submission_clause = (
+            ""
+            if counts.total < settings.openai_max_concurrency
+            else "AND openai_response_id IS NOT NULL"
+        )
         async with db.execute(
-            """SELECT * FROM market_focus_cycles
+            f"""SELECT * FROM market_focus_cycles
                WHERE status IN ('pending','queued','in_progress')
                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
                  AND (lease_expires_at IS NULL OR lease_expires_at<=?)
@@ -3582,6 +3723,7 @@ async def run_market_focus_worker_once(
                    OR (trigger_type='manual' AND ?)
                    OR (trigger_type<>'manual' AND ?)
                  )
+                 {submission_clause}
                ORDER BY created_at LIMIT 1""",
             (
                 now_text,
@@ -3617,8 +3759,22 @@ async def run_market_focus_worker_once(
         if claimed.rowcount != 1:
             await db.rollback()
             return False
+        await db.execute(
+            """UPDATE analysis_worker_state SET heartbeat_at=?,status='working',
+               last_job_id=?,error_code=NULL WHERE worker_id=?""",
+            (utc_text(), cycle["cycle_id"], worker_id),
+        )
         await db.commit()
-        cycle.update(status="in_progress", lease_owner=worker_id, lease_expires_at=lease_expires, fencing_token=fence)
+        cycle.update(
+            status="in_progress",
+            lease_owner=worker_id,
+            lease_expires_at=lease_expires,
+            fencing_token=fence,
+        )
+        renewal_stop = asyncio.Event()
+        renewal_task = asyncio.create_task(
+            _renew_market_focus_lease(cycle, renewal_stop)
+        )
         if not cycle.get("openai_response_id"):
             try:
                 _cycle_formula_parameters(json.loads(cycle["input_json"]))
@@ -3789,13 +3945,14 @@ async def run_market_focus_worker_once(
             prompt_cache_key=str(cycle["prompt_cache_key"]),
         )
         model_input = f"<untrusted_market_focus_snapshot>\n{cycle['input_json']}\n</untrusted_market_focus_snapshot>"
-        await db.execute(
-            """UPDATE market_focus_cycles SET attempt_count=attempt_count+1,
-               error_code='submission_in_progress',updated_at=?
-               WHERE cycle_id=? AND fencing_token=? AND lease_owner=?""",
-            (utc_text(), cycle["cycle_id"], fence, worker_id),
-        )
-        await db.commit()
+        if not await _mark_market_focus_submission_started(
+            db,
+            cycle=cycle,
+            worker_id=worker_id,
+            fencing_token=fence,
+            lease_seconds=lease_seconds,
+        ):
+            return False
         try:
             if cycle["execution_mode"] == "worker_sync":
                 result = await provider.create_sync(model_input, **kwargs)
@@ -3863,7 +4020,36 @@ async def run_market_focus_worker_once(
                 fencing_token=fence,
             )
         return True
+    except Exception:
+        worker_iteration_failed = True
+        await db.rollback()
+        raise
     finally:
+        if renewal_stop is not None:
+            renewal_stop.set()
+        if renewal_task is not None:
+            await renewal_task
+        if worker_state_initialized:
+            try:
+                finished_at = utc_text()
+                await db.execute(
+                    """UPDATE analysis_worker_state SET heartbeat_at=?,status=?,error_code=?
+                       WHERE worker_id=?""",
+                    (
+                        finished_at,
+                        "failed" if worker_iteration_failed else "idle",
+                        (
+                            "market_focus_worker_iteration_failed"
+                            if worker_iteration_failed
+                            else None
+                        ),
+                        worker_id,
+                    ),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.warning("Market focus worker state finalization was deferred")
         await db.close()
         if owned and callable(getattr(provider, "close", None)):
             await provider.close()
