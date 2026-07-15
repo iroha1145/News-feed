@@ -45,6 +45,16 @@ class ResponseResult:
     reasoning_effort: str | None = None
 
 
+class ProviderRequestRejected(RuntimeError):
+    """A provider response proves that no paid response task was accepted."""
+
+    error_code = "provider_request_rejected"
+
+    def __init__(self, *, status_code: int) -> None:
+        super().__init__(self.error_code)
+        self.status_code = status_code
+
+
 class ResponsesProvider(Protocol):
     def capabilities(self) -> ProviderCapabilities: ...
 
@@ -261,6 +271,29 @@ class OpenAIResponsesProvider:
             raise RuntimeError("unsupported_provider_capability")
         return self.client.responses
 
+    async def _create_response(
+        self,
+        request: dict[str, Any],
+        *,
+        background: bool,
+        store: bool,
+    ) -> Any:
+        try:
+            return await self._responses().create(
+                **request,
+                background=background,
+                store=store,
+            )
+        except Exception as exc:
+            # OpenAI validation/auth/model errors prove that the Responses API
+            # rejected the request before creating a billable response. Keep
+            # transport timeouts, conflicts and rate-limit paths conservative:
+            # their submission outcome is handled as unknown by the caller.
+            status_code = getattr(exc, "status_code", None)
+            if status_code in {400, 401, 403, 404, 405, 413, 415, 422}:
+                raise ProviderRequestRejected(status_code=int(status_code)) from exc
+            raise
+
     async def create_background(
         self,
         model_input: str,
@@ -272,8 +305,8 @@ class OpenAIResponsesProvider:
         instructions: str | None = None,
         prompt_cache_key: str | None = None,
     ) -> ResponseResult:
-        result = await self._responses().create(
-            **self._common_request(
+        result = await self._create_response(
+            self._common_request(
                 model_input,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -304,8 +337,8 @@ class OpenAIResponsesProvider:
         instructions: str | None = None,
         prompt_cache_key: str | None = None,
     ) -> ResponseResult:
-        result = await self._responses().create(
-            **self._common_request(
+        result = await self._create_response(
+            self._common_request(
                 model_input,
                 model=model,
                 reasoning_effort=reasoning_effort,

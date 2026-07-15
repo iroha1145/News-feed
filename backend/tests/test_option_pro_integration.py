@@ -66,6 +66,7 @@ from app.services.analysis_jobs import (
 )
 from app.services.responses_runtime import (
     OpenAIResponsesProvider,
+    ProviderRequestRejected,
     ProviderCapabilities,
     ResponseResult,
     structured_output_format,
@@ -338,6 +339,56 @@ def test_third_party_default_key_is_never_given_to_async_openai(monkeypatch):
     assert "anthropic-secret-never-for-openai" not in captured_keys
     assert provider.capabilities().status == "not_configured"
     run(provider.close())
+
+
+@pytest.mark.parametrize("create_method", ("create_background", "create_sync"))
+def test_openai_provider_separates_definitive_4xx_from_ambiguous_failures(
+    create_method,
+):
+    class RejectedRequest(RuntimeError):
+        status_code = 400
+
+        def __str__(self):
+            return "provider detail must not become the durable error code"
+
+    class FakeResponses:
+        def __init__(self, failure):
+            self.failure = failure
+
+        async def create(self, **_kwargs):
+            raise self.failure
+
+        async def retrieve(self, _response_id):
+            raise AssertionError("no retrieve request is expected")
+
+        async def cancel(self, _response_id):
+            raise AssertionError("no cancel request is expected")
+
+    class FakeClient:
+        def __init__(self, failure):
+            self.responses = FakeResponses(failure)
+
+    rejected = OpenAIResponsesProvider(client=FakeClient(RejectedRequest()))
+    with pytest.raises(ProviderRequestRejected) as caught:
+        run(getattr(rejected, create_method)("bounded input"))
+    assert caught.value.error_code == "provider_request_rejected"
+    assert caught.value.status_code == 400
+    assert str(caught.value) == "provider_request_rejected"
+
+    class RateLimitedRequest(RuntimeError):
+        status_code = 429
+
+    rate_limited = OpenAIResponsesProvider(
+        client=FakeClient(RateLimitedRequest("rate limited"))
+    )
+    with pytest.raises(RateLimitedRequest, match="rate limited"):
+        run(getattr(rate_limited, create_method)("bounded input"))
+
+    timed_out = OpenAIResponsesProvider(
+        client=FakeClient(TimeoutError("connection timed out"))
+    )
+    with pytest.raises(TimeoutError, match="connection timed out"):
+        run(getattr(timed_out, create_method)("bounded input"))
 
 
 def test_non_openai_default_provider_creates_no_openai_work(
