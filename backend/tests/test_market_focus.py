@@ -3342,18 +3342,29 @@ def test_market_focus_long_retrieve_renews_lease_and_worker_heartbeat(
             finally:
                 await db.close()
 
-            await asyncio.sleep(0.05)
-            db = await database.get_db()
-            try:
-                selection = await select_worker_heartbeat(db)
-                async with db.execute(
-                    """SELECT lease_expires_at FROM market_focus_cycles
-                       WHERE cycle_id=?""",
-                    (cycle["cycle_id"],),
-                ) as cursor:
-                    lease_after = str((await cursor.fetchone())[0])
-            finally:
-                await db.close()
+            deadline = asyncio.get_running_loop().time() + 1
+            while True:
+                db = await database.get_db()
+                try:
+                    selection = await select_worker_heartbeat(db)
+                    async with db.execute(
+                        """SELECT lease_expires_at FROM market_focus_cycles
+                           WHERE cycle_id=?""",
+                        (cycle["cycle_id"],),
+                    ) as cursor:
+                        lease_after = str((await cursor.fetchone())[0])
+                finally:
+                    await db.close()
+                if (
+                    selection.health_status == "ok"
+                    and selection.worker_id == worker_id
+                    and selection.heartbeat_at != stale
+                    and lease_after > lease_before
+                ):
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
 
             assert selection.health_status == "ok"
             assert selection.worker_id == worker_id
