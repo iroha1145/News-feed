@@ -1491,7 +1491,11 @@ async def _recover_legacy_market_focus_rejections_v5(
         if cycle_row is None:
             authorization_mismatches += 1
             continue
-        cycle = dict(zip(columns, cycle_row, strict=True))
+        if len(columns) != len(cycle_row):
+            raise RuntimeError(
+                "Market focus recovery row does not match the database schema"
+            )
+        cycle = dict(zip(columns, cycle_row))
         if not _legacy_market_focus_cycle_matches_authorization(cycle, authorization):
             authorization_mismatches += 1
             continue
