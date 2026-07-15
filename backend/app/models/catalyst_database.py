@@ -10,7 +10,19 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-CATALYST_SCHEMA_MIGRATION = 4
+CATALYST_SCHEMA_MIGRATION = 5
+
+# Versioned recovery constants for the one legacy request shape that is known
+# to have been rejected by the provider before a response task was created.
+# These values are deliberately frozen instead of following current runtime
+# settings: widening them would risk releasing genuinely cost-unknown work.
+LEGACY_MARKET_FOCUS_CACHE_KEY_LENGTH = 75
+LEGACY_MARKET_FOCUS_PROVIDER_CACHE_KEY_LIMIT = 64
+LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES = 100
+LEGACY_MARKET_FOCUS_RECOVERY_MIGRATION_VERSION = 5
+LEGACY_MARKET_FOCUS_RECOVERY_REASON = (
+    "legacy_prompt_cache_key_400_string_above_max_length"
+)
 
 
 CREATE_ANALYSIS_JOBS = """
@@ -528,6 +540,21 @@ CREATE TABLE IF NOT EXISTS market_focus_cycles (
 )
 """
 
+CREATE_MARKET_FOCUS_CYCLE_RECOVERY_AUDIT = """
+CREATE TABLE IF NOT EXISTS market_focus_cycle_recovery_audit (
+    cycle_id TEXT PRIMARY KEY,
+    migration_version INTEGER NOT NULL CHECK(migration_version >= 5),
+    reason_code TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    original_cycle_state_json TEXT NOT NULL,
+    original_cycle_state_sha256 TEXT NOT NULL CHECK(length(original_cycle_state_sha256) = 64),
+    released_prepared_revisions_json TEXT NOT NULL,
+    active_cycle_released INTEGER NOT NULL CHECK(active_cycle_released IN (0,1)),
+    action_json TEXT NOT NULL,
+    recovered_at TEXT NOT NULL
+)
+"""
+
 CREATE_MARKET_FOCUS_CYCLE_EVENTS = """
 CREATE TABLE IF NOT EXISTS market_focus_cycle_events (
     cycle_id TEXT NOT NULL REFERENCES market_focus_cycles(cycle_id) ON DELETE CASCADE,
@@ -575,6 +602,7 @@ TABLES = [
     CREATE_HOTSPOT_PREPARATION_SETS,
     CREATE_HOTSPOT_PREPARATION_STATE,
     CREATE_MARKET_FOCUS_CYCLES,
+    CREATE_MARKET_FOCUS_CYCLE_RECOVERY_AUDIT,
     CREATE_MARKET_FOCUS_CYCLE_EVENTS,
     CREATE_MARKET_FOCUS_CYCLE_ARCHIVES,
 ]
@@ -1322,6 +1350,290 @@ async def _migrate_ticker_lineage_v4(
     }
 
 
+async def _recover_legacy_market_focus_rejections_v5(
+    db: aiosqlite.Connection,
+    *,
+    recovered_at: str | None = None,
+) -> dict[str, int]:
+    """Release only the incident-proven legacy 75-character cache-key failures.
+
+    Older workers persisted every create exception as ``submission_outcome_unknown``.
+    The affected production requests are distinguishable without trusting a broad
+    exception class: their stored key is exactly the legacy request formula, is
+    exactly 75 characters, and therefore exceeds the provider's documented
+    64-character limit.  The remaining predicates reproduce the direct rejection
+    path and the preparation lease graph.  Any mismatch stays cost-unknown.
+    """
+
+    recovered_at = recovered_at or _utc_now()
+    async with db.execute(
+        """SELECT c.* FROM market_focus_cycles c
+           WHERE c.status='failed'
+             AND c.error_code='submission_outcome_unknown'
+             AND c.provider='openai'
+             AND c.openai_response_id IS NULL
+             AND c.result_json IS NULL
+             AND c.attempt_count=1
+             AND c.retrieve_error_count=0
+             AND c.cancel_attempt_count=0
+             AND c.next_attempt_at IS NULL
+             AND c.cancel_requested_at IS NULL
+             AND c.lease_owner IS NULL
+             AND c.lease_expires_at IS NULL
+             AND c.fencing_token=1
+             AND c.latency_ms IS NULL
+             AND c.usage_input_tokens=0
+             AND c.usage_cached_input_tokens=0
+             AND c.usage_cache_write_tokens=0
+             AND c.usage_reasoning_tokens=0
+             AND c.usage_output_tokens=0
+             AND c.usage_total_tokens=0
+             AND c.retry_of_cycle_id IS NULL
+             AND c.execution_number=1
+             AND c.no_new_hot_events=0
+             AND c.event_group_count>0
+             AND c.consumes_through_revision IS NOT NULL
+             AND c.prepared_revision>=c.consumes_through_revision
+             AND c.started_at IS NOT NULL
+             AND c.completed_at IS NOT NULL
+             AND c.updated_at=c.completed_at
+             AND length(c.input_hash)=64
+             AND json_valid(c.input_json)=1
+             AND c.prompt_cache_key=(
+               'market_focus_cycle:' || c.prompt_version || ':' ||
+               c.output_schema_version || ':' || c.model || ':' ||
+               c.reasoning_effort
+             )
+             AND length(c.prompt_cache_key)=?
+             AND NOT EXISTS (
+               SELECT 1 FROM market_focus_cycles child
+               WHERE child.retry_of_cycle_id=c.cycle_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM market_focus_cycle_archives archive
+               WHERE archive.cycle_id=c.cycle_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM market_focus_cycle_recovery_audit audit
+               WHERE audit.cycle_id=c.cycle_id
+             )
+           ORDER BY c.created_at,c.cycle_id
+           LIMIT ?""",
+        (
+            LEGACY_MARKET_FOCUS_CACHE_KEY_LENGTH,
+            LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES + 1,
+        ),
+    ) as cursor:
+        columns = [str(column[0]) for column in cursor.description or ()]
+        candidates = [
+            dict(zip(columns, row, strict=True)) for row in await cursor.fetchall()
+        ]
+
+    if len(candidates) > LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES:
+        raise RuntimeError("legacy_market_focus_recovery_candidate_limit_exceeded")
+
+    recovered_cycles = 0
+    released_preparations = 0
+    released_active_cycles = 0
+    skipped_inconsistent_leases = 0
+    for cycle in candidates:
+        cycle_id = str(cycle["cycle_id"])
+        async with db.execute(
+            """SELECT e.prepared_revision,e.event_group_id,e.event_group_version,
+                      h.event_group_id,h.event_group_version,h.status,
+                      h.leased_cycle_id,h.consumed_cycle_id,h.consumed_at
+               FROM market_focus_cycle_events e
+               JOIN hotspot_preparation_sets h
+                 ON h.prepared_revision=e.prepared_revision
+               WHERE e.cycle_id=?
+               ORDER BY e.prepared_revision""",
+            (cycle_id,),
+        ) as cursor:
+            preparation_rows = await cursor.fetchall()
+        async with db.execute(
+            """SELECT COUNT(*) FROM hotspot_preparation_sets
+               WHERE leased_cycle_id=?""",
+            (cycle_id,),
+        ) as cursor:
+            leased_count = int((await cursor.fetchone())[0])
+
+        prepared_revisions = [int(row[0]) for row in preparation_rows]
+        consumes_through = int(cycle["consumes_through_revision"])
+        last_consumed = int(cycle["last_consumed_revision_at_start"])
+        lease_graph_is_exact = bool(preparation_rows) and all(
+            str(row[1]) == str(row[3])
+            and int(row[2]) == int(row[4])
+            and str(row[5]) == "LEASED"
+            and str(row[6]) == cycle_id
+            and row[7] is None
+            and row[8] is None
+            and last_consumed < int(row[0]) <= consumes_through
+            for row in preparation_rows
+        )
+        lease_graph_is_exact = bool(
+            lease_graph_is_exact
+            and len(preparation_rows) == int(cycle["event_group_count"])
+            and leased_count == len(preparation_rows)
+            and max(prepared_revisions) == consumes_through
+        )
+        if not lease_graph_is_exact:
+            skipped_inconsistent_leases += 1
+            logger.warning(
+                "Legacy market focus rejection recovery skipped an inconsistent "
+                "lease graph (cycle_id=%s)",
+                cycle_id,
+            )
+            continue
+
+        async with db.execute(
+            """SELECT active_cycle_id FROM hotspot_preparation_state
+               WHERE singleton_id=1"""
+        ) as cursor:
+            state_row = await cursor.fetchone()
+        active_cycle_released = bool(
+            state_row is not None and str(state_row[0] or "") == cycle_id
+        )
+
+        original_state = {
+            key: cycle.get(key)
+            for key in (
+                "cycle_id",
+                "retry_of_cycle_id",
+                "execution_number",
+                "trigger_type",
+                "status",
+                "provider",
+                "model",
+                "reasoning_effort",
+                "execution_mode",
+                "prompt_version",
+                "output_schema_version",
+                "prompt_cache_key",
+                "openai_response_id",
+                "error_code",
+                "attempt_count",
+                "retrieve_error_count",
+                "cancel_attempt_count",
+                "lease_owner",
+                "lease_expires_at",
+                "fencing_token",
+                "latency_ms",
+                "usage_input_tokens",
+                "usage_cached_input_tokens",
+                "usage_cache_write_tokens",
+                "usage_reasoning_tokens",
+                "usage_output_tokens",
+                "usage_total_tokens",
+                "input_hash",
+                "event_group_count",
+                "prepared_revision",
+                "last_consumed_revision_at_start",
+                "consumes_through_revision",
+                "created_at",
+                "started_at",
+                "completed_at",
+                "updated_at",
+            )
+        }
+        original_state["active_cycle_id"] = state_row[0] if state_row else None
+        original_state_json = json.dumps(
+            original_state, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        evidence = {
+            "evidence_version": "legacy-market-focus-cache-key-rejection-v1",
+            "evidence_source": "deterministic_legacy_request_shape_and_confirmed_provider_incident",
+            "provider": "openai",
+            "http_status": 400,
+            "provider_error_type": "string_above_max_length",
+            "provider_error_param": "prompt_cache_key",
+            "provider_max_length": LEGACY_MARKET_FOCUS_PROVIDER_CACHE_KEY_LIMIT,
+            "observed_prompt_cache_key_length": len(str(cycle["prompt_cache_key"])),
+            "legacy_key_formula": (
+                "market_focus_cycle:{prompt_version}:{output_schema_version}:"
+                "{model}:{reasoning_effort}"
+            ),
+            "response_task_id_present": False,
+            "token_usage_present": False,
+            "preparation_lease_graph_verified": True,
+            "preparation_leases": [
+                {
+                    "prepared_revision": int(row[0]),
+                    "event_group_id": str(row[1]),
+                    "event_group_version": int(row[2]),
+                    "status": str(row[5]),
+                    "leased_cycle_id": str(row[6]),
+                }
+                for row in preparation_rows
+            ],
+        }
+        action = {
+            "cycle_error_code": "provider_request_rejected",
+            "preparation_status": "PREPARED",
+            "budget_reservation": "released",
+            "active_cycle_released": active_cycle_released,
+        }
+
+        changed = await db.execute(
+            """UPDATE market_focus_cycles
+               SET error_code='provider_request_rejected',updated_at=?
+               WHERE cycle_id=? AND status='failed'
+                 AND error_code='submission_outcome_unknown'
+                 AND openai_response_id IS NULL
+                 AND prompt_cache_key=?""",
+            (recovered_at, cycle_id, cycle["prompt_cache_key"]),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("legacy_market_focus_recovery_cycle_changed")
+        released = await db.execute(
+            """UPDATE hotspot_preparation_sets
+               SET status='PREPARED',leased_cycle_id=NULL
+               WHERE leased_cycle_id=? AND status='LEASED'""",
+            (cycle_id,),
+        )
+        if released.rowcount != len(preparation_rows):
+            raise RuntimeError("legacy_market_focus_recovery_lease_changed")
+        active_change = await db.execute(
+            """UPDATE hotspot_preparation_state
+               SET active_cycle_id=NULL,
+                   last_cycle_at=COALESCE(last_cycle_at,?),updated_at=?
+               WHERE singleton_id=1 AND active_cycle_id=?""",
+            (cycle["completed_at"], recovered_at, cycle_id),
+        )
+        if active_change.rowcount != int(active_cycle_released):
+            raise RuntimeError("legacy_market_focus_recovery_active_cycle_changed")
+        await db.execute(
+            """INSERT INTO market_focus_cycle_recovery_audit
+               (cycle_id,migration_version,reason_code,evidence_json,
+                original_cycle_state_json,original_cycle_state_sha256,
+                released_prepared_revisions_json,active_cycle_released,
+                action_json,recovered_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                cycle_id,
+                LEGACY_MARKET_FOCUS_RECOVERY_MIGRATION_VERSION,
+                LEGACY_MARKET_FOCUS_RECOVERY_REASON,
+                json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                original_state_json,
+                hashlib.sha256(original_state_json.encode()).hexdigest(),
+                json.dumps(prepared_revisions, separators=(",", ":")),
+                int(active_cycle_released),
+                json.dumps(action, separators=(",", ":"), sort_keys=True),
+                recovered_at,
+            ),
+        )
+        recovered_cycles += 1
+        released_preparations += len(preparation_rows)
+        released_active_cycles += int(active_cycle_released)
+
+    return {
+        "candidates_scanned": len(candidates),
+        "cycles_recovered": recovered_cycles,
+        "preparations_released": released_preparations,
+        "active_cycles_released": released_active_cycles,
+        "inconsistent_lease_graphs_skipped": skipped_inconsistent_leases,
+    }
+
+
 async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
     """Apply additive, idempotent integration migrations without rebuilding legacy tables."""
     async with db.execute("PRAGMA user_version") as cursor:
@@ -1349,6 +1661,7 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
             migration_lock_held = True
     needs_v3_migration = current_migration < 3
     needs_v4_migration = current_migration < 4
+    needs_v5_migration = current_migration < 5
     await _add_column(db, "news_items", "updated_at", "TEXT")
     await _add_column(db, "news_items", "source_tickers", "TEXT NOT NULL DEFAULT '[]'")
     await db.execute("UPDATE news_items SET updated_at = COALESCE(updated_at, fetched_at) WHERE updated_at IS NULL")
@@ -1581,6 +1894,18 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
             migration_stats["validation_revisions_backfilled"],
             migration_stats["invalid_impacts_removed"],
         )
+    if needs_v5_migration:
+        recovery_stats = await _recover_legacy_market_focus_rejections_v5(db)
+        logger.info(
+            "market_focus_legacy_recovery_v5_completed "
+            "candidates_scanned=%s cycles_recovered=%s preparations_released=%s "
+            "active_cycles_released=%s inconsistent_lease_graphs_skipped=%s",
+            recovery_stats["candidates_scanned"],
+            recovery_stats["cycles_recovered"],
+            recovery_stats["preparations_released"],
+            recovery_stats["active_cycles_released"],
+            recovery_stats["inconsistent_lease_graphs_skipped"],
+        )
 
     for statement in INDEXES:
         await db.execute(statement)
@@ -1592,7 +1917,7 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
     )
     for statement in TRIGGERS:
         await db.execute(statement)
-    if needs_v3_migration or needs_v4_migration:
+    if needs_v3_migration or needs_v4_migration or needs_v5_migration:
         await db.execute(f"PRAGMA user_version={CATALYST_SCHEMA_MIGRATION}")
     await db.commit()
     if migration_lock_held:

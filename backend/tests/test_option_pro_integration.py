@@ -1959,7 +1959,7 @@ def test_legacy_schema_upgrade_is_idempotent_and_does_not_publish_logic_chain(tm
                 "event_projection_status",
             } <= source_columns
             async with db.execute("PRAGMA user_version") as cursor:
-                assert (await cursor.fetchone())[0] == 4
+                assert (await cursor.fetchone())[0] == 5
             async with db.execute(
                 "SELECT source_input_hash,content_hash FROM analysis_jobs WHERE job_id='legacy-job'"
             ) as cursor:

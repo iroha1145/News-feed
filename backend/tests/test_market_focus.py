@@ -5,10 +5,11 @@ import hashlib
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import aiosqlite
 import pytest
 
 from app.config import Settings, settings
-from app.models import database
+from app.models import catalyst_database, database
 from app.services.analysis_jobs import (
     CreateJobResult,
     claim_next_job,
@@ -3810,6 +3811,276 @@ class RejectedCycleProvider(BlockingCycleProvider):
         self.create_calls += 1
         self.prompt_cache_key = kwargs["prompt_cache_key"]
         raise ProviderRequestRejected(status_code=400)
+
+
+def _legacy_market_focus_cache_key(cycle: dict) -> str:
+    return ":".join(
+        (
+            "market_focus_cycle",
+            str(cycle["prompt_version"]),
+            str(cycle["output_schema_version"]),
+            str(cycle["model"]),
+            str(cycle["reasoning_effort"]),
+        )
+    )
+
+
+async def _stage_legacy_cache_key_rejection(db, cycle: dict) -> str:
+    legacy_key = _legacy_market_focus_cache_key(cycle)
+    assert len(legacy_key) == 75
+    started_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    failed_at = started_at + timedelta(seconds=1)
+    await db.execute(
+        """UPDATE market_focus_cycles SET
+             status='failed',prompt_cache_key=?,openai_response_id=NULL,result_json=NULL,
+             error_code='submission_outcome_unknown',attempt_count=1,
+             retrieve_error_count=0,cancel_attempt_count=0,next_attempt_at=NULL,
+             cancel_requested_at=NULL,lease_owner=NULL,lease_expires_at=NULL,
+             fencing_token=1,latency_ms=NULL,usage_input_tokens=0,
+             usage_cached_input_tokens=0,usage_cache_write_tokens=0,
+             usage_reasoning_tokens=0,usage_output_tokens=0,usage_total_tokens=0,
+             started_at=?,completed_at=?,updated_at=?
+           WHERE cycle_id=?""",
+        (
+            legacy_key,
+            started_at.isoformat(),
+            failed_at.isoformat(),
+            failed_at.isoformat(),
+            cycle["cycle_id"],
+        ),
+    )
+    await db.execute(
+        """UPDATE hotspot_preparation_state SET active_cycle_id=?
+           WHERE singleton_id=1""",
+        (cycle["cycle_id"],),
+    )
+    return legacy_key
+
+
+async def _rewind_to_catalyst_v4(db) -> None:
+    await db.execute("DROP TABLE market_focus_cycle_recovery_audit")
+    await db.execute("PRAGMA user_version=4")
+    await db.commit()
+
+
+def test_v4_to_v5_recovers_only_proven_legacy_cache_key_rejection_and_is_idempotent(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(settings, "hot_cycle_daily_job_limit", 1)
+    monkeypatch.setattr(
+        settings,
+        "hot_cycle_daily_output_token_limit",
+        settings.hot_cycle_max_output_tokens,
+    )
+    monkeypatch.setattr(settings, "analysis_job_retry_cooldown_seconds", 0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 314)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            legacy_key = await _stage_legacy_cache_key_rejection(db, cycle)
+            await _rewind_to_catalyst_v4(db)
+
+            # Startup uses a plain aiosqlite connection rather than the
+            # row-factory connection returned to request handlers.
+            db.row_factory = None
+            await catalyst_database.init_catalyst_schema(db)
+            db.row_factory = aiosqlite.Row
+            async with db.execute("PRAGMA user_version") as cursor:
+                assert int((await cursor.fetchone())[0]) == 5
+            recovered = await (await db.execute(
+                """SELECT status,error_code,prompt_cache_key,attempt_count,
+                          openai_response_id,usage_total_tokens
+                   FROM market_focus_cycles WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(recovered) == (
+                "failed",
+                "provider_request_rejected",
+                legacy_key,
+                1,
+                None,
+                0,
+            )
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id,consumed_cycle_id
+                   FROM hotspot_preparation_sets WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("PREPARED", None, None)
+            state = await get_hotspot_status(db)
+            assert state["active_cycle_id"] is None
+            assert state["prepared_hot_count"] == 1
+            assert state["last_consumed_revision"] == 0
+
+            audit = dict(await (await db.execute(
+                "SELECT * FROM market_focus_cycle_recovery_audit WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone())
+            assert audit["migration_version"] == 5
+            assert audit["reason_code"] == (
+                "legacy_prompt_cache_key_400_string_above_max_length"
+            )
+            evidence = json.loads(audit["evidence_json"])
+            assert evidence["http_status"] == 400
+            assert evidence["provider_error_type"] == "string_above_max_length"
+            assert evidence["provider_error_param"] == "prompt_cache_key"
+            assert evidence["provider_max_length"] == 64
+            assert evidence["observed_prompt_cache_key_length"] == 75
+            assert evidence["response_task_id_present"] is False
+            original = audit["original_cycle_state_json"]
+            assert hashlib.sha256(original.encode()).hexdigest() == (
+                audit["original_cycle_state_sha256"]
+            )
+            assert json.loads(original)["error_code"] == "submission_outcome_unknown"
+            assert json.loads(audit["released_prepared_revisions_json"]) == [
+                cycle["prepared_revision"]
+            ]
+            assert audit["active_cycle_released"] == 1
+
+            await catalyst_database.init_catalyst_schema(db)
+            audit_count = await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone()
+            assert int(audit_count[0]) == 1
+
+            retry = await retry_market_focus_cycle(db, cycle["cycle_id"])
+            assert retry["retry_of_cycle_id"] == cycle["cycle_id"]
+            assert retry["status"] == "pending"
+            assert len(retry["prompt_cache_key"]) == 64
+            assert retry["prompt_cache_key"] != legacy_key
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "valid_cache_key_transport_timeout",
+        "unrecognized_75_character_key",
+        "expired_unlinked_submission",
+        "response_id_present",
+        "usage_present",
+        "inconsistent_preparation_lease",
+    ),
+)
+def test_v5_legacy_recovery_fails_closed_for_non_proven_unknown_outcomes(
+    isolated_market_db, monkeypatch, variant
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 315)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            await _stage_legacy_cache_key_rejection(db, cycle)
+            if variant == "valid_cache_key_transport_timeout":
+                await db.execute(
+                    "UPDATE market_focus_cycles SET prompt_cache_key=? WHERE cycle_id=?",
+                    ("market_focus_cycle:" + "a" * 45, cycle["cycle_id"]),
+                )
+            elif variant == "unrecognized_75_character_key":
+                await db.execute(
+                    "UPDATE market_focus_cycles SET prompt_cache_key=? WHERE cycle_id=?",
+                    ("x" * 75, cycle["cycle_id"]),
+                )
+            elif variant == "expired_unlinked_submission":
+                await db.execute(
+                    """UPDATE market_focus_cycles SET attempt_count=2,fencing_token=2
+                       WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            elif variant == "response_id_present":
+                await db.execute(
+                    """UPDATE market_focus_cycles SET openai_response_id='resp-existing'
+                       WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            elif variant == "usage_present":
+                await db.execute(
+                    """UPDATE market_focus_cycles SET usage_output_tokens=1,
+                       usage_total_tokens=1 WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            else:
+                await db.execute(
+                    """UPDATE hotspot_preparation_sets SET status='PREPARED',
+                       leased_cycle_id=NULL WHERE leased_cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            await _rewind_to_catalyst_v4(db)
+
+            await catalyst_database.init_catalyst_schema(db)
+            unchanged = await (await db.execute(
+                "SELECT status,error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(unchanged) == ("failed", "submission_outcome_unknown")
+            audit_count = await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone()
+            assert int(audit_count[0]) == 0
+            if variant != "inconsistent_preparation_lease":
+                preparation = await (await db.execute(
+                    """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                       WHERE prepared_revision=?""",
+                    (cycle["prepared_revision"],),
+                )).fetchone()
+                assert tuple(preparation) == ("LEASED", cycle["cycle_id"])
+            active = await (await db.execute(
+                """SELECT active_cycle_id FROM hotspot_preparation_state
+                   WHERE singleton_id=1"""
+            )).fetchone()
+            assert active[0] == cycle["cycle_id"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_v5_legacy_recovery_aborts_without_partial_changes_when_bound_is_exceeded(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(
+        catalyst_database, "LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES", 0
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 316)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            await _stage_legacy_cache_key_rejection(db, cycle)
+            await _rewind_to_catalyst_v4(db)
+
+            with pytest.raises(
+                RuntimeError,
+                match="legacy_market_focus_recovery_candidate_limit_exceeded",
+            ):
+                await catalyst_database.init_catalyst_schema(db)
+            async with db.execute("PRAGMA user_version") as cursor:
+                assert int((await cursor.fetchone())[0]) == 4
+            unchanged = await (await db.execute(
+                "SELECT error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert unchanged[0] == "submission_outcome_unknown"
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                   WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("LEASED", cycle["cycle_id"])
+        finally:
+            await db.close()
+
+    run(scenario())
 
 
 def test_definitive_provider_rejection_releases_snapshot_and_budget_for_retry(
