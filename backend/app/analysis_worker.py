@@ -39,6 +39,21 @@ async def _wait_for_next_poll(stop: asyncio.Event) -> None:
         pass
 
 
+async def _initialize_database(stop: asyncio.Event) -> bool:
+    while not stop.is_set():
+        try:
+            await init_db()
+            return True
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_database_lock(exc):
+                raise
+            logger.warning(
+                "SQLite write contention deferred database initialization; retrying without restarting"
+            )
+            await _wait_for_next_poll(stop)
+    return False
+
+
 async def _run_worker_loop(
     *,
     stop: asyncio.Event,
@@ -70,7 +85,6 @@ async def _run_worker_loop(
 
 
 async def run() -> None:
-    await init_db()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -78,6 +92,9 @@ async def run() -> None:
             loop.add_signal_handler(signum, stop.set)
         except NotImplementedError:
             pass
+    if not await _initialize_database(stop):
+        logger.info("MacroLens analysis worker stopped before database initialization")
+        return
     logger.info("MacroLens analysis worker ready")
     worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     provider = OpenAIResponsesProvider()

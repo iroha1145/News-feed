@@ -322,6 +322,14 @@ def test_manual_analysis_routes_fail_closed_and_report_real_enqueue_count(
 
 def test_database_pragmas_indexes_batch_insert_and_absolute_path(isolated_db, monkeypatch):
     assert database.SQLITE_BUSY_TIMEOUT_MS == 30_000
+    connect_timeouts = []
+    real_connect = database.aiosqlite.connect
+
+    def recording_connect(*args, **kwargs):
+        connect_timeouts.append(kwargs.get("timeout"))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(database.aiosqlite, "connect", recording_connect)
 
     async def scenario():
         db = await database.get_db()
@@ -344,6 +352,8 @@ def test_database_pragmas_indexes_batch_insert_and_absolute_path(isolated_db, mo
             await db.close()
 
     run(scenario())
+    run(database.init_db())
+    assert connect_timeouts == [30.0, 30.0]
 
     absolute = isolated_db.parent / "absolute.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{absolute}")

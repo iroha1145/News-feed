@@ -12,6 +12,32 @@ class _Provider:
     pass
 
 
+def test_database_initialization_retries_transient_lock(monkeypatch):
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        attempts = 0
+        poll_waits = 0
+
+        async def initialize():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is busy")
+
+        async def wait_for_poll(_stop):
+            nonlocal poll_waits
+            poll_waits += 1
+
+        monkeypatch.setattr(analysis_worker, "init_db", initialize)
+        monkeypatch.setattr(analysis_worker, "_wait_for_next_poll", wait_for_poll)
+
+        assert await analysis_worker._initialize_database(stop) is True
+        assert attempts == 2
+        assert poll_waits == 1
+
+    asyncio.run(scenario())
+
+
 def test_worker_loop_retries_transient_database_lock(monkeypatch):
     async def scenario() -> None:
         stop = asyncio.Event()
