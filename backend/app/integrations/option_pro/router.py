@@ -581,7 +581,8 @@ def _public_cycle(row: dict) -> dict:
         )
         status = str(result["status"])
         no_new_hot_events = bool(result["no_new_hot_events"])
-        if (status == "completed") != (public_result is not None):
+        publishable_status = status in {"completed", "insufficient_context"}
+        if publishable_status != (public_result is not None):
             raise ValueError("published_result_status_mismatch")
         if public_result is not None:
             if public_result.cycle_id != str(result["cycle_id"]):

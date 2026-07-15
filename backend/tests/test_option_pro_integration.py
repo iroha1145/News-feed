@@ -3295,6 +3295,34 @@ def test_public_cycle_rejects_persisted_result_invariant_mismatches(
     assert captured.value.code == "persisted_market_focus_result_invalid"
 
 
+def test_public_cycle_requires_results_for_all_publishable_terminal_states():
+    cycle_id = "mfc_0123456789abcdef0123456789abcdef"
+    persisted = {
+        **completed_market_focus_result(cycle_id),
+        "insufficient_context": True,
+    }
+    public = integration_router._public_cycle(
+        {
+            "cycle_id": cycle_id,
+            "status": "insufficient_context",
+            "result_json": json.dumps(persisted, separators=(",", ":")),
+            "no_new_hot_events": 1,
+        }
+    )
+    assert public["result"]["insufficient_context"] is True
+
+    with pytest.raises(IntegrationAPIError) as missing:
+        integration_router._public_cycle(
+            {
+                "cycle_id": cycle_id,
+                "status": "insufficient_context",
+                "result_json": None,
+                "no_new_hot_events": 1,
+            }
+        )
+    assert missing.value.code == "persisted_market_focus_result_invalid"
+
+
 def test_completed_market_focus_cycle_latest_and_point_reads_persisted_result(
     isolated_integration_db, monkeypatch
 ):
