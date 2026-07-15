@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
 import os
+import signal
+import sqlite3
 import socket
 import uuid
 
@@ -23,6 +24,51 @@ configure_safe_network_logging()
 logger = logging.getLogger(__name__)
 
 
+def _is_transient_database_lock(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database" in message and ("locked" in message or "busy" in message)
+
+
+async def _wait_for_next_poll(stop: asyncio.Event) -> None:
+    try:
+        await asyncio.wait_for(
+            stop.wait(),
+            timeout=settings.analysis_worker_poll_seconds,
+        )
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _run_worker_loop(
+    *,
+    stop: asyncio.Event,
+    provider: OpenAIResponsesProvider,
+    worker_id: str,
+) -> None:
+    while not stop.is_set():
+        try:
+            worked_news = await run_worker_once(provider=provider, worker_id=worker_id)
+            worked_calendar = await run_calendar_worker_once(
+                provider=provider,
+                worker_id=worker_id,
+            )
+            worked_market_focus = await run_market_focus_worker_once(
+                provider=provider,
+                worker_id=worker_id,
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_database_lock(exc):
+                raise
+            logger.warning(
+                "SQLite write contention deferred; retrying without restarting the analysis worker"
+            )
+            await _wait_for_next_poll(stop)
+            continue
+        if worked_news or worked_calendar or worked_market_focus:
+            continue
+        await _wait_for_next_poll(stop)
+
+
 async def run() -> None:
     await init_db()
     stop = asyncio.Event()
@@ -39,22 +85,7 @@ async def run() -> None:
     if capabilities.status != "ok":
         logger.warning("OpenAI runtime is not ready: %s", capabilities.status)
     try:
-        while not stop.is_set():
-            worked_news = await run_worker_once(provider=provider, worker_id=worker_id)
-            worked_calendar = await run_calendar_worker_once(
-                provider=provider,
-                worker_id=worker_id,
-            )
-            worked_market_focus = await run_market_focus_worker_once(
-                provider=provider,
-                worker_id=worker_id,
-            )
-            if worked_news or worked_calendar or worked_market_focus:
-                continue
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=settings.analysis_worker_poll_seconds)
-            except asyncio.TimeoutError:
-                pass
+        await _run_worker_loop(stop=stop, provider=provider, worker_id=worker_id)
     finally:
         await provider.close()
     logger.info("MacroLens analysis worker stopped")

@@ -121,7 +121,10 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_x_sentiments_analyzed_at ON x_sentiments(analyzed_at DESC)",
 ]
 
-SQLITE_BUSY_TIMEOUT_MS = 5_000
+# Production runs the scheduler and the analysis worker in separate processes.
+# Some bounded batch writes legitimately take longer than SQLite's short default
+# wait, so readers and heartbeat writes need enough time to let them commit.
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 DEFAULT_ANALYSIS_LEASE_SECONDS = 10 * 60
 MAX_ANALYSIS_ATTEMPTS = 3
 

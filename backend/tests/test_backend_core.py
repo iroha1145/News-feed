@@ -321,6 +321,8 @@ def test_manual_analysis_routes_fail_closed_and_report_real_enqueue_count(
 
 
 def test_database_pragmas_indexes_batch_insert_and_absolute_path(isolated_db, monkeypatch):
+    assert database.SQLITE_BUSY_TIMEOUT_MS == 30_000
+
     async def scenario():
         db = await database.get_db()
         try:
