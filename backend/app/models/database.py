@@ -1,53 +1,33 @@
+from __future__ import annotations
+
+import hashlib
 import json
 import logging
-import math
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import urlparse
+from typing import Any, Protocol
 
 import aiosqlite
 
 from app.config import settings
-from app.utils.dedup import normalize_title, publication_bucket, similar_titles
+from app.utils.dedup import (
+    compute_content_hash,
+    compute_legacy_content_hash,
+    normalize_title,
+    normalize_url,
+    publication_bucket,
+    similar_titles,
+)
 from app.utils.tickers import normalize_ticker
 
 logger = logging.getLogger(__name__)
 
-INTERNAL_NEWS_FIELDS = {
-    "analysis_attempts",
-    "analysis_error",
-    "analysis_claimed_at",
-    "analysis_lease_expires_at",
-}
+DB_PATH = settings.database_path
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+RETENTION_BATCH_SIZE = 500
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-
-def _without_internal_news_fields(item: dict) -> dict:
-    for field in INTERNAL_NEWS_FIELDS:
-        item.pop(field, None)
-    return item
-
-
-def _resolve_db_path() -> str:
-    parsed = urlparse(settings.database_url)
-    if parsed.scheme != "sqlite+aiosqlite":
-        raise ValueError(f"Unsupported database_url scheme: {settings.database_url}")
-
-    prefix = "sqlite+aiosqlite:///"
-    if not settings.database_url.startswith(prefix) or parsed.netloc:
-        raise ValueError("database_url must use sqlite+aiosqlite:///path syntax")
-    # Three slashes mean a relative path; four preserve the leading slash.
-    db_path = settings.database_url[len(prefix):]
-
-    if not db_path:
-        raise ValueError("database_url must include a SQLite database path")
-
-    path = Path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return str(path)
-
-
-DB_PATH = _resolve_db_path()
 
 CREATE_NEWS_ITEMS = """
 CREATE TABLE IF NOT EXISTS news_items (
@@ -60,302 +40,272 @@ CREATE TABLE IF NOT EXISTS news_items (
     published_at TEXT,
     fetched_at TEXT NOT NULL,
     content_hash TEXT NOT NULL UNIQUE,
-    analysis_status TEXT DEFAULT 'pending',
-    analysis_attempts INTEGER DEFAULT 0,
-    analysis_error TEXT DEFAULT '',
-    analysis_claimed_at TEXT,
-    analysis_lease_expires_at TEXT
+    source_tickers TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
 )
 """
 
-CREATE_ANALYSES = """
-CREATE TABLE IF NOT EXISTS analyses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    news_id INTEGER NOT NULL REFERENCES news_items(id) ON DELETE CASCADE,
-    title_zh TEXT DEFAULT '',
-    headline_summary TEXT DEFAULT '',
-    overall_sentiment INTEGER NOT NULL,
-    classification TEXT NOT NULL,
-    confidence INTEGER NOT NULL,
-    affected_stocks TEXT NOT NULL DEFAULT '[]',
-    affected_sectors TEXT NOT NULL DEFAULT '[]',
-    affected_commodities TEXT NOT NULL DEFAULT '[]',
-    logic_chain TEXT NOT NULL,
-    key_factors TEXT NOT NULL DEFAULT '[]',
-    llm_provider TEXT NOT NULL,
-    llm_model TEXT NOT NULL,
-    analyzed_at TEXT NOT NULL,
-    UNIQUE(news_id)
+CREATE_NEWS_CHANGES = """
+CREATE TABLE IF NOT EXISTS news_changes (
+    change_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    news_id INTEGER NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('upsert','delete')),
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT,
+    url TEXT NOT NULL,
+    image_url TEXT,
+    published_at TEXT,
+    fetched_at TEXT NOT NULL,
+    source_tickers TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    available_at_us INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL,
+    UNIQUE(news_id, operation, payload_hash, updated_at)
 )
 """
 
-CREATE_X_SENTIMENTS = """
-CREATE TABLE IF NOT EXISTS x_sentiments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    query TEXT NOT NULL,
-    trending_tickers TEXT NOT NULL DEFAULT '[]',
-    retail_sentiment_score INTEGER NOT NULL,
-    key_narratives TEXT NOT NULL DEFAULT '[]',
-    meme_stocks TEXT NOT NULL DEFAULT '[]',
-    raw_analysis TEXT NOT NULL,
-    fear_greed_estimate INTEGER DEFAULT 50,
-    analyzed_at TEXT NOT NULL
+CREATE_NEWS_SOURCE_OBSERVATIONS = """
+CREATE TABLE IF NOT EXISTS news_source_observations (
+    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_news_id INTEGER NOT NULL
+        REFERENCES news_items(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    original_title TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    source_tickers TEXT NOT NULL DEFAULT '[]',
+    observed_at TEXT NOT NULL,
+    observed_at_us INTEGER NOT NULL,
+    observation_hash TEXT NOT NULL,
+    UNIQUE(canonical_news_id, observation_hash)
 )
 """
 
-CREATE_SETTINGS = """
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+CREATE_SOURCE_HEALTH = """
+CREATE TABLE IF NOT EXISTS source_health (
+    source TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN (
+        'ok','degraded','unavailable','not_configured','disabled'
+    )),
+    last_attempt_at TEXT,
+    last_success_at TEXT,
+    data_through TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+    next_attempt_at TEXT,
+    raw_count INTEGER CHECK(raw_count IS NULL OR raw_count >= 0),
+    inserted_count INTEGER CHECK(inserted_count IS NULL OR inserted_count >= 0),
+    duplicates_count INTEGER CHECK(duplicates_count IS NULL OR duplicates_count >= 0),
+    error_code TEXT,
+    updated_at TEXT NOT NULL
 )
 """
 
-CREATE_INDEXES = [
+CREATE_CALENDAR_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS etl_calendar_snapshots (
+    snapshot_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_token TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    source_fetched_at TEXT NOT NULL,
+    data_through TEXT,
+    is_stale INTEGER NOT NULL DEFAULT 0 CHECK(is_stale IN (0,1)),
+    available_at TEXT NOT NULL,
+    available_at_us INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL
+)
+"""
+
+CREATE_CALENDAR_EVENTS = """
+CREATE TABLE IF NOT EXISTS etl_calendar_events (
+    snapshot_sequence INTEGER NOT NULL
+        REFERENCES etl_calendar_snapshots(snapshot_sequence) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+    event_id TEXT NOT NULL,
+    country_code TEXT NOT NULL,
+    country TEXT NOT NULL,
+    title TEXT NOT NULL,
+    impact TEXT NOT NULL CHECK(impact IN ('low','medium','high','holiday')),
+    impact_zh TEXT NOT NULL,
+    scheduled_at TEXT NOT NULL,
+    scheduled_at_utc TEXT NOT NULL,
+    forecast TEXT,
+    previous TEXT,
+    actual TEXT,
+    is_stale INTEGER NOT NULL DEFAULT 0 CHECK(is_stale IN (0,1)),
+    source_fetched_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY(snapshot_sequence, ordinal),
+    UNIQUE(snapshot_sequence, event_id)
+)
+"""
+
+RAW_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_news_published_at ON news_items(published_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_news_effective_published ON news_items(COALESCE(published_at, fetched_at) DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_news_source_published ON news_items(source, published_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_news_analysis_status_published ON news_items(analysis_status, published_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_news_analysis_lease ON news_items(analysis_status, analysis_lease_expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_analyses_analyzed_at ON analyses(analyzed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_analyses_classification_analyzed ON analyses(classification, analyzed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_x_sentiments_analyzed_at ON x_sentiments(analyzed_at DESC)",
-]
+    "CREATE INDEX IF NOT EXISTS idx_news_effective_time ON news_items(COALESCE(published_at,fetched_at) DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_news_source_time ON news_items(source,COALESCE(published_at,fetched_at) DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_news_changes_window ON news_changes(available_at_us,change_sequence)",
+    "CREATE INDEX IF NOT EXISTS idx_news_changes_item ON news_changes(news_id,available_at DESC,change_sequence DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_news_observations_item ON news_source_observations(canonical_news_id,observed_at_us,observation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_calendar_snapshots_available ON etl_calendar_snapshots(available_at_us DESC,snapshot_sequence DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_calendar_events_time ON etl_calendar_events(snapshot_sequence,scheduled_at_utc,ordinal)",
+)
 
-# Production runs the scheduler and the analysis worker in separate processes.
-# Some bounded batch writes legitimately take longer than SQLite's short default
-# wait, so readers and heartbeat writes need enough time to let them commit.
-SQLITE_BUSY_TIMEOUT_MS = 30_000
-DEFAULT_ANALYSIS_LEASE_SECONDS = 10 * 60
-MAX_ANALYSIS_ATTEMPTS = 3
+LEGACY_INTEGRATION_TRIGGERS = (
+    "trg_news_integration_insert",
+    "trg_analysis_revision_integration_insert",
+    "trg_ticker_validation_integration_insert",
+    "trg_calendar_revision_integration_insert",
+    "trg_source_health_integration_insert",
+    "trg_source_health_integration_update",
+)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_text(value: datetime | None = None) -> str:
+    current = value or utc_now()
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("timestamp must include a UTC offset")
+    return current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc(value: str | datetime, *, field: str = "timestamp") -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include a UTC offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def epoch_microseconds(value: str | datetime) -> int:
+    parsed = parse_utc(value)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed - epoch
+    return (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+
+
+def _database_path() -> Path:
+    return Path(DB_PATH)
 
 
 async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(
-        DB_PATH,
-        timeout=SQLITE_BUSY_TIMEOUT_MS / 1_000,
-    )
+    path = _database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1_000)
     db.row_factory = aiosqlite.Row
     await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     await db.execute("PRAGMA foreign_keys=ON")
     return db
 
 
+async def _add_raw_column(
+    db: aiosqlite.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    try:
+        await db.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
+    except aiosqlite.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 async def init_db() -> None:
-    logger.info("Initializing database tables...")
-    async with aiosqlite.connect(
-        DB_PATH,
-        timeout=SQLITE_BUSY_TIMEOUT_MS / 1_000,
-    ) as db:
-        await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    """Create only ETL-owned tables and additive raw-news columns.
+
+    Legacy analysis tables are intentionally neither created, migrated, updated,
+    nor deleted. They may remain in an upgraded database for historical reads.
+    """
+
+    db = await get_db()
+    migration_now = utc_text()
+    try:
         await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA foreign_keys=ON")
         await db.execute(CREATE_NEWS_ITEMS)
-        await db.execute(CREATE_ANALYSES)
-        await db.execute(CREATE_X_SENTIMENTS)
-        await db.execute(CREATE_SETTINGS)
-        # Centralized migration list: (table, column, definition)
-        migrations = [
-            ("news_items", "analysis_status", "TEXT DEFAULT 'pending'"),
-            ("news_items", "analysis_attempts", "INTEGER DEFAULT 0"),
-            ("news_items", "analysis_error", "TEXT DEFAULT ''"),
-            ("news_items", "analysis_claimed_at", "TEXT"),
-            ("news_items", "analysis_lease_expires_at", "TEXT"),
-            ("analyses", "title_zh", "TEXT DEFAULT ''"),
-            ("analyses", "headline_summary", "TEXT DEFAULT ''"),
-            ("x_sentiments", "fear_greed_estimate", "INTEGER DEFAULT 50"),
-        ]
-        for table, col, definition in migrations:
-            try:
-                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
-            except Exception as e:
-                if "duplicate column" not in str(e).lower():
-                    raise
-        for statement in CREATE_INDEXES:
-            await db.execute(statement)
-        from app.models.catalyst_database import init_catalyst_schema
-        from app.services.calendar_analysis_jobs import init_calendar_analysis_schema
-
-        await init_catalyst_schema(db)
-        await init_calendar_analysis_schema(db)
-        await db.commit()
-        await cleanup_retained_data(db)
-    logger.info("Database tables initialized successfully")
-
-
-def _retention_days(value: Any, setting_name: str) -> Optional[int]:
-    if value in (None, ""):
-        return None
-    try:
-        days = int(value)
-    except (TypeError, ValueError):
-        logger.warning("Ignoring invalid retention setting %s=%r", setting_name, value)
-        return None
-    if not 1 <= days <= 3650:
-        logger.warning("Ignoring out-of-range retention setting %s=%r", setting_name, value)
-        return None
-    return days
-
-
-def _analysis_retention_limit(value: Any) -> int:
-    if value in (None, ""):
-        return 350
-    try:
-        limit = int(value)
-    except (TypeError, ValueError):
-        logger.warning("Invalid analysis_retention_limit=%r; using 350", value)
-        return 350
-    if not 1 <= limit <= 100_000:
-        logger.warning("Out-of-range analysis_retention_limit=%r; using 350", value)
-        return 350
-    return limit
-
-
-async def cleanup_retained_data(db: aiosqlite.Connection) -> dict[str, int]:
-    """Keep 350 analyses by default; other data is deleted only when explicitly configured."""
-    news_setting = await get_setting(db, "news_retention_days")
-    x_setting = await get_setting(db, "x_sentiment_retention_days")
-    analysis_setting = await get_setting(db, "analysis_retention_limit")
-    news_days = _retention_days(
-        news_setting if news_setting is not None else settings.news_retention_days,
-        "news_retention_days",
-    )
-    x_days = _retention_days(
-        x_setting if x_setting is not None else settings.x_sentiment_retention_days,
-        "x_sentiment_retention_days",
-    )
-    analysis_limit = _analysis_retention_limit(
-        analysis_setting if analysis_setting is not None else settings.analysis_retention_limit
-    )
-
-    deleted = {"news_items": 0, "analyses": 0, "x_sentiments": 0}
-    try:
+        # Older databases received these raw columns from the former Catalyst
+        # migration. Keep that upgrade here before the old module is removed.
+        await _add_raw_column(db, "news_items", "source_tickers", "TEXT NOT NULL DEFAULT '[]'")
+        await _add_raw_column(db, "news_items", "updated_at", "TEXT")
         await db.execute(
-            """UPDATE news_items
-               SET analysis_status = 'skipped',
-                   analysis_error = 'Analysis removed by retention policy',
-                   analysis_claimed_at = NULL,
-                   analysis_lease_expires_at = NULL
-               WHERE id IN (
-                   SELECT news_id FROM analyses
-                   ORDER BY datetime(analyzed_at) DESC, id DESC
-                   LIMIT -1 OFFSET ?
-               )""",
-            (analysis_limit,),
+            "UPDATE news_items SET updated_at=COALESCE(updated_at,fetched_at) WHERE updated_at IS NULL"
         )
-        cursor = await db.execute(
-            """DELETE FROM analyses WHERE id IN (
-                   SELECT id FROM analyses
-                   ORDER BY datetime(analyzed_at) DESC, id DESC
-                   LIMIT -1 OFFSET ?
+        await db.execute(CREATE_NEWS_CHANGES)
+        await db.execute(CREATE_NEWS_SOURCE_OBSERVATIONS)
+        await db.execute(CREATE_SOURCE_HEALTH)
+        await db.execute(CREATE_CALENDAR_SNAPSHOTS)
+        await db.execute(CREATE_CALENDAR_EVENTS)
+        # These triggers belonged to the removed signed integration surface.
+        # Leaving them behind would make raw ETL writes mutate its obsolete
+        # change table even though no reader remains.
+        for trigger in LEGACY_INTEGRATION_TRIGGERS:
+            await db.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+        for statement in RAW_INDEXES:
+            await db.execute(statement)
+
+        # Older databases discarded duplicate-source evidence. Preserve the
+        # canonical source as the first observation without touching any
+        # historical analysis table.
+        async with db.execute(
+            """SELECT id,source,title,url,source_tickers
+               FROM news_items
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM news_source_observations o
+                   WHERE o.canonical_news_id=news_items.id
+               )"""
+        ) as cursor:
+            while True:
+                rows = await cursor.fetchmany(RETENTION_BATCH_SIZE)
+                if not rows:
+                    break
+                for row in rows:
+                    await _record_news_observation(
+                        db,
+                        canonical_news_id=int(row["id"]),
+                        source=str(row["source"]),
+                        original_title=str(row["title"]),
+                        original_url=str(row["url"]),
+                        source_tickers=str(row["source_tickers"] or "[]"),
+                        observed_at=migration_now,
+                    )
+
+        # Backfill a point-in-time baseline for pre-ETL raw rows. This touches
+        # only the new change log; the source row and all legacy analysis data
+        # remain unchanged.
+        await db.execute(
+            """INSERT OR IGNORE INTO news_changes
+               (news_id,operation,source,title,summary,url,image_url,published_at,
+                fetched_at,source_tickers,content_hash,updated_at,available_at,
+                available_at_us,payload_hash)
+               SELECT id,'upsert',source,title,summary,url,image_url,published_at,
+                      fetched_at,COALESCE(source_tickers,'[]'),content_hash,
+                      COALESCE(updated_at,fetched_at),?,?,content_hash
+               FROM news_items n
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM news_changes c WHERE c.news_id=n.id
                )""",
-            (analysis_limit,),
+            (migration_now, epoch_microseconds(migration_now)),
         )
-        deleted["analyses"] += cursor.rowcount
-
-        if news_days is not None:
-            modifier = f"-{news_days} days"
-            cursor = await db.execute(
-                """DELETE FROM analyses WHERE news_id IN (
-                       SELECT id FROM news_items
-                       WHERE datetime(COALESCE(published_at, fetched_at)) < datetime('now', ?)
-                   )""",
-                (modifier,),
-            )
-            deleted["analyses"] += cursor.rowcount
-            cursor = await db.execute(
-                """DELETE FROM news_items
-                   WHERE datetime(COALESCE(published_at, fetched_at)) < datetime('now', ?)""",
-                (modifier,),
-            )
-            deleted["news_items"] = cursor.rowcount
-
-        if x_days is not None:
-            cursor = await db.execute(
-                "DELETE FROM x_sentiments WHERE datetime(analyzed_at) < datetime('now', ?)",
-                (f"-{x_days} days",),
-            )
-            deleted["x_sentiments"] = cursor.rowcount
-
         await db.commit()
     except Exception:
         await db.rollback()
         raise
+    finally:
+        await db.close()
 
-    if any(deleted.values()):
-        logger.info("Retention cleanup removed rows: %s", deleted)
-    from app.services.retention import cleanup_extended_retention
-
-    extended = await cleanup_extended_retention(db)
-    deleted.update(extended)
-    return deleted
-
-
-def row_to_dict(row: aiosqlite.Row) -> dict:
-    return dict(row)
-
-
-def _bounded_score(value: Any) -> int:
-    if isinstance(value, bool):
-        return 0
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0
-    if not math.isfinite(number):
-        return 0
-    return max(-100, min(100, round(number)))
-
-
-def _normalize_json_list(field: str, value: Any) -> list:
-    if not isinstance(value, list):
-        return []
-    if field == "affected_stocks":
-        normalized = []
-        for item in value:
-            if not isinstance(item, dict):
-                continue
-            ticker = str(item.get("ticker") or "").strip().upper().lstrip("$")[:20]
-            if not ticker:
-                continue
-            normalized.append({
-                "ticker": ticker,
-                "company": str(item.get("company") or ticker).strip()[:200],
-                "impact_score": _bounded_score(item.get("impact_score")),
-                "reason": str(item.get("reason") or "").strip()[:2000],
-            })
-        return normalized
-    if field == "affected_commodities":
-        normalized = []
-        for item in value:
-            if isinstance(item, str) and item.strip():
-                normalized.append({"name": item.strip()[:100], "impact_score": 0, "reason": ""})
-            elif isinstance(item, dict):
-                name = str(item.get("name") or "").strip()[:100]
-                if name:
-                    normalized.append({
-                        "name": name,
-                        "impact_score": _bounded_score(item.get("impact_score")),
-                        "reason": str(item.get("reason") or "").strip()[:2000],
-                    })
-        return normalized
-    if field in {"affected_sectors", "key_factors"}:
-        return [item.strip()[:500] for item in value if isinstance(item, str) and item.strip()]
-    return value
-
-
-def parse_json_fields(d: dict, fields: list[str]) -> dict:
-    for field in fields:
-        if field in d and isinstance(d[field], str):
-            try:
-                d[field] = json.loads(d[field])
-            except (json.JSONDecodeError, TypeError):
-                d[field] = []
-        if field in d:
-            d[field] = _normalize_json_list(field, d[field])
-    return d
-
-
-# --- news_items ---
 
 def _serialize_source_tickers(value: Any) -> str:
     if isinstance(value, str):
@@ -372,763 +322,932 @@ def _serialize_source_tickers(value: Any) -> str:
             tickers.append(ticker)
     return json.dumps(tickers[:100], separators=(",", ":"))
 
-async def insert_news_item(db: aiosqlite.Connection, item: dict) -> Optional[int]:
-    params = dict(item)
-    params["source_tickers"] = _serialize_source_tickers(item.get("source_tickers"))
-    params["updated_at"] = item.get("updated_at") or item["fetched_at"]
+
+def _deserialize_tickers(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
     try:
-        cursor = await db.execute(
-            """INSERT INTO news_items
-               (source, title, summary, url, image_url, published_at, fetched_at, content_hash,
-                source_tickers, updated_at)
-               VALUES (:source, :title, :summary, :url, :image_url, :published_at, :fetched_at,
-                       :content_hash, :source_tickers, :updated_at)""",
-            params,
-        )
-        await db.commit()
-        return cursor.lastrowid
-    except aiosqlite.IntegrityError:
-        await db.rollback()
-        return None  # duplicate
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [str(item) for item in parsed if isinstance(item, str)] if isinstance(parsed, list) else []
 
 
-async def insert_news_items_batch(db: aiosqlite.Connection, items: list[dict]) -> int:
-    """Insert a batch in one transaction and return the number of new rows."""
-    if not items:
-        return 0
-    # Compare with recent stored headlines as independent source jobs cannot
-    # perform cross-source fuzzy matching in memory.
-    async with db.execute(
-        """SELECT title, published_at, fetched_at
-           FROM news_items
-           ORDER BY COALESCE(published_at, fetched_at) DESC
-           LIMIT 2000"""
-    ) as cursor:
-        existing_rows = await cursor.fetchall()
-    titles_by_day: dict[str, list[str]] = {}
-    for row in existing_rows:
-        normalized = normalize_title(str(row[0] or ""))
-        if normalized:
-            titles_by_day.setdefault(publication_bucket(row[1] or row[2]), []).append(normalized)
-
-    fuzzy_filtered: list[dict] = []
-    for item in items:
-        normalized = normalize_title(str(item.get("title") or ""))
-        day = publication_bucket(item.get("published_at") or item.get("fetched_at"))
-        prior_titles = titles_by_day.setdefault(day, [])
-        if normalized and any(similar_titles(normalized, prior) for prior in prior_titles):
-            continue
-        if normalized:
-            prior_titles.append(normalized)
-        fuzzy_filtered.append(item)
-
-    # Accept both new and legacy hashes during an upgrade. Existing records keep
-    # their original hash, while newly inserted records use the date-aware hash.
-    candidate_hashes = {
-        str(value)
-        for item in fuzzy_filtered
-        for value in (item.get("content_hash"), item.get("legacy_content_hash"))
-        if value
+def _observation_hash(
+    *,
+    source: str,
+    original_title: str,
+    original_url: str,
+    source_tickers: str,
+) -> str:
+    payload = {
+        "source": source.strip().casefold(),
+        "title": original_title.strip(),
+        "url": normalize_url(original_url),
+        "source_tickers": _deserialize_tickers(_serialize_source_tickers(source_tickers)),
     }
-    existing_hashes: set[str] = set()
-    candidates = list(candidate_hashes)
-    for start in range(0, len(candidates), 500):
-        chunk = candidates[start:start + 500]
-        placeholders = ",".join("?" for _ in chunk)
-        async with db.execute(
-            f"SELECT content_hash FROM news_items WHERE content_hash IN ({placeholders})",
-            chunk,
-        ) as cursor:
-            existing_hashes.update(str(row[0]) for row in await cursor.fetchall())
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
 
-    filtered_items = [
-        item for item in fuzzy_filtered
-        if item.get("content_hash") not in existing_hashes
-        and item.get("legacy_content_hash") not in existing_hashes
-    ]
-    if not filtered_items:
-        return 0
 
-    prepared_items = []
-    for item in filtered_items:
-        prepared = dict(item)
-        prepared["source_tickers"] = _serialize_source_tickers(item.get("source_tickers"))
-        prepared["updated_at"] = item.get("updated_at") or item["fetched_at"]
-        prepared_items.append(prepared)
+async def _record_news_observation(
+    db: aiosqlite.Connection,
+    *,
+    canonical_news_id: int,
+    source: str,
+    original_title: str,
+    original_url: str,
+    source_tickers: str,
+    observed_at: str | None = None,
+) -> bool:
     try:
-        cursor = await db.executemany(
-            """INSERT OR IGNORE INTO news_items
-               (source, title, summary, url, image_url, published_at, fetched_at, content_hash,
-                source_tickers, updated_at)
-               VALUES (:source, :title, :summary, :url, :image_url, :published_at, :fetched_at,
-                       :content_hash, :source_tickers, :updated_at)""",
-            prepared_items,
+        observation_time = utc_text(
+            parse_utc(str(observed_at or utc_text()), field="observed_at")
         )
+    except ValueError:
+        observation_time = utc_text()
+    serialized_tickers = _serialize_source_tickers(source_tickers)
+    stable_hash = _observation_hash(
+        source=source,
+        original_title=original_title,
+        original_url=original_url,
+        source_tickers=serialized_tickers,
+    )
+    cursor = await db.execute(
+        """INSERT OR IGNORE INTO news_source_observations
+           (canonical_news_id,source,original_title,original_url,source_tickers,
+            observed_at,observed_at_us,observation_hash)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            canonical_news_id,
+            source[:500],
+            original_title[:4_000],
+            original_url[:8_000],
+            serialized_tickers,
+            observation_time,
+            epoch_microseconds(observation_time),
+            stable_hash,
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def _prepare_news(item: dict[str, Any]) -> dict[str, Any]:
+    fetched_at = utc_text(parse_utc(str(item.get("fetched_at") or utc_text()), field="fetched_at"))
+    published = item.get("published_at")
+    published_at = None
+    if published:
+        try:
+            published_at = utc_text(parse_utc(str(published), field="published_at"))
+        except ValueError:
+            # The internal API contract accepts only timezone-aware ISO-8601.
+            # Keep the news item but omit a malformed source timestamp.
+            published_at = None
+    updated_at = utc_text(
+        parse_utc(str(item.get("updated_at") or fetched_at), field="updated_at")
+    )
+    original_title = str(item.get("title") or "").strip()
+    original_url = str(item.get("url") or "").strip()
+    title = original_title
+    url = normalize_url(original_url)
+    source = str(item.get("source") or "").strip()
+    if not source or not title or not url:
+        raise ValueError("source, title, and url are required")
+    content_hash = str(item.get("content_hash") or "") or compute_content_hash(
+        title, url, published_at
+    )
+    return {
+        "source": source[:500],
+        "title": title[:4_000],
+        "summary": str(item["summary"])[:50_000] if item.get("summary") is not None else None,
+        "url": url[:8_000],
+        "image_url": str(item["image_url"])[:8_000] if item.get("image_url") else None,
+        "published_at": published_at,
+        "fetched_at": fetched_at,
+        "content_hash": content_hash,
+        "legacy_content_hash": str(item.get("legacy_content_hash") or "")
+        or compute_legacy_content_hash(title, url),
+        "source_tickers": _serialize_source_tickers(item.get("source_tickers")),
+        "updated_at": updated_at,
+        "observation_title": original_title[:4_000],
+        "observation_url": original_url[:8_000],
+    }
+
+
+async def _record_news_change(
+    db: aiosqlite.Connection,
+    row: MappingLike,
+    *,
+    operation: str,
+    available_at: str,
+    changed_at: str | None = None,
+) -> int:
+    updated_at = changed_at or str(row["updated_at"])
+    payload_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "operation": operation,
+                "news_id": int(row["id"]),
+                "content_hash": str(row["content_hash"]),
+                "updated_at": updated_at,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    cursor = await db.execute(
+        """INSERT OR IGNORE INTO news_changes
+           (news_id,operation,source,title,summary,url,image_url,published_at,
+            fetched_at,source_tickers,content_hash,updated_at,available_at,
+            available_at_us,payload_hash)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(row["id"]),
+            operation,
+            str(row["source"]),
+            str(row["title"]),
+            row["summary"],
+            str(row["url"]),
+            row["image_url"],
+            row["published_at"],
+            str(row["fetched_at"]),
+            str(row["source_tickers"] or "[]"),
+            str(row["content_hash"]),
+            updated_at,
+            available_at,
+            epoch_microseconds(available_at),
+            payload_hash,
+        ),
+    )
+    return int(cursor.lastrowid or 0)
+
+
+class MappingLike(Protocol):
+    def __getitem__(self, key: str) -> Any: ...
+
+
+async def _insert_prepared_news(db: aiosqlite.Connection, item: dict[str, Any]) -> int | None:
+    cursor = await db.execute(
+        """INSERT OR IGNORE INTO news_items
+           (source,title,summary,url,image_url,published_at,fetched_at,content_hash,
+            source_tickers,updated_at)
+           VALUES (:source,:title,:summary,:url,:image_url,:published_at,:fetched_at,
+                   :content_hash,:source_tickers,:updated_at)""",
+        item,
+    )
+    if cursor.rowcount != 1:
+        return None
+    news_id = int(cursor.lastrowid)
+    stored = {**item, "id": news_id}
+    available_at = utc_text()
+    await _record_news_observation(
+        db,
+        canonical_news_id=news_id,
+        source=str(item["source"]),
+        original_title=str(item["observation_title"]),
+        original_url=str(item["observation_url"]),
+        source_tickers=str(item["source_tickers"]),
+        observed_at=available_at,
+    )
+    await _record_news_change(db, stored, operation="upsert", available_at=available_at)
+    return news_id
+
+
+async def insert_news_item(db: aiosqlite.Connection, item: dict[str, Any]) -> int | None:
+    prepared = _prepare_news(item)
+    try:
+        async with db.execute(
+            """SELECT id FROM news_items
+               WHERE content_hash IN (?,?) OR url=? ORDER BY id LIMIT 1""",
+            (
+                prepared["content_hash"],
+                prepared["legacy_content_hash"],
+                prepared["url"],
+            ),
+        ) as cursor:
+            duplicate = await cursor.fetchone()
+        if duplicate is not None:
+            await _record_duplicate_news(db, int(duplicate[0]), prepared)
+            await db.commit()
+            return None
+        news_id = await _insert_prepared_news(db, prepared)
+        if news_id is None:
+            async with db.execute(
+                "SELECT id FROM news_items WHERE content_hash IN (?,?) ORDER BY id LIMIT 1",
+                (prepared["content_hash"], prepared["legacy_content_hash"]),
+            ) as cursor:
+                duplicate = await cursor.fetchone()
+            if duplicate is not None:
+                await _record_duplicate_news(db, int(duplicate[0]), prepared)
         await db.commit()
-        # total_changes includes integration audit triggers; cursor.rowcount
-        # reflects only the rows inserted into news_items.
-        inserted = max(0, cursor.rowcount)
+        return news_id
     except Exception:
         await db.rollback()
         raise
-    try:
-        await cleanup_retained_data(db)
-    except Exception:
-        logger.exception("Post-ingest retention cleanup failed")
-    return inserted
 
 
-async def get_news_items(
+async def _merge_source_tickers(
     db: aiosqlite.Connection,
-    page: int = 1,
-    page_size: int = 20,
-    source: Optional[str] = None,
-    classification: Optional[str] = None,
-) -> tuple[int, list[dict]]:
-    offset = (page - 1) * page_size
-    conditions: list[str] = []
-    filter_params: list[Any] = []
-    if source:
-        conditions.append("n.source = ?")
-        filter_params.append(source)
-    if classification:
-        conditions.append("a.classification = ?")
-        filter_params.append(classification)
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    news_id: int,
+    incoming_tickers: str,
+) -> bool:
+    async with db.execute("SELECT * FROM news_items WHERE id=?", (news_id,)) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return False
+    current = _deserialize_tickers(row["source_tickers"])
+    merged = list(current)
+    for ticker in _deserialize_tickers(incoming_tickers):
+        if ticker not in merged:
+            merged.append(ticker)
+    if merged == current:
+        return False
+    changed_at = utc_text()
+    serialized = _serialize_source_tickers(merged)
+    await db.execute(
+        "UPDATE news_items SET source_tickers=?,updated_at=? WHERE id=?",
+        (serialized, changed_at, news_id),
+    )
+    updated = dict(row)
+    updated["source_tickers"] = serialized
+    updated["updated_at"] = changed_at
+    await _record_news_change(
+        db,
+        updated,
+        operation="upsert",
+        available_at=changed_at,
+    )
+    return True
+
+
+async def _record_duplicate_news(
+    db: aiosqlite.Connection,
+    news_id: int,
+    item: dict[str, Any],
+) -> None:
+    observed_at = utc_text()
+    observation_inserted = await _record_news_observation(
+        db,
+        canonical_news_id=news_id,
+        source=str(item["source"]),
+        original_title=str(item["observation_title"]),
+        original_url=str(item["observation_url"]),
+        source_tickers=str(item["source_tickers"]),
+        observed_at=observed_at,
+    )
+    tickers_changed = await _merge_source_tickers(
+        db, news_id, str(item["source_tickers"])
+    )
+    if not observation_inserted or tickers_changed:
+        return
+
+    # A newly corroborating source is itself a material ETL change even when
+    # it carries no new ticker. Advance the canonical row and change stream so
+    # incremental readers can observe the higher source count.
+    changed_at = utc_text()
+    await db.execute(
+        "UPDATE news_items SET updated_at=? WHERE id=?",
+        (changed_at, news_id),
+    )
+    async with db.execute("SELECT * FROM news_items WHERE id=?", (news_id,)) as cursor:
+        row = await cursor.fetchone()
+    if row is not None:
+        await _record_news_change(
+            db,
+            row,
+            operation="upsert",
+            available_at=changed_at,
+        )
+
+
+async def insert_news_items_batch(
+    db: aiosqlite.Connection,
+    items: list[dict[str, Any]],
+) -> dict[str, int]:
+    if not items:
+        return {"inserted": 0, "duplicates": 0}
+    prepared_items = [_prepare_news(item) for item in items]
 
     async with db.execute(
-        f"""SELECT COUNT(*)
-            FROM news_items n
-            LEFT JOIN analyses a ON a.news_id = n.id
-            {where}""",
-        filter_params,
-    ) as cur:
-        row = await cur.fetchone()
-        total = row[0] if row else 0
+        """SELECT id,title,url,published_at,fetched_at,content_hash,source_tickers FROM news_items
+           ORDER BY COALESCE(published_at,fetched_at) DESC LIMIT 2000"""
+    ) as cursor:
+        existing = await cursor.fetchall()
+    titles_by_day: dict[str, list[tuple[str, int]]] = {}
+    hashes_to_ids: dict[str, int] = {}
+    urls_to_ids: dict[str, int] = {}
+    for row in existing:
+        news_id = int(row["id"])
+        title = normalize_title(str(row["title"] or ""))
+        if title:
+            bucket = publication_bucket(row["published_at"] or row["fetched_at"])
+            titles_by_day.setdefault(bucket, []).append((title, news_id))
+        hashes_to_ids[str(row["content_hash"])] = news_id
+        normalized_url = normalize_url(str(row["url"] or ""))
+        if normalized_url:
+            urls_to_ids[normalized_url] = news_id
 
-    # Major news: |sentiment| >= 50 AND confidence >= 70 AND published within 4 hours => pinned
-    from datetime import datetime, timedelta, timezone
-    pin_cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%S")
+    inserted = 0
+    duplicates = 0
+    try:
+        for item in prepared_items:
+            duplicate_id = (
+                hashes_to_ids.get(item["content_hash"])
+                or hashes_to_ids.get(item["legacy_content_hash"])
+                or urls_to_ids.get(item["url"])
+            )
+            title = normalize_title(item["title"])
+            bucket = publication_bucket(item["published_at"] or item["fetched_at"])
+            if duplicate_id is None and title:
+                duplicate_id = next(
+                    (
+                        news_id
+                        for prior_title, news_id in titles_by_day.setdefault(bucket, [])
+                        if similar_titles(title, prior_title)
+                    ),
+                    None,
+                )
+            if duplicate_id is not None:
+                duplicates += 1
+                await _record_duplicate_news(db, duplicate_id, item)
+                continue
+            news_id = await _insert_prepared_news(db, item)
+            if news_id is None:
+                duplicates += 1
+                async with db.execute(
+                    "SELECT id FROM news_items WHERE content_hash IN (?,?) ORDER BY id LIMIT 1",
+                    (item["content_hash"], item["legacy_content_hash"]),
+                ) as cursor:
+                    concurrent = await cursor.fetchone()
+                if concurrent is not None:
+                    await _record_duplicate_news(db, int(concurrent[0]), item)
+            else:
+                inserted += 1
+                hashes_to_ids[item["content_hash"]] = news_id
+                hashes_to_ids[item["legacy_content_hash"]] = news_id
+                urls_to_ids[item["url"]] = news_id
+                if title:
+                    titles_by_day.setdefault(bucket, []).append((title, news_id))
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return {"inserted": inserted, "duplicates": duplicates}
 
+
+def _news_payload(
+    row: MappingLike,
+    *,
+    sources: list[str] | None = None,
+) -> dict[str, Any]:
+    source_names = sources or [str(row["source"])]
+    return {
+        "id": int(row["news_id"]),
+        "source": str(row["source"]),
+        "title": str(row["title"]),
+        "summary": row["summary"],
+        "url": str(row["url"]),
+        "image_url": row["image_url"],
+        "published_at": row["published_at"],
+        "fetched_at": str(row["fetched_at"]),
+        "updated_at": str(row["updated_at"]),
+        "source_tickers": _deserialize_tickers(row["source_tickers"]),
+        "content_hash": str(row["content_hash"]),
+        "sources": source_names,
+        "source_count": len(source_names),
+    }
+
+
+async def _source_evidence_by_news_ids(
+    db: aiosqlite.Connection,
+    news_ids: list[int],
+    *,
+    as_of: datetime,
+) -> dict[int, list[str]]:
+    unique_ids = list(dict.fromkeys(news_ids))
+    if not unique_ids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_ids)
     async with db.execute(
-        f"""SELECT n.*, 
-            a.id as analysis_id, a.title_zh, a.headline_summary, a.overall_sentiment, a.classification, 
-            a.confidence, a.affected_stocks, a.affected_sectors, a.affected_commodities,
-            a.logic_chain, a.key_factors, a.llm_provider, a.llm_model, a.analyzed_at,
-            CASE 
-                WHEN a.id IS NOT NULL 
-                     AND ABS(a.overall_sentiment) >= 50 
-                     AND a.confidence >= 70 
-                     AND datetime(n.published_at) >= datetime(?)
-                THEN 1 ELSE 0 
-            END as is_pinned
-        FROM news_items n
-        LEFT JOIN analyses a ON a.news_id = n.id
-        {where} ORDER BY is_pinned DESC, n.published_at DESC LIMIT ? OFFSET ?""",
-        [pin_cutoff, *filter_params, page_size, offset],
-    ) as cur:
-        rows = await cur.fetchall()
+        f"""SELECT canonical_news_id,source
+            FROM news_source_observations
+            WHERE canonical_news_id IN ({placeholders}) AND observed_at_us<=?
+            ORDER BY canonical_news_id,observation_id""",
+        [*unique_ids, epoch_microseconds(as_of)],
+    ) as cursor:
+        rows = await cursor.fetchall()
+    sources_by_id: dict[int, list[str]] = {}
+    seen_by_id: dict[int, set[str]] = {}
+    for row in rows:
+        news_id = int(row["canonical_news_id"])
+        source = str(row["source"])
+        key = source.casefold()
+        if key in seen_by_id.setdefault(news_id, set()):
+            continue
+        seen_by_id[news_id].add(key)
+        sources_by_id.setdefault(news_id, []).append(source)
+    return sources_by_id
 
-    items = []
-    for r in rows:
-        d = row_to_dict(r)
-        pinned = bool(d.pop("is_pinned", 0))
-        # Extract analysis fields into nested object
-        if d.get("analysis_id"):
-            analysis = {
-                "id": d.pop("analysis_id"),
-                "news_id": d["id"],
-                "title_zh": d.pop("title_zh", ""),
-                "headline_summary": d.pop("headline_summary", ""),
-                "overall_sentiment": d.pop("overall_sentiment", 0),
-                "classification": d.pop("classification", "neutral"),
-                "confidence": d.pop("confidence", 0),
-                "affected_stocks": d.pop("affected_stocks", "[]"),
-                "affected_sectors": d.pop("affected_sectors", "[]"),
-                "affected_commodities": d.pop("affected_commodities", "[]"),
-                "logic_chain": d.pop("logic_chain", ""),
-                "key_factors": d.pop("key_factors", "[]"),
-                "llm_provider": d.pop("llm_provider", ""),
-                "llm_model": d.pop("llm_model", ""),
-                "analyzed_at": d.pop("analyzed_at", ""),
+
+async def _source_evidence_by_changes(
+    db: aiosqlite.Connection,
+    changes: list[aiosqlite.Row],
+) -> dict[int, list[str]]:
+    """Project source names at each immutable change's own availability time."""
+
+    upserts = [row for row in changes if row["operation"] == "upsert"]
+    news_ids = list(dict.fromkeys(int(row["news_id"]) for row in upserts))
+    if not news_ids:
+        return {}
+    maximum_cutoff = max(int(row["available_at_us"]) for row in upserts)
+    placeholders = ",".join("?" for _ in news_ids)
+    async with db.execute(
+        f"""SELECT canonical_news_id,source,observed_at_us,observation_id
+            FROM news_source_observations
+            WHERE canonical_news_id IN ({placeholders}) AND observed_at_us<=?
+            ORDER BY canonical_news_id,observed_at_us,observation_id""",
+        [*news_ids, maximum_cutoff],
+    ) as cursor:
+        observations = await cursor.fetchall()
+
+    by_news_id: dict[int, list[aiosqlite.Row]] = {}
+    for observation in observations:
+        by_news_id.setdefault(int(observation["canonical_news_id"]), []).append(observation)
+
+    projected: dict[int, list[str]] = {}
+    for change in upserts:
+        cutoff = int(change["available_at_us"])
+        seen: set[str] = set()
+        sources: list[str] = []
+        for observation in by_news_id.get(int(change["news_id"]), []):
+            if int(observation["observed_at_us"]) > cutoff:
+                break
+            source = str(observation["source"])
+            key = source.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(source)
+        projected[int(change["change_sequence"])] = sources
+    return projected
+
+
+async def news_change_watermark(
+    db: aiosqlite.Connection,
+    *,
+    as_of: datetime,
+) -> int:
+    async with db.execute(
+        """SELECT COALESCE(MAX(change_sequence),0) FROM news_changes
+           WHERE available_at_us<=?""",
+        (epoch_microseconds(as_of),),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return int(row[0] if row else 0)
+
+
+async def query_news_changes(
+    db: aiosqlite.Connection,
+    *,
+    updated_after: datetime,
+    as_of: datetime,
+    after_sequence: int,
+    checkpoint_sequence: int | None = None,
+    watermark_sequence: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    sequence_floor = max(after_sequence, checkpoint_sequence or 0)
+    if checkpoint_sequence is None:
+        statement = """SELECT * FROM news_changes
+                       WHERE change_sequence>? AND change_sequence<=?
+                         AND available_at_us>?
+                         AND available_at_us<=?
+                       ORDER BY change_sequence LIMIT ?"""
+        parameters = (
+            sequence_floor,
+            watermark_sequence,
+            epoch_microseconds(updated_after),
+            epoch_microseconds(as_of),
+            limit + 1,
+        )
+    else:
+        # Sequence checkpoints close the commit-time race inherent in wall-clock
+        # filters: a row stamped before ``as_of`` may become visible only after
+        # that read transaction has completed.
+        statement = """SELECT * FROM news_changes
+                       WHERE change_sequence>? AND change_sequence<=?
+                         AND available_at_us<=?
+                       ORDER BY change_sequence LIMIT ?"""
+        parameters = (
+            sequence_floor,
+            watermark_sequence,
+            epoch_microseconds(as_of),
+            limit + 1,
+        )
+    async with db.execute(statement, parameters) as cursor:
+        rows = await cursor.fetchall()
+    has_more = len(rows) > limit
+    visible_rows = rows[:limit]
+    sources_by_change = await _source_evidence_by_changes(db, visible_rows)
+    changes: list[dict[str, Any]] = []
+    for row in visible_rows:
+        news_id = int(row["news_id"])
+        changes.append(
+            {
+                "sequence": int(row["change_sequence"]),
+                "operation": str(row["operation"]),
+                "changed_at": str(row["available_at"]),
+                "source_updated_at": str(row["updated_at"]),
+                "available_at": str(row["available_at"]),
+                "news": (
+                    _news_payload(
+                        row,
+                        sources=sources_by_change.get(int(row["change_sequence"])),
+                    )
+                    if row["operation"] == "upsert"
+                    else None
+                ),
+                "news_id": news_id,
             }
-            parse_json_fields(analysis, ["affected_stocks", "affected_sectors", "affected_commodities", "key_factors"])
-            d["analysis"] = analysis
-        else:
-            # Remove None analysis columns
-            for k in ["analysis_id", "title_zh", "headline_summary", "overall_sentiment", "classification",
-                       "confidence", "affected_stocks", "affected_sectors", "affected_commodities",
-                       "logic_chain", "key_factors", "llm_provider", "llm_model", "analyzed_at"]:
-                d.pop(k, None)
-            d["analysis"] = None
-        d["is_pinned"] = pinned
-        items.append(_without_internal_news_fields(d))
-    return total, items
+        )
+    return changes, has_more
 
 
-async def get_news_item_by_id(
+async def get_news_as_of(
     db: aiosqlite.Connection,
     news_id: int,
     *,
-    include_internal: bool = True,
-) -> Optional[dict]:
-    async with db.execute("SELECT * FROM news_items WHERE id = ?", (news_id,)) as cur:
-        row = await cur.fetchone()
-    if not row:
-        return None
-    item = row_to_dict(row)
-    return item if include_internal else _without_internal_news_fields(item)
-
-
-async def get_unanalyzed_news(db: aiosqlite.Connection, limit: int = 5) -> list[dict]:
-    recovered = await recover_stale_analysis_leases(db)
-    if recovered:
-        logger.warning("Recovered %s expired analysis leases", recovered)
-
+    as_of: datetime,
+) -> tuple[dict[str, Any], int, str] | None:
     async with db.execute(
-        "SELECT * FROM news_items WHERE analysis_status = 'pending' ORDER BY published_at DESC LIMIT ?",
-        (limit,),
-    ) as cur:
-        rows = await cur.fetchall()
-    return [row_to_dict(r) for r in rows]
-
-
-async def claim_news_for_analysis(db: aiosqlite.Connection, news_id: int) -> bool:
-    """Claim an item with a renewable-by-retry lease to avoid permanent processing rows."""
-    now = datetime.now(timezone.utc)
-    lease_expires_at = now + timedelta(seconds=DEFAULT_ANALYSIS_LEASE_SECONDS)
-    cursor = await db.execute(
-        """UPDATE news_items
-           SET analysis_status = 'processing',
-               analysis_attempts = analysis_attempts + 1,
-               analysis_claimed_at = ?,
-               analysis_lease_expires_at = ?,
-               analysis_error = ''
-           WHERE id = ?
-             AND (
-                 analysis_status = 'pending'
-                 OR (
-                     analysis_status = 'processing'
-                     AND datetime(analysis_lease_expires_at) <= datetime(?)
-                 )
-             )""",
-        (now.isoformat(), lease_expires_at.isoformat(), news_id, now.isoformat()),
+        """SELECT * FROM news_changes
+           WHERE news_id=? AND available_at_us<=?
+           ORDER BY change_sequence DESC LIMIT 1""",
+        (news_id, epoch_microseconds(as_of)),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or row["operation"] == "delete":
+        return None
+    # The selected change is immutable. Project source evidence at that change's
+    # own availability boundary so later corroboration cannot rewrite history.
+    sources_by_id = await _source_evidence_by_news_ids(
+        db,
+        [news_id],
+        as_of=parse_utc(str(row["available_at"]), field="available_at"),
     )
-    await db.commit()
-    return cursor.rowcount > 0
-
-
-async def recover_stale_analysis_leases(db: aiosqlite.Connection) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = await db.execute(
-        """UPDATE news_items
-           SET analysis_status = CASE
-                   WHEN analysis_attempts >= ? THEN 'failed'
-                   ELSE 'pending'
-               END,
-               analysis_error = 'Analysis lease expired; item requeued',
-               analysis_claimed_at = NULL,
-               analysis_lease_expires_at = NULL
-           WHERE analysis_status = 'processing'
-             AND (
-                 analysis_lease_expires_at IS NULL
-                 OR datetime(analysis_lease_expires_at) <= datetime(?)
-             )""",
-        (MAX_ANALYSIS_ATTEMPTS, now),
+    return (
+        _news_payload(row, sources=sources_by_id.get(news_id)),
+        int(row["change_sequence"]),
+        str(row["available_at"]),
     )
-    await db.commit()
-    return cursor.rowcount
 
 
-async def mark_analysis_completed(db: aiosqlite.Connection, news_id: int) -> None:
+async def upsert_source_health(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    status: str,
+    last_attempt_at: str | None,
+    last_success_at: str | None,
+    data_through: str | None,
+    consecutive_failures: int,
+    next_attempt_at: str | None,
+    raw_count: int | None,
+    inserted_count: int | None,
+    duplicates_count: int | None,
+    error_code: str | None,
+) -> None:
     await db.execute(
-        """UPDATE news_items
-           SET analysis_status = 'completed', analysis_error = '',
-               analysis_claimed_at = NULL, analysis_lease_expires_at = NULL
-           WHERE id = ?""",
-        (news_id,),
+        """INSERT INTO source_health
+           (source,status,last_attempt_at,last_success_at,data_through,consecutive_failures,
+            next_attempt_at,raw_count,inserted_count,duplicates_count,error_code,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(source) DO UPDATE SET
+             status=excluded.status,last_attempt_at=excluded.last_attempt_at,
+             last_success_at=excluded.last_success_at,data_through=excluded.data_through,
+             consecutive_failures=excluded.consecutive_failures,
+             next_attempt_at=excluded.next_attempt_at,raw_count=excluded.raw_count,
+             inserted_count=excluded.inserted_count,duplicates_count=excluded.duplicates_count,
+             error_code=excluded.error_code,updated_at=excluded.updated_at""",
+        (
+            source[:200],
+            status,
+            last_attempt_at,
+            last_success_at,
+            data_through,
+            max(0, int(consecutive_failures)),
+            next_attempt_at,
+            max(0, int(raw_count)) if raw_count is not None else None,
+            max(0, int(inserted_count)) if inserted_count is not None else None,
+            max(0, int(duplicates_count)) if duplicates_count is not None else None,
+            error_code[:100] if error_code else None,
+            utc_text(),
+        ),
     )
     await db.commit()
 
 
-async def mark_analysis_failed(db: aiosqlite.Connection, news_id: int, error: str) -> None:
-    await db.execute(
-        """UPDATE news_items
-           SET analysis_status = CASE WHEN analysis_attempts >= ? THEN 'failed' ELSE 'pending' END,
-               analysis_error = ?, analysis_claimed_at = NULL, analysis_lease_expires_at = NULL
-           WHERE id = ?""",
-        (MAX_ANALYSIS_ATTEMPTS, error[:500], news_id),
-    )
-    await db.commit()
+async def get_source_health(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    async with db.execute(
+        """SELECT source,status,last_attempt_at,last_success_at,data_through,
+                  consecutive_failures,next_attempt_at,raw_count,inserted_count,
+                  duplicates_count,error_code,updated_at
+           FROM source_health ORDER BY source"""
+    ) as cursor:
+        return [dict(row) for row in await cursor.fetchall()]
 
 
-async def requeue_failed_analyses(db: aiosqlite.Connection, news_id: Optional[int] = None) -> int:
-    where = "analysis_status = 'failed'"
-    params: list[Any] = []
-    if news_id is not None:
-        where += " AND id = ?"
-        params.append(news_id)
-    cursor = await db.execute(
-        f"""UPDATE news_items
-            SET analysis_status = 'pending', analysis_attempts = 0, analysis_error = '',
-                analysis_claimed_at = NULL, analysis_lease_expires_at = NULL
-            WHERE {where}""",
-        params,
-    )
-    await db.commit()
-    return cursor.rowcount
-
-
-# --- analyses ---
-
-async def insert_analysis(db: aiosqlite.Connection, analysis: dict) -> int:
-    cursor = await db.execute(
-        """INSERT OR IGNORE INTO analyses
-           (news_id, title_zh, headline_summary, overall_sentiment, classification, confidence, affected_stocks,
-            affected_sectors, affected_commodities, logic_chain, key_factors,
-            llm_provider, llm_model, analyzed_at)
-           VALUES (:news_id, :title_zh, :headline_summary, :overall_sentiment, :classification, :confidence,
-                   :affected_stocks, :affected_sectors, :affected_commodities,
-                   :logic_chain, :key_factors, :llm_provider, :llm_model, :analyzed_at)""",
-        analysis,
-    )
-    await db.commit()
-    analysis_id = cursor.lastrowid
-    try:
-        await cleanup_retained_data(db)
-    except Exception:
-        logger.exception("Post-analysis retention cleanup failed")
-    return analysis_id
-
-
-async def save_analysis_result(db: aiosqlite.Connection, analysis: dict) -> int:
-    """Upsert an analysis and mark its news item complete in one transaction."""
-    try:
-        await db.execute(
-            """INSERT INTO analyses
-               (news_id, title_zh, headline_summary, overall_sentiment, classification, confidence,
-                affected_stocks, affected_sectors, affected_commodities, logic_chain, key_factors,
-                llm_provider, llm_model, analyzed_at)
-               VALUES (:news_id, :title_zh, :headline_summary, :overall_sentiment, :classification,
-                       :confidence, :affected_stocks, :affected_sectors, :affected_commodities,
-                       :logic_chain, :key_factors, :llm_provider, :llm_model, :analyzed_at)
-               ON CONFLICT(news_id) DO UPDATE SET
-                   title_zh=excluded.title_zh,
-                   headline_summary=excluded.headline_summary,
-                   overall_sentiment=excluded.overall_sentiment,
-                   classification=excluded.classification,
-                   confidence=excluded.confidence,
-                   affected_stocks=excluded.affected_stocks,
-                   affected_sectors=excluded.affected_sectors,
-                   affected_commodities=excluded.affected_commodities,
-                   logic_chain=excluded.logic_chain,
-                   key_factors=excluded.key_factors,
-                   llm_provider=excluded.llm_provider,
-                   llm_model=excluded.llm_model,
-                   analyzed_at=excluded.analyzed_at""",
-            analysis,
+def _calendar_event_id(event: dict[str, Any]) -> str:
+    identity = "\n".join(
+        (
+            str(event.get("date") or event.get("scheduled_at") or ""),
+            str(event.get("country_code") or "").upper(),
+            str(event.get("title") or "").strip(),
         )
-        await db.execute(
-            """UPDATE news_items
-               SET analysis_status = 'completed', analysis_error = '',
-                   analysis_claimed_at = NULL, analysis_lease_expires_at = NULL
-               WHERE id = :news_id""",
-            analysis,
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+async def record_calendar_snapshot(
+    db: aiosqlite.Connection,
+    events: list[dict[str, Any]],
+    *,
+    source_fetched_at: str,
+    stale: bool,
+    observed_at: str,
+    source: str = "faireconomy",
+) -> tuple[str, int]:
+    fetched = utc_text(parse_utc(source_fetched_at, field="source_fetched_at"))
+    observed = utc_text(max(parse_utc(observed_at, field="observed_at"), parse_utc(fetched)))
+    normalized: list[dict[str, Any]] = []
+    for event in events:
+        country_code = str(event.get("country_code") or "").upper()
+        title = str(event.get("title") or "").strip()
+        scheduled = str(event.get("date") or event.get("scheduled_at") or "").strip()
+        impact = str(event.get("impact") or "low").lower()
+        if len(country_code) != 3 or not title or not scheduled:
+            continue
+        if impact not in {"low", "medium", "high", "holiday"}:
+            continue
+        scheduled_utc = utc_text(parse_utc(scheduled, field="scheduled_at"))
+        row = {
+            "event_id": _calendar_event_id(event),
+            "country_code": country_code,
+            "country": str(event.get("country") or country_code),
+            "title": title[:4_000],
+            "impact": impact,
+            "impact_zh": str(event.get("impact_zh") or impact),
+            "scheduled_at": scheduled,
+            "scheduled_at_utc": scheduled_utc,
+            "forecast": str(event.get("forecast") or "") or None,
+            "previous": str(event.get("previous") or "") or None,
+            "actual": str(event.get("actual") or "") or None,
+        }
+        row["content_hash"] = hashlib.sha256(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        normalized.append(row)
+    normalized.sort(key=lambda row: (row["scheduled_at_utc"], row["event_id"]))
+    canonical = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    payload_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    # Repeated reads of the same stale cache reuse one immutable snapshot.
+    # A successful fresh fetch gets a new snapshot even when values are equal,
+    # because source_fetched_at is itself a newer data-through observation.
+    token = "cal_" + hashlib.sha256(
+        f"{fetched}:{int(stale)}:{payload_hash}".encode()
+    ).hexdigest()[:40]
+    try:
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO etl_calendar_snapshots
+               (snapshot_token,source,source_fetched_at,data_through,is_stale,available_at,
+                available_at_us,payload_hash)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                token,
+                source,
+                fetched,
+                fetched,
+                int(stale),
+                observed,
+                epoch_microseconds(observed),
+                payload_hash,
+            ),
         )
-        async with db.execute("SELECT id FROM analyses WHERE news_id = ?", (analysis["news_id"],)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            raise RuntimeError("analysis upsert did not produce a row")
+        if cursor.rowcount == 0:
+            async with db.execute(
+                "SELECT snapshot_sequence FROM etl_calendar_snapshots WHERE snapshot_token=?",
+                (token,),
+            ) as query:
+                existing = await query.fetchone()
+            await db.commit()
+            return token, int(existing[0])
+        sequence = int(cursor.lastrowid)
+        for ordinal, event in enumerate(normalized, 1):
+            await db.execute(
+                """INSERT INTO etl_calendar_events
+                   (snapshot_sequence,ordinal,event_id,country_code,country,title,impact,
+                    impact_zh,scheduled_at,scheduled_at_utc,forecast,previous,actual,
+                    is_stale,source_fetched_at,available_at,content_hash)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sequence,
+                    ordinal,
+                    event["event_id"],
+                    event["country_code"],
+                    event["country"],
+                    event["title"],
+                    event["impact"],
+                    event["impact_zh"],
+                    event["scheduled_at"],
+                    event["scheduled_at_utc"],
+                    event["forecast"],
+                    event["previous"],
+                    event["actual"],
+                    int(stale),
+                    fetched,
+                    observed,
+                    event["content_hash"],
+                ),
+            )
         await db.commit()
-        try:
-            await cleanup_retained_data(db)
-        except Exception:
-            logger.exception("Post-analysis retention cleanup failed")
-        return int(row[0])
+        return token, sequence
     except Exception:
         await db.rollback()
         raise
 
 
-async def get_analyses(
+async def calendar_watermark(
     db: aiosqlite.Connection,
-    page: int = 1,
-    page_size: int = 20,
-    classification: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-) -> tuple[int, list[dict]]:
-    offset = (page - 1) * page_size
-    conditions = []
-    params: list[Any] = []
-
-    if classification:
-        conditions.append("a.classification = ?")
-        params.append(classification)
-    if date_from:
-        conditions.append("a.analyzed_at >= ?")
-        params.append(date_from)
-    if date_to:
-        conditions.append("a.analyzed_at <= ?")
-        params.append(date_to)
-
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
+    *,
+    updated_after: datetime,
+    as_of: datetime,
+) -> dict[str, Any] | None:
     async with db.execute(
-        f"SELECT COUNT(*) FROM analyses a {where}", params
-    ) as cur:
-        row = await cur.fetchone()
-        total = row[0] if row else 0
+        """SELECT *,
+                  CASE WHEN available_at_us>? THEN 1 ELSE 0 END AS has_changes
+           FROM etl_calendar_snapshots
+           WHERE available_at_us<=?
+           ORDER BY snapshot_sequence DESC LIMIT 1""",
+        (epoch_microseconds(updated_after), epoch_microseconds(as_of)),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return dict(row) if row else None
 
+
+async def query_calendar_page(
+    db: aiosqlite.Connection,
+    *,
+    snapshot_sequence: int,
+    after_ordinal: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
     async with db.execute(
-        f"""SELECT a.*, n.title as news_title, n.source as news_source, n.url as news_url
-            FROM analyses a
-            JOIN news_items n ON n.id = a.news_id
-            {where}
-            ORDER BY a.analyzed_at DESC
-            LIMIT ? OFFSET ?""",
-        params + [page_size, offset],
-    ) as cur:
-        rows = await cur.fetchall()
+        """SELECT * FROM etl_calendar_events
+           WHERE snapshot_sequence=? AND ordinal>?
+           ORDER BY ordinal LIMIT ?""",
+        (snapshot_sequence, after_ordinal, limit + 1),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    has_more = len(rows) > limit
+    items = []
+    for row in rows[:limit]:
+        items.append(
+            {
+                "event_id": str(row["event_id"]),
+                "country_code": str(row["country_code"]),
+                "country": str(row["country"]),
+                "title": str(row["title"]),
+                "impact": str(row["impact"]),
+                "impact_zh": str(row["impact_zh"]),
+                "scheduled_at": str(row["scheduled_at"]),
+                "scheduled_at_utc": str(row["scheduled_at_utc"]),
+                "forecast": row["forecast"],
+                "previous": row["previous"],
+                "actual": row["actual"],
+                "is_stale": bool(row["is_stale"]),
+                "source_fetched_at": str(row["source_fetched_at"]),
+                "available_at": str(row["available_at"]),
+                "ordinal": int(row["ordinal"]),
+            }
+        )
+    return items, has_more
 
-    items = [parse_json_fields(row_to_dict(r), ["affected_stocks", "affected_sectors", "affected_commodities", "key_factors"]) for r in rows]
-    return total, items
+
+def _quote_identifier(value: str) -> str:
+    if not _IDENTIFIER.fullmatch(value):
+        raise ValueError("invalid SQLite identifier")
+    return f'"{value}"'
 
 
-async def get_latest_analyses(db: aiosqlite.Connection, limit: int = 10) -> list[dict]:
+async def _legacy_news_references(db: aiosqlite.Connection) -> list[tuple[str, str]]:
     async with db.execute(
-        """SELECT a.*, n.title as news_title, n.source as news_source, n.url as news_url
-           FROM analyses a
-           JOIN news_items n ON n.id = a.news_id
-           ORDER BY a.analyzed_at DESC
-           LIMIT ?""",
-        (limit,),
-    ) as cur:
-        rows = await cur.fetchall()
-    return [parse_json_fields(row_to_dict(r), ["affected_stocks", "affected_sectors", "affected_commodities", "key_factors"]) for r in rows]
-
-
-async def get_analysis_for_news(db: aiosqlite.Connection, news_id: int) -> Optional[dict]:
-    async with db.execute(
-        "SELECT * FROM analyses WHERE news_id = ?", (news_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    if not row:
-        return None
-    return parse_json_fields(row_to_dict(row), ["affected_stocks", "affected_sectors", "affected_commodities", "key_factors"])
-
-
-async def get_analysis_stats(db: aiosqlite.Connection, days: int = 7) -> dict:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    async with db.execute(
-        """SELECT
-               COUNT(*) as total,
-               AVG(overall_sentiment) as avg_sentiment,
-               SUM(CASE WHEN classification='bullish' THEN 1 ELSE 0 END) as bullish,
-               SUM(CASE WHEN classification='bearish' THEN 1 ELSE 0 END) as bearish,
-               SUM(CASE WHEN classification='neutral' THEN 1 ELSE 0 END) as neutral
-           FROM analyses
-           WHERE analyzed_at >= ?""",
-        (cutoff,),
-    ) as cur:
-        row = await cur.fetchone()
-    stats = row_to_dict(row) if row else {}
-
-    # Sector breakdown with per-sector sentiment
-    async with db.execute(
-        """SELECT affected_sectors, overall_sentiment, classification
-           FROM analyses WHERE analyzed_at >= ?""",
-        (cutoff,),
-    ) as cur:
-        rows = await cur.fetchall()
-
-    sector_data: dict[str, dict] = {}
-    for r in rows:
-        sectors = parse_json_fields({"affected_sectors": r[0]}, ["affected_sectors"])["affected_sectors"]
-        sentiment = r[1] or 0
-        cls = r[2] or "neutral"
-        if cls not in {"bullish", "bearish", "neutral"}:
-            cls = "neutral"
-        for s in sectors:
-            if not isinstance(s, str):
-                continue
-            if s not in sector_data:
-                sector_data[s] = {"count": 0, "total_sentiment": 0, "bullish": 0, "bearish": 0, "neutral": 0}
-            sector_data[s]["count"] += 1
-            sector_data[s]["total_sentiment"] += sentiment
-            sector_data[s][cls] += 1
-
-    sector_counts: dict[str, int] = {k: v["count"] for k, v in sector_data.items()}
-
-    # Build sector_sentiment with per-sector avg score
-    sector_sentiment = {
-        name: {
-            "count": data["count"],
-            "avg_sentiment": round(data["total_sentiment"] / max(data["count"], 1), 1),
-            "bullish": data["bullish"],
-            "bearish": data["bearish"],
-            "neutral": data["neutral"],
-        }
-        for name, data in sector_data.items()
-    }
-
-    # Top stocks
-    async with db.execute(
-        "SELECT affected_stocks FROM analyses WHERE analyzed_at >= ?",
-        (cutoff,),
-    ) as cur:
-        rows = await cur.fetchall()
-
-    stock_scores: dict[str, list[int]] = {}
-    for r in rows:
-        stocks = parse_json_fields({"affected_stocks": r[0]}, ["affected_stocks"])["affected_stocks"]
-        for s in stocks:
-            if not isinstance(s, dict):
-                continue
-            ticker = s.get("ticker", "")
-            if ticker:
-                stock_scores.setdefault(ticker, []).append(_bounded_score(s.get("impact_score")))
-
-    top_stocks = sorted(
-        [{"ticker": t, "avg_impact": sum(v) / len(v), "mention_count": len(v)} for t, v in stock_scores.items()],
-        key=lambda x: x["mention_count"],
-        reverse=True,
-    )[:10]
-
-    async with db.execute(
-        "SELECT COUNT(*) FROM news_items WHERE analysis_status IN ('pending', 'processing')"
-    ) as cur:
-        row = await cur.fetchone()
-        pending_count = row[0] if row else 0
-
-    return {
-        "window_days": days,
-        "total_analyzed": stats.get("total", 0) or 0,
-        "avg_sentiment": round(stats.get("avg_sentiment") or 0, 2),
-        "bullish_count": stats.get("bullish", 0) or 0,
-        "bearish_count": stats.get("bearish", 0) or 0,
-        "neutral_count": stats.get("neutral", 0) or 0,
-        "pending_count": pending_count,
-        "sector_breakdown": sector_counts,
-        "sector_sentiment": sector_sentiment,
-        "top_affected_stocks": top_stocks,
-    }
-
-
-# --- x_sentiments ---
-
-async def insert_x_sentiment(db: aiosqlite.Connection, sentiment: dict) -> int:
-    cursor = await db.execute(
-        """INSERT INTO x_sentiments
-           (query, trending_tickers, retail_sentiment_score, key_narratives, meme_stocks, raw_analysis, fear_greed_estimate, analyzed_at)
-           VALUES (:query, :trending_tickers, :retail_sentiment_score, :key_narratives, :meme_stocks, :raw_analysis, :fear_greed_estimate, :analyzed_at)""",
-        sentiment,
-    )
-    await db.commit()
-    sentiment_id = cursor.lastrowid
-    try:
-        await cleanup_retained_data(db)
-    except Exception:
-        logger.exception("Post-sentiment retention cleanup failed")
-    return sentiment_id
-
-
-async def get_latest_x_sentiment(db: aiosqlite.Connection) -> Optional[dict]:
-    async with db.execute(
-        "SELECT * FROM x_sentiments ORDER BY analyzed_at DESC LIMIT 1"
-    ) as cur:
-        row = await cur.fetchone()
-    if not row:
-        return None
-    return parse_json_fields(row_to_dict(row), ["trending_tickers", "key_narratives", "meme_stocks"])
-
-
-async def get_x_sentiment_history(
-    db: aiosqlite.Connection, page: int = 1, page_size: int = 20
-) -> tuple[int, list[dict]]:
-    offset = (page - 1) * page_size
-
-    async with db.execute("SELECT COUNT(*) FROM x_sentiments") as cur:
-        row = await cur.fetchone()
-        total = row[0] if row else 0
-
-    async with db.execute(
-        "SELECT * FROM x_sentiments ORDER BY analyzed_at DESC LIMIT ? OFFSET ?",
-        (page_size, offset),
-    ) as cur:
-        rows = await cur.fetchall()
-
-    items = [parse_json_fields(row_to_dict(r), ["trending_tickers", "key_narratives", "meme_stocks"]) for r in rows]
-    return total, items
-
-
-# --- settings ---
-
-async def get_setting(db: aiosqlite.Connection, key: str) -> Optional[Any]:
-    async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
-        row = await cur.fetchone()
-    if not row:
-        return None
-    try:
-        return json.loads(row[0])
-    except (json.JSONDecodeError, TypeError):
-        return row[0]
-
-
-async def set_setting(db: aiosqlite.Connection, key: str, value: Any) -> None:
-    serialized = json.dumps(value)
-    await db.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, serialized),
-    )
-    await db.commit()
-
-
-async def get_all_settings(db: aiosqlite.Connection) -> dict[str, Any]:
-    async with db.execute("SELECT key, value FROM settings") as cur:
-        rows = await cur.fetchall()
-    result = {}
-    for row in rows:
-        try:
-            result[row[0]] = json.loads(row[1])
-        except (json.JSONDecodeError, TypeError):
-            result[row[0]] = row[1]
-    return result
-
-
-# --- Asset Sentiment Aggregation ---
-
-# Direct aliases only; constituent or ETF proxies are deliberately excluded.
-_ASSET_TICKER_ALIASES: dict[str, set[str]] = {
-    "^IXIC": {"^IXIC", "IXIC", "NASDAQ", "NASDAQCOMPOSITE"},
-    "^GSPC": {"^GSPC", "GSPC", "SPX", "SP500", "S&P500"},
-    "^N225": {"^N225", "N225", "NIKKEI", "NIKKEI225"},
-    "000001.SS": {"000001.SS", "SHCOMP", "SSECOMPOSITE"},
-}
-
-_COMMODITY_NAMES: dict[str, set[str]] = {
-    "GC=F": {"gold", "黄金"},
-    "SI=F": {"silver", "白银"},
-    "CL=F": {"oil", "crude", "crude oil", "原油", "石油"},
-}
-
-
-async def get_asset_sentiment(db: aiosqlite.Connection, symbol: str, days: int = 7) -> dict:
-    """Aggregate sentiment for a given asset from recent analyses."""
-    from datetime import datetime, timedelta, timezone
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    async with db.execute(
-        """SELECT a.affected_stocks, a.affected_commodities,
-                  a.overall_sentiment, a.classification, a.confidence, a.analyzed_at
-           FROM analyses a
-           WHERE a.analyzed_at >= ?
-           ORDER BY a.analyzed_at DESC""",
-        (cutoff,),
-    ) as cur:
-        rows = await cur.fetchall()
-
-    if not rows:
-        return {"score": None, "total": 0, "bullish": 0, "bearish": 0, "neutral": 0,
-                "signal": None, "description": None, "tags": []}
-
-    target_tickers = _ASSET_TICKER_ALIASES.get(symbol, {symbol})
-    target_commodities = _COMMODITY_NAMES.get(symbol, set())
-
-    weighted_sum = 0.0
-    weight_total = 0.0
-    bullish = bearish = neutral = 0
-
-    for r in rows:
-        stocks = parse_json_fields({"affected_stocks": r[0]}, ["affected_stocks"])["affected_stocks"]
-        commodities = parse_json_fields(
-            {"affected_commodities": r[1]},
-            ["affected_commodities"],
-        )["affected_commodities"]
-        sentiment = r[2] or 0
-        cls = r[3] or "neutral"
-        confidence = r[4] if r[4] is not None else 50
-
-        relevance = 0.0
-
-        # Check ticker overlap
-        row_tickers = {
-            str(item.get("ticker") or "").upper().lstrip("$")
-            for item in stocks
-            if isinstance(item, dict)
-        }
-        ticker_hits = row_tickers & target_tickers
-        if ticker_hits:
-            relevance += len(ticker_hits) * 3.0
-
-        # Check commodity name overlap
-        if target_commodities:
-            com_names = set()
-            for c in commodities:
-                if isinstance(c, dict):
-                    com_names.add(str(c.get("name") or "").strip().lower())
-                elif isinstance(c, str):
-                    com_names.add(c.strip().lower())
-            if com_names & target_commodities:
-                relevance += 3.0
-
-        if relevance <= 0:
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ) as cursor:
+        table_names = [str(row[0]) for row in await cursor.fetchall()]
+    references: set[tuple[str, str]] = set()
+    for table in table_names:
+        if table in {"news_items", "news_changes", "news_source_observations"}:
             continue
+        quoted = _quote_identifier(table)
+        async with db.execute(f"PRAGMA table_info({quoted})") as cursor:
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+        # Some very old installations used a logical news_id link without a
+        # declared foreign key. Protect it as historical data all the same.
+        if "news_id" in columns:
+            references.add((table, "news_id"))
+        async with db.execute(f"PRAGMA foreign_key_list({quoted})") as cursor:
+            for row in await cursor.fetchall():
+                if str(row[2]) == "news_items" and str(row[4] or "id") == "id":
+                    references.add((table, str(row[3])))
+    return sorted(references)
 
-        w = relevance * (confidence / 100.0)
-        weighted_sum += sentiment * w
-        weight_total += w
 
-        if cls == "bullish":
-            bullish += 1
-        elif cls == "bearish":
-            bearish += 1
-        else:
-            neutral += 1
+async def cleanup_retained_data(
+    db: aiosqlite.Connection,
+    *,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Apply ETL retention without modifying legacy analysis tables.
 
-    total = bullish + bearish + neutral
-    if total == 0 or weight_total == 0:
-        return {"score": None, "total": 0, "bullish": 0, "bearish": 0, "neutral": 0,
-                "signal": None, "description": None, "tags": []}
+    Raw news rows referenced by any legacy foreign key are retained. This keeps
+    cascade rules from silently deleting historical analysis records.
+    """
 
-    avg_sentiment = weighted_sum / weight_total  # -100 to 100
-    # Normalise to 0–100 scale
-    score = max(0, min(100, round((avg_sentiment + 100) / 2)))
+    current = now or utc_now()
+    storage = settings.storage
+    deleted = {"news_items": 0, "news_changes": 0, "calendar_snapshots": 0}
+    try:
+        if storage.news_retention_days:
+            cutoff = utc_text(current - timedelta(days=storage.news_retention_days))
+            references = await _legacy_news_references(db)
+            protections = [
+                f"NOT EXISTS (SELECT 1 FROM {_quote_identifier(table)} legacy "
+                f"WHERE legacy.{_quote_identifier(column)}=news_items.id)"
+                for table, column in references
+            ]
+            protected_sql = " AND " + " AND ".join(protections) if protections else ""
+            async with db.execute(
+                f"""SELECT * FROM news_items
+                    WHERE julianday(COALESCE(published_at,fetched_at))<julianday(?)
+                    {protected_sql}
+                    ORDER BY COALESCE(published_at,fetched_at),id LIMIT ?""",
+                (cutoff, RETENTION_BATCH_SIZE),
+            ) as cursor:
+                candidates = await cursor.fetchall()
+            deletion_time = utc_text(current)
+            for row in candidates:
+                await _record_news_change(
+                    db,
+                    row,
+                    operation="delete",
+                    available_at=deletion_time,
+                    changed_at=deletion_time,
+                )
+            if candidates:
+                placeholders = ",".join("?" for _ in candidates)
+                cursor = await db.execute(
+                    f"DELETE FROM news_items WHERE id IN ({placeholders})",
+                    [int(row["id"]) for row in candidates],
+                )
+                deleted["news_items"] = max(0, int(cursor.rowcount))
 
-    if score >= 60:
-        signal = "bullish"
-    elif score <= 40:
-        signal = "bearish"
-    else:
-        signal = "neutral"
+        change_cutoff = utc_text(current - timedelta(days=storage.change_retention_days))
+        cursor = await db.execute(
+            """DELETE FROM news_changes
+               WHERE available_at_us<?
+                 AND change_sequence NOT IN (
+                     SELECT MAX(change_sequence) FROM news_changes GROUP BY news_id
+                 )""",
+            (epoch_microseconds(change_cutoff),),
+        )
+        deleted["news_changes"] = max(0, int(cursor.rowcount))
 
-    bull_ratio = bullish / total
-    bear_ratio = bearish / total
-    neutral_ratio = neutral / total
-    desc_parts = []
-    if bull_ratio > 0.6:
-        desc_parts.append(f"过去 {days} 天内 {total} 条相关新闻中，{round(bull_ratio * 100)}% 偏多。")
-    elif bear_ratio > 0.6:
-        desc_parts.append(f"过去 {days} 天内 {total} 条相关新闻中，{round(bear_ratio * 100)}% 偏空。")
-    elif neutral_ratio > 0.6:
-        desc_parts.append(f"过去 {days} 天内 {total} 条相关新闻中，{round(neutral_ratio * 100)}% 为中性。")
-    else:
-        desc_parts.append(f"过去 {days} 天内 {total} 条相关新闻，多空分歧较大。")
+        calendar_cutoff = utc_text(
+            current - timedelta(days=storage.calendar_snapshot_retention_days)
+        )
+        cursor = await db.execute(
+            """DELETE FROM etl_calendar_snapshots
+               WHERE available_at_us<?
+                 AND snapshot_sequence<>(
+                     SELECT COALESCE(MAX(snapshot_sequence),0) FROM etl_calendar_snapshots
+                 )""",
+            (epoch_microseconds(calendar_cutoff),),
+        )
+        deleted["calendar_snapshots"] = max(0, int(cursor.rowcount))
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return deleted
 
-    if avg_sentiment > 30:
-        desc_parts.append("这些新闻的模型平均情绪分数偏正。")
-    elif avg_sentiment < -30:
-        desc_parts.append("这些新闻的模型平均情绪分数偏负。")
-    else:
-        desc_parts.append("这些新闻的模型平均情绪分数接近中性。")
 
-    return {
-        "score": score,
-        "total": total,
-        "bullish": bullish,
-        "bearish": bearish,
-        "neutral": neutral,
-        "signal": signal,
-        "description": " ".join(desc_parts),
-        "tags": [],
-    }
+async def run_retention() -> dict[str, int]:
+    db = await get_db()
+    try:
+        result = await cleanup_retained_data(db)
+    finally:
+        await db.close()
+    if any(result.values()):
+        logger.info("ETL retention removed rows: %s", result)
+    return result

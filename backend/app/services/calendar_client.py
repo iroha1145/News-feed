@@ -6,20 +6,21 @@ import os
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 import httpx
 
+from app.config import settings
+from app.models.database import get_db, record_calendar_snapshot, upsert_source_health
 from app.utils.http import log_http_failure, safe_exception_message
 
 logger = logging.getLogger(__name__)
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-CACHE_TTL = 3600
+CACHE_TTL = settings.calendar.interval_seconds
 STALE_RETRY_TTL = 300
 MAX_STALE_CACHE_AGE = timedelta(days=7)
-CACHE_FILE = Path(__file__).resolve().parents[2] / "data" / "calendar_cache.json"
+CACHE_FILE = settings.calendar_cache_path
 
 COUNTRY_MAP = {
     "USD": "🇺🇸 美国", "EUR": "🇪🇺 欧元区", "GBP": "🇬🇧 英国",
@@ -128,6 +129,39 @@ def _normalize_events(raw_events: list[dict], *, stale: bool, fetched_at: str | 
     return events
 
 
+async def _persist_unavailable_health(attempted_at: str, error_code: str) -> None:
+    db = await get_db()
+    try:
+        async with db.execute(
+            """SELECT last_success_at,data_through,consecutive_failures
+               FROM source_health WHERE source='faireconomy'"""
+        ) as cursor:
+            prior = await cursor.fetchone()
+        prior_success = prior[0] if prior else None
+        prior_data_through = prior[1] if prior else None
+        prior_failures = int(prior[2] or 0) if prior else 0
+        retry_at = (
+            datetime.fromisoformat(attempted_at.replace("Z", "+00:00"))
+            + timedelta(seconds=STALE_RETRY_TTL)
+        ).isoformat()
+        await upsert_source_health(
+            db,
+            source="faireconomy",
+            status="degraded" if prior_success else "unavailable",
+            last_attempt_at=attempted_at,
+            last_success_at=prior_success,
+            data_through=prior_data_through,
+            consecutive_failures=prior_failures + 1,
+            next_attempt_at=retry_at,
+            raw_count=0,
+            inserted_count=None,
+            duplicates_count=None,
+            error_code=error_code,
+        )
+    finally:
+        await db.close()
+
+
 async def fetch_economic_calendar(*, force: bool = False) -> list[dict]:
     """Fetch the calendar, atomically persisting and exposing a stale last-known-good fallback."""
     global _calendar_cache, _cache_time, _cache_ttl
@@ -179,6 +213,10 @@ async def fetch_economic_calendar(*, force: bool = False) -> list[dict]:
             _calendar_cache = []
             _cache_time = time.monotonic()
             _cache_ttl = STALE_RETRY_TTL
+            try:
+                await _persist_unavailable_health(attempted_at, "calendar_source_failed")
+            except Exception:
+                logger.exception("Economic calendar failure health could not be persisted")
             return []
         _calendar_status.update(stale=True, as_of=fetched_at, last_error=upstream_error)
         _cache_ttl = STALE_RETRY_TTL
@@ -189,21 +227,16 @@ async def fetch_economic_calendar(*, force: bool = False) -> list[dict]:
     events = _normalize_events(raw_events, stale=stale, fetched_at=fetched_at)
     if fetched_at:
         try:
-            from app.integrations.option_pro.repository import (
-                record_calendar_snapshot,
-                upsert_source_health,
-            )
-            from app.models.database import get_db
-
             db = await get_db()
             try:
                 async with db.execute(
-                    """SELECT last_success_at,consecutive_failures FROM source_health
-                       WHERE source='faireconomy'"""
+                    """SELECT last_success_at,data_through,consecutive_failures
+                       FROM source_health WHERE source='faireconomy'"""
                 ) as cursor:
                     prior_health = await cursor.fetchone()
                 prior_success = prior_health[0] if prior_health else None
-                prior_failures = int(prior_health[1] or 0) if prior_health else 0
+                prior_data_through = prior_health[1] if prior_health else None
+                prior_failures = int(prior_health[2] or 0) if prior_health else 0
                 if stale and not _calendar_status.get("last_success"):
                     _calendar_status["last_success"] = prior_success or fetched_at
                 await record_calendar_snapshot(
@@ -219,7 +252,7 @@ async def fetch_economic_calendar(*, force: bool = False) -> list[dict]:
                     status="degraded" if stale else "ok",
                     last_attempt_at=attempted_at,
                     last_success_at=(fetched_at if not stale else (prior_success or fetched_at)),
-                    data_through=fetched_at,
+                    data_through=(prior_data_through or fetched_at) if stale else fetched_at,
                     consecutive_failures=prior_failures + 1 if stale else 0,
                     next_attempt_at=(
                         (
@@ -236,9 +269,7 @@ async def fetch_economic_calendar(*, force: bool = False) -> list[dict]:
             finally:
                 await db.close()
         except Exception:
-            # Calendar display remains available from its last-known-good file
-            # even if the additive Integration projection cannot be published.
-            logger.exception("Economic calendar integration projection failed")
+            logger.exception("Economic calendar persistence failed")
     _calendar_cache = events
     _cache_time = time.monotonic()
     logger.info("Economic calendar: %s events (stale=%s)", len(events), stale)

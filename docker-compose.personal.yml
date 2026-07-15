@@ -1,3 +1,5 @@
+# Personal deployment entry point. docker-compose.yml is kept equivalent so
+# existing `docker compose up -d` commands continue to work.
 services:
   macrolens:
     build:

@@ -19,13 +19,11 @@ _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 SENSITIVE_NETWORK_LOGGERS = (
     "httpx",
     "httpcore",
-    "openai",
-    "openai._base_client",
 )
 
 
 def configure_safe_network_logging() -> None:
-    """Prevent client libraries from logging request URLs or provider IDs."""
+    """Prevent HTTP clients from logging request URLs or credentials."""
 
     for name in SENSITIVE_NETWORK_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)

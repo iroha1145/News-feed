@@ -4,7 +4,7 @@ from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.config import settings as app_settings
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,133 +17,42 @@ async def _job_fetch_source(source: str) -> None:
 
         result = await aggregate_source(source)
         logger.info(
-            "[Scheduler] %s fetch: status=%s inserted=%s duplicates=%s",
+            "Source %s fetch: status=%s inserted=%s duplicates=%s",
             source,
             result.get("status", "ok"),
             result.get("inserted", 0),
             result.get("duplicates", 0),
         )
     except Exception as exc:
-        logger.error("[Scheduler] source %s job failed: %s", source, type(exc).__name__)
-
-
-async def _job_analyze_news() -> None:
-    try:
-        from app.services.analysis_jobs import enqueue_auto_jobs
-
-        count = await enqueue_auto_jobs()
-        logger.info("[Scheduler] Persistent analysis jobs enqueued: %s", count)
-    except Exception as exc:
-        logger.error("[Scheduler] Analysis job failed: %s", type(exc).__name__)
-
-
-async def _job_retry_event_projections() -> None:
-    try:
-        from app.services.news_aggregator import process_projection_retry_queue
-
-        result = await process_projection_retry_queue()
-        if result["attempted"]:
-            logger.info(
-                "[Scheduler] Event projection retries: attempted=%s completed=%s failed=%s",
-                result["attempted"],
-                result["completed"],
-                result["failed"],
-            )
-    except Exception as exc:
-        logger.error("[Scheduler] Event projection retry failed: %s", type(exc).__name__)
-
-
-async def _job_x_sentiment() -> None:
-    if not app_settings.x_sentiment_enabled:
-        return
-    try:
-        from app.services.grok_x_monitor import run_x_sentiment_analysis
-
-        result = await run_x_sentiment_analysis()
-        if result:
-            logger.info("[Scheduler] News-grounded market scenario complete")
-        else:
-            logger.debug("[Scheduler] Market scenario skipped (missing key or news context)")
-    except Exception as exc:
-        logger.error("[Scheduler] Market scenario job failed: %s", type(exc).__name__)
+        logger.error("Source %s job failed: %s", source, type(exc).__name__)
 
 
 async def _job_fetch_calendar() -> None:
     try:
         from app.services.calendar_client import fetch_economic_calendar
+        from app.services.calendar_client import get_calendar_status
 
         events = await fetch_economic_calendar(force=True)
-        logger.info("[Scheduler] Economic calendar refreshed: %s events", len(events))
-    except Exception as exc:
-        logger.error("[Scheduler] Economic calendar job failed: %s", type(exc).__name__)
-
-
-async def _job_pull_focus_context() -> None:
-    try:
-        from app.services.focus_context import pull_focus_context
-
-        result = await pull_focus_context()
-        logger.info("[Scheduler] Option Pro focus context: %s", result.get("status"))
-    except Exception as exc:
-        logger.error("[Scheduler] Focus context pull failed: %s", type(exc).__name__)
-
-
-async def _job_resume_focus_revalidation() -> None:
-    try:
-        from app.services.focus_context import resume_focus_revalidation
-
-        result = await resume_focus_revalidation()
-        if result.get("pending"):
-            logger.info(
-                "[Scheduler] Focus revalidation pending: revision=%s phase=%s cursor=%s",
-                result.get("focus_revision"),
-                result.get("phase"),
-                result.get("mention_cursor") or result.get("group_cursor"),
+        calendar_status = get_calendar_status()
+        if calendar_status.get("last_error"):
+            logger.warning(
+                "Economic calendar refresh is %s: %s events",
+                "degraded" if events else "unavailable",
+                len(events),
             )
+        else:
+            logger.info("Economic calendar refreshed: %s events", len(events))
     except Exception as exc:
-        logger.error("[Scheduler] Focus revalidation resume failed: %s", type(exc).__name__)
+        logger.error("Economic calendar job failed: %s", type(exc).__name__)
 
 
-async def _job_market_focus_cycle() -> None:
-    if not app_settings.hot_cycle_schedule_enabled:
-        return
-    if app_settings.automatic_hot_cycle_capability != "enabled":
-        logger.warning("[Scheduler] Market-focus cycle gated: %s", app_settings.automatic_hot_cycle_capability)
-        return
+async def _job_retention() -> None:
     try:
-        from app.models.database import get_db
-        from app.services.market_focus import CycleConflict, create_market_focus_cycle
-        from app.services.market_schedule import due_cycle_trigger
+        from app.models.database import run_retention
 
-        trigger = due_cycle_trigger()
-        if trigger is None:
-            return
-        db = await get_db()
-        try:
-            await create_market_focus_cycle(db, trigger_type=trigger)
-        except CycleConflict as exc:
-            if exc.code not in {"no_new_hot_events", "prepared_revision_changed"}:
-                logger.warning("[Scheduler] Market-focus cycle gated: %s", exc.code)
-        finally:
-            await db.close()
+        await run_retention()
     except Exception as exc:
-        logger.error("[Scheduler] Market-focus cycle failed: %s", type(exc).__name__)
-
-
-async def _get_db_interval(key: str, fallback: int) -> int:
-    try:
-        from app.models.database import get_db, get_setting
-
-        db = await get_db()
-        try:
-            value = await get_setting(db, key)
-            if value is not None:
-                return max(30, int(value))
-        finally:
-            await db.close()
-    except Exception:
-        pass
-    return fallback
+        logger.error("ETL retention job failed: %s", type(exc).__name__)
 
 
 def _add_interval_job(
@@ -153,12 +62,11 @@ def _add_interval_job(
     seconds: int,
     job_id: str,
     name: str,
-    args: Optional[list] = None,
+    args: list | None = None,
 ) -> None:
-    jitter = min(60, max(5, seconds // 10))
     scheduler.add_job(
         function,
-        trigger=IntervalTrigger(seconds=seconds, jitter=jitter),
+        trigger=IntervalTrigger(seconds=seconds, jitter=min(60, max(5, seconds // 10))),
         args=args or [],
         id=job_id,
         name=name,
@@ -172,31 +80,22 @@ def _add_interval_job(
 async def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None and _scheduler.running:
-        logger.warning("Scheduler already running, skipping start")
+        logger.warning("Scheduler already running; duplicate start was ignored")
         return
 
-    from app.services.news_aggregator import (
-        SOURCE_DEFINITIONS,
-        initialize_source_health,
-        get_enabled_sources,
-        get_source_interval,
-    )
+    from app.services.news_aggregator import initialize_source_health
 
     _scheduler = AsyncIOScheduler()
     await initialize_source_health()
     source_intervals: dict[str, int] = {}
-    for source in get_enabled_sources():
-        definition = SOURCE_DEFINITIONS[source]
-        fallback_interval = get_source_interval(source)
-        interval = await _get_db_interval(
-            f"{definition.settings_prefix}_interval",
-            fallback_interval,
-        )
-        source_intervals[source] = interval
+    for source, source_config in settings.sources.items():
+        if not source_config.enabled:
+            continue
+        source_intervals[source] = source_config.interval_seconds
         _add_interval_job(
             _scheduler,
             _job_fetch_source,
-            seconds=interval,
+            seconds=source_config.interval_seconds,
             job_id=f"fetch_news_{source}",
             name=f"Fetch news: {source}",
             args=[source],
@@ -204,74 +103,28 @@ async def start_scheduler() -> None:
 
     _add_interval_job(
         _scheduler,
-        _job_analyze_news,
-        seconds=60,
-        job_id="analyze_news",
-        name="Analyze unanalyzed news",
-    )
-
-    _add_interval_job(
-        _scheduler,
-        _job_retry_event_projections,
-        seconds=60,
-        job_id="retry_event_projections",
-        name="Retry local event projections",
-    )
-
-    _add_interval_job(
-        _scheduler,
         _job_fetch_calendar,
-        seconds=app_settings.calendar_fetch_interval_seconds,
+        seconds=settings.calendar.interval_seconds,
         job_id="fetch_economic_calendar",
         name="Fetch economic calendar",
     )
-
     _add_interval_job(
         _scheduler,
-        _job_pull_focus_context,
-        seconds=app_settings.option_pro_focus_interval_seconds,
-        job_id="pull_option_pro_focus_context",
-        name="Pull Option Pro focus context",
+        _job_retention,
+        seconds=settings.storage.retention_interval_seconds,
+        job_id="etl_retention",
+        name="Apply ETL retention",
     )
-
-    _add_interval_job(
-        _scheduler,
-        _job_resume_focus_revalidation,
-        seconds=app_settings.focus_revalidation_resume_interval_seconds,
-        job_id="resume_focus_revalidation",
-        name="Resume bounded focus revalidation",
-    )
-
-    _add_interval_job(
-        _scheduler,
-        _job_market_focus_cycle,
-        seconds=60,
-        job_id="market_focus_cycle_schedule",
-        name="Market-focus cycle schedule",
-    )
-
-    if app_settings.x_sentiment_enabled:
-        x_sentiment_interval = await _get_db_interval(
-            "x_sentiment_interval",
-            getattr(app_settings, "x_sentiment_interval", 1800),
-        )
-        x_sentiment_interval = max(300, x_sentiment_interval)
-        _add_interval_job(
-            _scheduler,
-            _job_x_sentiment,
-            seconds=x_sentiment_interval,
-            job_id="x_sentiment",
-            name="News-grounded model market scenario",
-        )
-
     _scheduler.start()
-    logger.info("Scheduler started with independent news jobs: %s", source_intervals)
+    logger.info("ETL scheduler started: %s", source_intervals)
 
 
 def stop_scheduler() -> None:
+    global _scheduler
     if _scheduler is not None and _scheduler.running:
         _scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped")
+        logger.info("ETL scheduler stopped")
+    _scheduler = None
 
 
 def get_scheduler() -> Optional[AsyncIOScheduler]:

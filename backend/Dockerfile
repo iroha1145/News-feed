@@ -15,13 +15,9 @@ FROM base AS test
 
 COPY backend/requirements-dev.txt requirements-dev.txt
 RUN pip install --no-cache-dir -r requirements-dev.txt
-
 COPY backend/app ./app
 COPY backend/tests ./tests
-COPY contracts ./contracts
-RUN MACROLENS_OPTION_PRO_CONTRACT_PATH=/app/contracts/macrolens-option-pro-v2.json \
-    python -m app.integrations.option_pro.contract --check
-
+COPY config ./config
 CMD ["python", "-m", "pytest", "-q", "tests"]
 
 
@@ -31,10 +27,8 @@ RUN groupadd --gid 10001 macrolens \
     && useradd --uid 10001 --gid macrolens --create-home --shell /usr/sbin/nologin macrolens
 
 COPY --chown=macrolens:macrolens backend/app ./app
-COPY --chown=macrolens:macrolens contracts ./contracts
-RUN MACROLENS_OPTION_PRO_CONTRACT_PATH=/app/contracts/macrolens-option-pro-v2.json \
-    python -m app.integrations.option_pro.contract --check
-RUN mkdir -p data && chown -R macrolens:macrolens /app/data
+COPY --chown=macrolens:macrolens config ./config
+RUN mkdir -p /app/data && chown macrolens:macrolens /app/data
 
 USER macrolens
 EXPOSE 8000

@@ -1,91 +1,63 @@
-# MacroLens — 宏观新闻分析平台
+# MacroLens ETL
 
-MacroLens 聚合金融新闻、市场行情和经济日历，再用大语言模型（LLM）生成情绪判断与影响链。界面会区分原始数据、缓存数据和模型推演，避免把估算结果包装成实时事实。
+MacroLens 已收敛为个人使用的单进程数据服务。它定时抓取金融新闻与经济日历，完成清洗、去重、原始 Ticker 保存、来源健康记录和数据保留；不再包含网页前端、模型分析、市场焦点或远程动作接口。
 
-## 主要功能
+## 配置
 
-- 多来源新闻流：展示来源、发布时间、分析状态和原文链接。
-- 深度分析：结构化输出摘要、情绪、置信度、影响标的和逻辑链。
-- 市场面板：行情缺失时显示暂无数据，不用随机数填充。
-- 情绪面板：统一使用同一套恐惧—贪婪分数和中文标签。
-- 经济日历：短时缓存分析结果；上游失败时保留最近一次有效数据并注明状态。
-- 管理员会话：刷新新闻、触发分析和修改设置前必须登录。
-- 自适应布局：支持桌面和手机浏览。
+非敏感设置集中在 `config/personal.toml`，由 Python 标准库 `tomllib` 读取。日历始终启用，缓存最长保留 7 天，单次清理最多处理 500 条；这些个人版固定边界不再暴露成配置。密钥只从环境变量读取：
 
-## 数据边界
+- `MACROLENS_INTERNAL_TOKEN`：内部只读接口的持有者令牌，必须设置；
+- `FINNHUB_API_KEY`、`MASSIVE_API_KEY`、`NEWSAPI_API_KEY`、`GNEWS_API_KEY`：对应新闻源密钥；
+- `MACROLENS_DATABASE_PATH`：可选的数据库完整路径；
+- `MACROLENS_DATA_DIR`：可选的数据目录，数据库名固定为 `macrolens.db`。
 
-- 新闻标题、摘要和时间来自对应新闻源；平台只保存必要元数据，并提供原文入口。
-- “X 市场情绪”是模型根据新闻语境生成的市场情景，不是实时抓取的 X 帖文。
-- 行情来自雅虎财经（Yahoo Finance）的非官方客户端，可能延迟或暂时缺失；界面不再推断交易所是否开盘。
-- 缺少正文的新闻会进入低信息回退分析，不再补造正文或强行情判断。
-
-数据源启停、轮询频率、重复覆盖与授权注意事项见 [数据源审查](docs/data-sources.md)。
-
-## 安装
-
-推荐使用安装脚本。密钥输入不会回显，旧配置会先备份，管理员令牌会自动生成。
-
-```bash
-git clone https://github.com/iroha1145/News-feed.git
-cd News-feed
-./setup.sh
-```
-
-也可以手动启动：
+## 启动
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少配置一个模型提供方和 ADMIN_TOKEN
-docker compose up -d --build
+# 在 .env 中填写一个足够长的 MACROLENS_INTERNAL_TOKEN
+docker compose -f docker-compose.personal.yml up -d --build
+curl --fail http://127.0.0.1:8000/health
 ```
 
-浏览器打开 `http://localhost:3000`。管理员令牌保存在 `.env`，不会写入网页存储，也不应提交到代码仓库。
+`docker-compose.yml` 与个人版文件保持同样的单服务结构，旧的 `docker compose up -d` 命令仍可使用。容器只监听本机地址，数据库放在具名卷 `macrolens-data` 中。
 
-## 本地开发
+## 内部只读接口
 
-后端（Backend）：
+除公开的 `/health` 外，接口都需要请求头：
+
+```text
+Authorization: Bearer <MACROLENS_INTERNAL_TOKEN>
+```
+
+可读取：
+
+- `GET /internal/v1/health`
+- `GET /internal/v1/news/changes`
+- `GET /internal/v1/news/{id}`
+- `GET /internal/v1/calendar`
+
+新闻增量和日历列表支持 `after_sequence`、`updated_after`、`cursor`、`limit`、`as_of`。首轮可用旧的时间水位兼容读取；此后应保存完整响应里的 `next_after_sequence`，并在下一轮首屏传回。序号是跨轮读取的主检查点，可以接住“首轮读取时尚未提交、随后才变为可见”的数据。游标已经冻结首屏条件，翻页时只发送 `cursor` 与 `limit`。新闻增量每页最多 50 条，日历每页最多 500 条。
+
+`published_at` 是格式合规的源站发布时间；源站若给出无法解析的日期，该字段会留空。`fetched_at` 是抓取时间，`updated_at` 保留原始记录时间，`available_at` 是本地可见时间。兼容时间窗口以 `available_at` 为准，新的跨轮读取则以持续递增的序号为准，因此迟到新闻和提交边界上的新闻都不会漏掉。
+
+近似重复新闻仍归到同一条规范记录，但每次首次见到的来源、原始标题、原始网址和源站 Ticker 会写入 `news_source_observations`。新闻增量与单条详情返回去重后的 `sources` 和 `source_count`，让读取方识别多来源印证；列表读取会一次批量查询来源，不会逐条追加数据库查询。
+
+## 数据库升级边界
+
+升级已有数据库时，只会给原始新闻补充 `source_tickers`、`updated_at`，并新建 ETL 变化日志、来源观察、来源健康和日历快照表。旧分析表不会再初始化、迁移、写入或清理。新闻保留任务若发现旧表仍以外键引用某条新闻，会保留该新闻，避免级联删除历史分析。
+
+日历每个快照保存完整事件集合。相同陈旧缓存会复用已有快照；内容相同但抓取时间更晚的新鲜结果仍会形成新快照，因为新的 `source_fetched_at` 代表数据覆盖时间已经推进。
+
+`as_of` 的历史深度受 `change_retention_days` 与 `calendar_snapshot_retention_days` 限制。清理仍会为每条新闻保留最新状态或删除墓碑，足以重建当前副本，但不承诺永久保存每次中间变化。
+
+## 离线测试
 
 ```bash
 python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -r backend/requirements.txt -r backend/requirements-dev.txt
-PYTHONPATH=backend pytest -q backend/tests
-cd backend && uvicorn app.main:app --reload --port 8000
+PYTHONPATH=backend MACROLENS_INTERNAL_TOKEN=test-owner-token pytest -q backend/tests
 ```
 
-前端（Frontend）：
-
-```bash
-cd frontend
-npm ci
-npm run typecheck
-npm test
-npm run dev
-```
-
-## 生产部署
-
-容器以非特权用户运行，后端只绑定本机 `127.0.0.1:8000`，前端只绑定本机 `127.0.0.1:3000`。数据库目录可通过 `MACROLENS_DATA_DIR` 指向持久化位置。
-
-```bash
-docker compose up -d --build
-docker compose ps
-curl --fail http://127.0.0.1:8000/health
-```
-
-公开部署时，边界传输层安全协议（TLS）代理把普通网页请求转发到 `127.0.0.1:3000`，把 `/api/integrations/option-pro/v1/` 直接转发到 `127.0.0.1:8000`。前端容器明确拒绝代转该服务间接口，避免浏览器伪造来源或安全协议。`OPTION_PRO_TRUSTED_PROXY_CIDRS` 只填写边界代理地址，`OPTION_PRO_ALLOWED_CIDRS` 只填写 Option Pro 服务器地址，并把 `SESSION_COOKIE_SECURE` 设为 `true`。端口 3000 和 8000 均不得直接暴露到公网。
-
-焦点快照默认保留 90 天：最近 30 天保留全部快照，30—90 天按日压缩，并保护仍被分析、验证或市场焦点周期引用的版本。清理采用有界批次并在提交前执行外键检查。股票验证历史采用追加式版本，带 `as_of` 的查询只读取当时已经可见的状态。模型新闻分析和市场焦点周期默认关闭；只有同时配置每日任务与输出令牌（Token）预算后才可开启。
-
-## 技术构成
-
-| 层级 | 组件 |
-|---|---|
-| 前端（Frontend） | React、TypeScript、Vite、Tailwind CSS |
-| 后端（Backend） | FastAPI、SQLite、APScheduler |
-| 模型 | OpenAI、Anthropic、Grok、Ollama |
-| 部署 | Docker Compose、Nginx |
-
-## 许可证
-
-MIT
+测试会替换新闻源和日历网络客户端，不会访问真实新闻服务，也不会调用任何模型。
