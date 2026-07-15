@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from app.config import settings
 from app.integrations.option_pro.auth import (
@@ -51,6 +52,7 @@ from app.models.catalysts import (
     SCHEMA_VERSION,
 )
 from app.models.database import get_db
+from app.models.market_focus import MarketFocusCyclePublicAnalysis
 from app.services.analysis_jobs import (
     InputVersionConflict,
     create_or_get_job,
@@ -571,8 +573,34 @@ def _public_cycle(row: dict) -> dict:
     ):
         result.pop(key, None)
     value = result.pop("result_json", None)
-    result["result"] = json.loads(value) if value else None
-    result["no_new_hot_events"] = bool(result["no_new_hot_events"])
+    try:
+        public_result = (
+            MarketFocusCyclePublicAnalysis.model_validate_json(value)
+            if value
+            else None
+        )
+        status = str(result["status"])
+        no_new_hot_events = bool(result["no_new_hot_events"])
+        publishable_status = status in {"completed", "insufficient_context"}
+        if publishable_status != (public_result is not None):
+            raise ValueError("published_result_status_mismatch")
+        if public_result is not None:
+            if public_result.cycle_id != str(result["cycle_id"]):
+                raise ValueError("cycle_id_mismatch")
+            if public_result.no_new_material_catalyst != no_new_hot_events:
+                raise ValueError("empty_cycle_semantics_mismatch")
+        result["result"] = (
+            public_result.model_dump(mode="python")
+            if public_result is not None
+            else None
+        )
+    except (KeyError, TypeError, ValueError, ValidationError) as exc:
+        raise IntegrationAPIError(
+            500,
+            "persisted_market_focus_result_invalid",
+            "The persisted market-focus result is invalid.",
+        ) from exc
+    result["no_new_hot_events"] = no_new_hot_events
     return result
 
 

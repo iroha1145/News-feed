@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -96,3 +96,10 @@ class MarketFocusCyclePublicAnalysis(StrictModel):
     no_new_material_catalyst: bool
     insufficient_context: bool
     display_only: Literal[True] = True
+
+    @field_validator("as_of")
+    @classmethod
+    def require_utc_as_of(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("as_of must include a timezone")
+        return value.astimezone(timezone.utc)

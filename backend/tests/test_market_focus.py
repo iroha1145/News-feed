@@ -5,10 +5,15 @@ import hashlib
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import aiosqlite
 import pytest
 
-from app.config import Settings, settings
-from app.models import database
+from app.config import (
+    MarketFocusLegacyRecoveryAuthorization,
+    Settings,
+    settings,
+)
+from app.models import catalyst_database, database
 from app.services.analysis_jobs import (
     CreateJobResult,
     claim_next_job,
@@ -112,6 +117,7 @@ def test_cost_defaults_and_named_persistence_tables(isolated_market_db):
     assert configured.news_llm_manual_daily_job_limit is None
     assert configured.news_llm_manual_daily_output_token_limit is None
     assert configured.hot_cycle_manual_enabled is False
+    assert configured.market_focus_legacy_recovery_authorizations == []
     assert configured.x_sentiment_enabled is False
     assert configured.calendar_llm_manual_enabled is False
     assert configured.calendar_llm_daily_job_limit is None
@@ -138,6 +144,56 @@ def test_cost_defaults_and_named_persistence_tables(isolated_market_db):
             await db.close()
 
     run(scenario())
+
+
+def test_legacy_recovery_authorization_configuration_is_strict_and_unique(
+    monkeypatch,
+):
+    authorization = {
+        "cycle_id": "mfc_" + "a" * 32,
+        "input_hash": "b" * 64,
+        "created_at": "2026-07-15T08:00:00+00:00",
+        "prompt_cache_key_sha256": "c" * 64,
+        "provider_base_url": "https://api.openai.com/v1",
+        "http_status": 400,
+        "error_type": "string_above_max_length",
+        "error_param": "prompt_cache_key",
+        "authorized_at": "2026-07-15T09:00:00+00:00",
+        "evidence_reference": "incident-20260715-openai-400",
+    }
+    configured = Settings(
+        _env_file=None,
+        market_focus_legacy_recovery_authorizations=[authorization],
+    )
+    assert configured.market_focus_legacy_recovery_authorizations[0].cycle_id == (
+        authorization["cycle_id"]
+    )
+    monkeypatch.setenv(
+        "MARKET_FOCUS_LEGACY_RECOVERY_AUTHORIZATIONS",
+        json.dumps([authorization], separators=(",", ":")),
+    )
+    from_environment = Settings(_env_file=None)
+    assert from_environment.market_focus_legacy_recovery_authorizations[
+        0
+    ].input_hash == authorization["input_hash"]
+    with pytest.raises(ValueError, match="duplicate cycle_id"):
+        Settings(
+            _env_file=None,
+            market_focus_legacy_recovery_authorizations=[
+                authorization,
+                authorization,
+            ],
+        )
+    with pytest.raises(ValueError, match="provider_base_url"):
+        Settings(
+            _env_file=None,
+            market_focus_legacy_recovery_authorizations=[
+                {
+                    **authorization,
+                    "provider_base_url": "https://compatible.example/v1",
+                }
+            ],
+        )
 
 
 def test_manual_news_analysis_requires_switch_and_both_budgets(
@@ -3810,6 +3866,434 @@ class RejectedCycleProvider(BlockingCycleProvider):
         self.create_calls += 1
         self.prompt_cache_key = kwargs["prompt_cache_key"]
         raise ProviderRequestRejected(status_code=400)
+
+
+def _legacy_market_focus_cache_key(cycle: dict) -> str:
+    return ":".join(
+        (
+            "market_focus_cycle",
+            str(cycle["prompt_version"]),
+            str(cycle["output_schema_version"]),
+            str(cycle["model"]),
+            str(cycle["reasoning_effort"]),
+        )
+    )
+
+
+async def _stage_legacy_cache_key_rejection(db, cycle: dict) -> str:
+    legacy_key = _legacy_market_focus_cache_key(cycle)
+    assert len(legacy_key) == 75
+    started_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    failed_at = started_at + timedelta(seconds=1)
+    await db.execute(
+        """UPDATE market_focus_cycles SET
+             status='failed',prompt_cache_key=?,openai_response_id=NULL,result_json=NULL,
+             error_code='submission_outcome_unknown',attempt_count=1,
+             retrieve_error_count=0,cancel_attempt_count=0,next_attempt_at=NULL,
+             cancel_requested_at=NULL,lease_owner=NULL,lease_expires_at=NULL,
+             fencing_token=1,latency_ms=NULL,usage_input_tokens=0,
+             usage_cached_input_tokens=0,usage_cache_write_tokens=0,
+             usage_reasoning_tokens=0,usage_output_tokens=0,usage_total_tokens=0,
+             started_at=?,completed_at=?,updated_at=?
+           WHERE cycle_id=?""",
+        (
+            legacy_key,
+            started_at.isoformat(),
+            failed_at.isoformat(),
+            failed_at.isoformat(),
+            cycle["cycle_id"],
+        ),
+    )
+    await db.execute(
+        """UPDATE hotspot_preparation_state SET active_cycle_id=?
+           WHERE singleton_id=1""",
+        (cycle["cycle_id"],),
+    )
+    return legacy_key
+
+
+def _legacy_recovery_authorization(
+    cycle: dict,
+    legacy_key: str,
+    **overrides,
+) -> MarketFocusLegacyRecoveryAuthorization:
+    values = {
+        "cycle_id": cycle["cycle_id"],
+        "input_hash": cycle["input_hash"],
+        "created_at": cycle["created_at"],
+        "prompt_cache_key_sha256": hashlib.sha256(legacy_key.encode()).hexdigest(),
+        "provider_base_url": "https://api.openai.com/v1",
+        "http_status": 400,
+        "error_type": "string_above_max_length",
+        "error_param": "prompt_cache_key",
+        "authorized_at": datetime.now(timezone.utc).isoformat(),
+        "evidence_reference": "incident-20260715-openai-400",
+    }
+    values.update(overrides)
+    return MarketFocusLegacyRecoveryAuthorization.model_validate(values)
+
+
+async def _rewind_to_catalyst_v4(db) -> None:
+    await db.execute("DROP TABLE market_focus_cycle_recovery_audit")
+    await db.execute("PRAGMA user_version=4")
+    await db.commit()
+
+
+def test_v4_to_v5_recovers_only_proven_legacy_cache_key_rejection_and_is_idempotent(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(settings, "hot_cycle_daily_job_limit", 1)
+    monkeypatch.setattr(
+        settings,
+        "hot_cycle_daily_output_token_limit",
+        settings.hot_cycle_max_output_tokens,
+    )
+    monkeypatch.setattr(settings, "analysis_job_retry_cooldown_seconds", 0)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 314)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            legacy_key = await _stage_legacy_cache_key_rejection(db, cycle)
+            monkeypatch.setattr(
+                settings,
+                "market_focus_legacy_recovery_authorizations",
+                [_legacy_recovery_authorization(cycle, legacy_key)],
+            )
+            await _rewind_to_catalyst_v4(db)
+
+            # Startup uses a plain aiosqlite connection rather than the
+            # row-factory connection returned to request handlers.
+            db.row_factory = None
+            await catalyst_database.init_catalyst_schema(db)
+            db.row_factory = aiosqlite.Row
+            async with db.execute("PRAGMA user_version") as cursor:
+                assert int((await cursor.fetchone())[0]) == 5
+            recovered = await (await db.execute(
+                """SELECT status,error_code,prompt_cache_key,attempt_count,
+                          openai_response_id,usage_total_tokens
+                   FROM market_focus_cycles WHERE cycle_id=?""",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(recovered) == (
+                "failed",
+                "provider_request_rejected",
+                legacy_key,
+                1,
+                None,
+                0,
+            )
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id,consumed_cycle_id
+                   FROM hotspot_preparation_sets WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("PREPARED", None, None)
+            state = await get_hotspot_status(db)
+            assert state["active_cycle_id"] is None
+            assert state["prepared_hot_count"] == 1
+            assert state["last_consumed_revision"] == 0
+
+            audit = dict(await (await db.execute(
+                "SELECT * FROM market_focus_cycle_recovery_audit WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone())
+            assert audit["migration_version"] == 5
+            assert audit["reason_code"] == (
+                "legacy_prompt_cache_key_400_string_above_max_length"
+            )
+            evidence = json.loads(audit["evidence_json"])
+            assert evidence["http_status"] == 400
+            assert evidence["provider_error_type"] == "string_above_max_length"
+            assert evidence["provider_error_param"] == "prompt_cache_key"
+            assert evidence["provider_base_url"] == "https://api.openai.com/v1"
+            assert evidence["provider_max_length"] == 64
+            assert evidence["observed_prompt_cache_key_length"] == 75
+            assert evidence["response_task_id_present"] is False
+            assert evidence["authorization_sha256"] == hashlib.sha256(
+                json.dumps(
+                    evidence["authorization"], separators=(",", ":"), sort_keys=True
+                ).encode()
+            ).hexdigest()
+            original = audit["original_cycle_state_json"]
+            assert hashlib.sha256(original.encode()).hexdigest() == (
+                audit["original_cycle_state_sha256"]
+            )
+            assert json.loads(original)["error_code"] == "submission_outcome_unknown"
+            assert json.loads(audit["released_prepared_revisions_json"]) == [
+                cycle["prepared_revision"]
+            ]
+            assert audit["active_cycle_released"] == 1
+
+            await catalyst_database.init_catalyst_schema(db)
+            audit_count = await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone()
+            assert int(audit_count[0]) == 1
+
+            retry = await retry_market_focus_cycle(db, cycle["cycle_id"])
+            assert retry["retry_of_cycle_id"] == cycle["cycle_id"]
+            assert retry["status"] == "pending"
+            assert len(retry["prompt_cache_key"]) == 64
+            assert retry["prompt_cache_key"] != legacy_key
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_existing_v5_database_can_apply_a_later_explicit_recovery_authorization(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 317)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            legacy_key = await _stage_legacy_cache_key_rejection(db, cycle)
+
+            await catalyst_database.init_catalyst_schema(db)
+            before_authorization = await (await db.execute(
+                "SELECT error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert before_authorization[0] == "submission_outcome_unknown"
+            assert int((await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone())[0]) == 0
+
+            monkeypatch.setattr(
+                settings,
+                "market_focus_legacy_recovery_authorizations",
+                [_legacy_recovery_authorization(cycle, legacy_key)],
+            )
+            await catalyst_database.init_catalyst_schema(db)
+            recovered = await (await db.execute(
+                "SELECT error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert recovered[0] == "provider_request_rejected"
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                   WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("PREPARED", None)
+            await catalyst_database.init_catalyst_schema(db)
+            assert int((await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone())[0]) == 1
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_custom_endpoint_authorization_cannot_release_unknown_cycle(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 318)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            legacy_key = await _stage_legacy_cache_key_rejection(db, cycle)
+            authorization = _legacy_recovery_authorization(
+                cycle, legacy_key
+            ).model_dump(mode="json")
+            authorization["provider_base_url"] = "https://compatible.example/v1"
+            monkeypatch.setattr(
+                settings,
+                "market_focus_legacy_recovery_authorizations",
+                [authorization],
+            )
+
+            with pytest.raises(ValueError, match="provider_base_url"):
+                await catalyst_database.init_catalyst_schema(db)
+            cycle_row = await (await db.execute(
+                "SELECT error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert cycle_row[0] == "submission_outcome_unknown"
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                   WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("LEASED", cycle["cycle_id"])
+            assert int((await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone())[0]) == 0
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "no_authorization",
+        "authorization_cycle_id_mismatch",
+        "authorization_input_hash_mismatch",
+        "authorization_created_at_mismatch",
+        "authorization_cache_key_hash_mismatch",
+        "valid_cache_key_transport_timeout",
+        "unrecognized_75_character_key",
+        "expired_unlinked_submission",
+        "response_id_present",
+        "usage_present",
+        "inconsistent_preparation_lease",
+    ),
+)
+def test_v5_legacy_recovery_fails_closed_for_non_proven_unknown_outcomes(
+    isolated_market_db, monkeypatch, variant
+):
+    _enable_cycles(monkeypatch)
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 315)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            legacy_key = await _stage_legacy_cache_key_rejection(db, cycle)
+            authorization_overrides = {}
+            if variant == "authorization_cycle_id_mismatch":
+                authorization_overrides["cycle_id"] = "mfc_" + "0" * 32
+            elif variant == "authorization_input_hash_mismatch":
+                authorization_overrides["input_hash"] = "0" * 64
+            elif variant == "authorization_created_at_mismatch":
+                authorization_overrides["created_at"] = (
+                    datetime.now(timezone.utc) - timedelta(days=1)
+                ).isoformat()
+            elif variant == "authorization_cache_key_hash_mismatch":
+                authorization_overrides["prompt_cache_key_sha256"] = "0" * 64
+            if variant != "no_authorization":
+                monkeypatch.setattr(
+                    settings,
+                    "market_focus_legacy_recovery_authorizations",
+                    [
+                        _legacy_recovery_authorization(
+                            cycle,
+                            legacy_key,
+                            **authorization_overrides,
+                        )
+                    ],
+                )
+
+            if variant == "valid_cache_key_transport_timeout":
+                await db.execute(
+                    "UPDATE market_focus_cycles SET prompt_cache_key=? WHERE cycle_id=?",
+                    ("market_focus_cycle:" + "a" * 45, cycle["cycle_id"]),
+                )
+            elif variant == "unrecognized_75_character_key":
+                await db.execute(
+                    "UPDATE market_focus_cycles SET prompt_cache_key=? WHERE cycle_id=?",
+                    ("x" * 75, cycle["cycle_id"]),
+                )
+            elif variant == "expired_unlinked_submission":
+                await db.execute(
+                    """UPDATE market_focus_cycles SET attempt_count=2,fencing_token=2
+                       WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            elif variant == "response_id_present":
+                await db.execute(
+                    """UPDATE market_focus_cycles SET openai_response_id='resp-existing'
+                       WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            elif variant == "usage_present":
+                await db.execute(
+                    """UPDATE market_focus_cycles SET usage_output_tokens=1,
+                       usage_total_tokens=1 WHERE cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            elif variant == "inconsistent_preparation_lease":
+                await db.execute(
+                    """UPDATE hotspot_preparation_sets SET status='PREPARED',
+                       leased_cycle_id=NULL WHERE leased_cycle_id=?""",
+                    (cycle["cycle_id"],),
+                )
+            await _rewind_to_catalyst_v4(db)
+
+            await catalyst_database.init_catalyst_schema(db)
+            unchanged = await (await db.execute(
+                "SELECT status,error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert tuple(unchanged) == ("failed", "submission_outcome_unknown")
+            audit_count = await (await db.execute(
+                "SELECT COUNT(*) FROM market_focus_cycle_recovery_audit"
+            )).fetchone()
+            assert int(audit_count[0]) == 0
+            if variant != "inconsistent_preparation_lease":
+                preparation = await (await db.execute(
+                    """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                       WHERE prepared_revision=?""",
+                    (cycle["prepared_revision"],),
+                )).fetchone()
+                assert tuple(preparation) == ("LEASED", cycle["cycle_id"])
+            active = await (await db.execute(
+                """SELECT active_cycle_id FROM hotspot_preparation_state
+                   WHERE singleton_id=1"""
+            )).fetchone()
+            assert active[0] == cycle["cycle_id"]
+        finally:
+            await db.close()
+
+    run(scenario())
+
+
+def test_v5_legacy_recovery_aborts_without_partial_changes_when_bound_is_exceeded(
+    isolated_market_db, monkeypatch
+):
+    _enable_cycles(monkeypatch)
+    monkeypatch.setattr(
+        catalyst_database, "LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES", 0
+    )
+
+    async def scenario():
+        db = await database.get_db()
+        try:
+            await _seed_hotspot(db, 316)
+            cycle = await create_market_focus_cycle(db, trigger_type="manual")
+            legacy_key = await _stage_legacy_cache_key_rejection(db, cycle)
+            monkeypatch.setattr(
+                settings,
+                "market_focus_legacy_recovery_authorizations",
+                [_legacy_recovery_authorization(cycle, legacy_key)],
+            )
+            await _rewind_to_catalyst_v4(db)
+
+            with pytest.raises(
+                RuntimeError,
+                match="legacy_market_focus_recovery_authorization_limit_exceeded",
+            ):
+                await catalyst_database.init_catalyst_schema(db)
+            async with db.execute("PRAGMA user_version") as cursor:
+                assert int((await cursor.fetchone())[0]) == 4
+            unchanged = await (await db.execute(
+                "SELECT error_code FROM market_focus_cycles WHERE cycle_id=?",
+                (cycle["cycle_id"],),
+            )).fetchone()
+            assert unchanged[0] == "submission_outcome_unknown"
+            preparation = await (await db.execute(
+                """SELECT status,leased_cycle_id FROM hotspot_preparation_sets
+                   WHERE prepared_revision=?""",
+                (cycle["prepared_revision"],),
+            )).fetchone()
+            assert tuple(preparation) == ("LEASED", cycle["cycle_id"])
+        finally:
+            await db.close()
+
+    run(scenario())
 
 
 def test_definitive_provider_rejection_releases_snapshot_and_budget_for_retry(

@@ -190,12 +190,12 @@ async def _restore_real_v3_lineage_shape(db: aiosqlite.Connection) -> None:
     await db.execute("PRAGMA foreign_keys=ON")
 
 
-def test_schema_v4_contains_lineage_and_focus_validation_state(lineage_db):
+def test_current_schema_contains_lineage_focus_validation_and_recovery_audit(lineage_db):
     async def scenario():
         db = await database.get_db()
         try:
             async with db.execute("PRAGMA user_version") as cursor:
-                assert int((await cursor.fetchone())[0]) == CATALYST_SCHEMA_MIGRATION == 4
+                assert int((await cursor.fetchone())[0]) == CATALYST_SCHEMA_MIGRATION == 5
             async with db.execute("PRAGMA table_info(news_ticker_mentions)") as cursor:
                 mention_columns = {str(row[1]) for row in await cursor.fetchall()}
             assert {
@@ -208,6 +208,11 @@ def test_schema_v4_contains_lineage_and_focus_validation_state(lineage_db):
                 state = dict(await cursor.fetchone())
             assert state["singleton_id"] == 1
             assert state["rows_scanned"] == state["rows_changed"] == 0
+            async with db.execute(
+                """SELECT 1 FROM sqlite_master WHERE type='table'
+                   AND name='market_focus_cycle_recovery_audit'"""
+            ) as cursor:
+                assert await cursor.fetchone() is not None
             async with db.execute("PRAGMA foreign_key_check") as cursor:
                 assert await cursor.fetchall() == []
         finally:
@@ -862,7 +867,7 @@ def test_v3_to_v4_migration_deduplicates_and_backfills_conservatively(lineage_db
             await init_catalyst_schema(db)
 
             async with db.execute("PRAGMA user_version") as cursor:
-                assert int((await cursor.fetchone())[0]) == 4
+                assert int((await cursor.fetchone())[0]) == 5
             async with db.execute(
                 """SELECT id,association_confidence,validation_status,validated_at,last_checked_at,
                           focus_revision,universe_version

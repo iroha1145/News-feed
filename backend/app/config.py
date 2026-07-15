@@ -1,14 +1,48 @@
 import logging
 import os
 import ipaddress
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+
+class MarketFocusLegacyRecoveryAuthorization(BaseModel):
+    """Operator-supplied proof for one known pre-task provider rejection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    cycle_id: str = Field(pattern=r"^mfc_[0-9a-f]{32}$")
+    input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: str = Field(min_length=20, max_length=64)
+    prompt_cache_key_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_base_url: Literal["https://api.openai.com/v1"]
+    http_status: Literal[400]
+    error_type: Literal["string_above_max_length"]
+    error_param: Literal["prompt_cache_key"]
+    authorized_at: str = Field(min_length=20, max_length=64)
+    evidence_reference: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:/-]+$",
+    )
+
+    @field_validator("created_at", "authorized_at")
+    @classmethod
+    def validate_authorization_timestamp(cls, value: str) -> str:
+        value = value.strip()
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("must be an ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("must include a UTC offset")
+        return value
 
 
 def _find_env_file() -> str:
@@ -140,6 +174,11 @@ class Settings(BaseSettings):
     hot_cycle_daily_output_token_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000_000)
     hot_cycle_prompt_version: str = Field(default="market-focus-v1", min_length=1, max_length=100)
     hot_cycle_schema_version: str = Field(default="market-focus-schema-v1", min_length=1, max_length=100)
+    # Empty by default. Each entry is an operator attestation for one historical
+    # official OpenAI 400 response; it is never inferred from stored cycle shape.
+    market_focus_legacy_recovery_authorizations: list[
+        MarketFocusLegacyRecoveryAuthorization
+    ] = Field(default_factory=list, max_length=100)
     # Bootstrap calibration for display-only Catalyst context.  This does not
     # participate in the formal stock score.
     catalyst_context_support_target: float = Field(default=80.0, gt=0, le=1000)
@@ -287,6 +326,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_sensitive_endpoints_and_credentials(self):
+        recovery_cycle_ids = [
+            item.cycle_id
+            for item in self.market_focus_legacy_recovery_authorizations
+        ]
+        if len(recovery_cycle_ids) != len(set(recovery_cycle_ids)):
+            raise ValueError(
+                "MARKET_FOCUS_LEGACY_RECOVERY_AUTHORIZATIONS contains duplicate cycle_id values"
+            )
         if self.focus_snapshot_full_resolution_days > self.focus_snapshot_retention_days:
             raise ValueError(
                 "FOCUS_SNAPSHOT_FULL_RESOLUTION_DAYS must not exceed "
