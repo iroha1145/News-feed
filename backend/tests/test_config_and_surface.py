@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import ConfigurationError, load_settings
+from app.config import ConfigurationError, _resolve_project_root, load_settings
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +45,17 @@ def test_personal_toml_is_loaded_by_standard_library(tmp_path):
         hasattr(loaded, name)
         for name in ("model", "reasoning", "llm", "provider", "openai_api_key")
     )
+
+
+def test_project_root_supports_packaged_container_layout(tmp_path):
+    module_file = tmp_path / "runtime" / "app" / "config.py"
+    config_file = tmp_path / "runtime" / "config" / "personal.toml"
+    module_file.parent.mkdir(parents=True)
+    config_file.parent.mkdir(parents=True)
+    module_file.touch()
+    config_file.touch()
+
+    assert _resolve_project_root(module_file) == tmp_path / "runtime"
 
 
 def test_personal_toml_rejects_unknown_settings(tmp_path):

@@ -7,7 +7,18 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _resolve_project_root(module_file: Path) -> Path:
+    """Find the project root in source and packaged container layouts."""
+
+    resolved = module_file.resolve()
+    candidates = (resolved.parents[2], resolved.parents[1])
+    for candidate in candidates:
+        if (candidate / "config" / "personal.toml").is_file():
+            return candidate
+    return candidates[0]
+
+
+PROJECT_ROOT = _resolve_project_root(Path(__file__))
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "personal.toml"
 INTERNAL_TOKEN_ENV = "INTERNAL_API_TOKEN"
 DATA_DIR_ENV = "DATA_DIR"
