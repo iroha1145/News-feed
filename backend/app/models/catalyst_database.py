@@ -1350,93 +1350,170 @@ async def _migrate_ticker_lineage_v4(
     }
 
 
+def _validate_legacy_market_focus_recovery_authorizations(
+    values: list[Any],
+) -> list[dict[str, Any]]:
+    from app.config import MarketFocusLegacyRecoveryAuthorization
+
+    if len(values) > LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES:
+        raise RuntimeError("legacy_market_focus_recovery_authorization_limit_exceeded")
+    validated: list[dict[str, Any]] = []
+    seen_cycle_ids: set[str] = set()
+    for value in values:
+        authorization = MarketFocusLegacyRecoveryAuthorization.model_validate(value)
+        payload = authorization.model_dump(mode="json")
+        cycle_id = str(payload["cycle_id"])
+        if cycle_id in seen_cycle_ids:
+            raise RuntimeError("legacy_market_focus_recovery_duplicate_authorization")
+        seen_cycle_ids.add(cycle_id)
+        canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload["authorization_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+        validated.append(payload)
+    return sorted(validated, key=lambda item: str(item["cycle_id"]))
+
+
+def _legacy_market_focus_cycle_matches_authorization(
+    cycle: dict[str, Any],
+    authorization: dict[str, Any],
+) -> bool:
+    prompt_cache_key = str(cycle.get("prompt_cache_key") or "")
+    legacy_prompt_cache_key = ":".join(
+        (
+            "market_focus_cycle",
+            str(cycle.get("prompt_version") or ""),
+            str(cycle.get("output_schema_version") or ""),
+            str(cycle.get("model") or ""),
+            str(cycle.get("reasoning_effort") or ""),
+        )
+    )
+    try:
+        input_payload = json.loads(str(cycle.get("input_json") or ""))
+        consumes_through = int(cycle["consumes_through_revision"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    zero_fields = (
+        "retrieve_error_count",
+        "cancel_attempt_count",
+        "usage_input_tokens",
+        "usage_cached_input_tokens",
+        "usage_cache_write_tokens",
+        "usage_reasoning_tokens",
+        "usage_output_tokens",
+        "usage_total_tokens",
+    )
+    return bool(
+        str(cycle.get("cycle_id") or "") == authorization["cycle_id"]
+        and str(cycle.get("input_hash") or "") == authorization["input_hash"]
+        and str(cycle.get("created_at") or "") == authorization["created_at"]
+        and hashlib.sha256(prompt_cache_key.encode()).hexdigest()
+        == authorization["prompt_cache_key_sha256"]
+        and cycle.get("status") == "failed"
+        and cycle.get("error_code") == "submission_outcome_unknown"
+        and cycle.get("provider") == "openai"
+        and cycle.get("openai_response_id") is None
+        and cycle.get("result_json") is None
+        and int(cycle.get("attempt_count") or 0) == 1
+        and all(int(cycle.get(field) or 0) == 0 for field in zero_fields)
+        and cycle.get("next_attempt_at") is None
+        and cycle.get("cancel_requested_at") is None
+        and cycle.get("lease_owner") is None
+        and cycle.get("lease_expires_at") is None
+        and int(cycle.get("fencing_token") or 0) == 1
+        and cycle.get("latency_ms") is None
+        and cycle.get("retry_of_cycle_id") is None
+        and int(cycle.get("execution_number") or 0) == 1
+        and int(cycle.get("no_new_hot_events") or 0) == 0
+        and int(cycle.get("event_group_count") or 0) > 0
+        and int(cycle.get("prepared_revision") or 0) >= consumes_through
+        and cycle.get("started_at") is not None
+        and cycle.get("completed_at") is not None
+        and cycle.get("updated_at") == cycle.get("completed_at")
+        and len(str(cycle.get("input_hash") or "")) == 64
+        and isinstance(input_payload, dict)
+        and prompt_cache_key == legacy_prompt_cache_key
+        and len(prompt_cache_key) == LEGACY_MARKET_FOCUS_CACHE_KEY_LENGTH
+    )
+
+
 async def _recover_legacy_market_focus_rejections_v5(
     db: aiosqlite.Connection,
     *,
+    authorizations: list[Any],
     recovered_at: str | None = None,
 ) -> dict[str, int]:
     """Release only the incident-proven legacy 75-character cache-key failures.
 
     Older workers persisted every create exception as ``submission_outcome_unknown``.
-    The affected production requests are distinguishable without trusting a broad
-    exception class: their stored key is exactly the legacy request formula, is
-    exactly 75 characters, and therefore exceeds the provider's documented
-    64-character limit.  The remaining predicates reproduce the direct rejection
-    path and the preparation lease graph.  Any mismatch stays cost-unknown.
+    Stored request shape cannot prove which historical endpoint handled a request,
+    so no row is inferred automatically. Each candidate requires an operator
+    authorization containing the exact row fingerprints and attesting the official
+    OpenAI 400 response. Any mismatch stays cost-unknown.
     """
 
     recovered_at = recovered_at or _utc_now()
-    async with db.execute(
-        """SELECT c.* FROM market_focus_cycles c
-           WHERE c.status='failed'
-             AND c.error_code='submission_outcome_unknown'
-             AND c.provider='openai'
-             AND c.openai_response_id IS NULL
-             AND c.result_json IS NULL
-             AND c.attempt_count=1
-             AND c.retrieve_error_count=0
-             AND c.cancel_attempt_count=0
-             AND c.next_attempt_at IS NULL
-             AND c.cancel_requested_at IS NULL
-             AND c.lease_owner IS NULL
-             AND c.lease_expires_at IS NULL
-             AND c.fencing_token=1
-             AND c.latency_ms IS NULL
-             AND c.usage_input_tokens=0
-             AND c.usage_cached_input_tokens=0
-             AND c.usage_cache_write_tokens=0
-             AND c.usage_reasoning_tokens=0
-             AND c.usage_output_tokens=0
-             AND c.usage_total_tokens=0
-             AND c.retry_of_cycle_id IS NULL
-             AND c.execution_number=1
-             AND c.no_new_hot_events=0
-             AND c.event_group_count>0
-             AND c.consumes_through_revision IS NOT NULL
-             AND c.prepared_revision>=c.consumes_through_revision
-             AND c.started_at IS NOT NULL
-             AND c.completed_at IS NOT NULL
-             AND c.updated_at=c.completed_at
-             AND length(c.input_hash)=64
-             AND json_valid(c.input_json)=1
-             AND c.prompt_cache_key=(
-               'market_focus_cycle:' || c.prompt_version || ':' ||
-               c.output_schema_version || ':' || c.model || ':' ||
-               c.reasoning_effort
-             )
-             AND length(c.prompt_cache_key)=?
-             AND NOT EXISTS (
-               SELECT 1 FROM market_focus_cycles child
-               WHERE child.retry_of_cycle_id=c.cycle_id
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM market_focus_cycle_archives archive
-               WHERE archive.cycle_id=c.cycle_id
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM market_focus_cycle_recovery_audit audit
-               WHERE audit.cycle_id=c.cycle_id
-             )
-           ORDER BY c.created_at,c.cycle_id
-           LIMIT ?""",
-        (
-            LEGACY_MARKET_FOCUS_CACHE_KEY_LENGTH,
-            LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES + 1,
-        ),
-    ) as cursor:
-        columns = [str(column[0]) for column in cursor.description or ()]
-        candidates = [
-            dict(zip(columns, row, strict=True)) for row in await cursor.fetchall()
-        ]
-
-    if len(candidates) > LEGACY_MARKET_FOCUS_RECOVERY_MAX_CYCLES:
-        raise RuntimeError("legacy_market_focus_recovery_candidate_limit_exceeded")
+    validated_authorizations = _validate_legacy_market_focus_recovery_authorizations(
+        authorizations
+    )
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    authorization_mismatches = 0
+    already_recovered = 0
+    for authorization in validated_authorizations:
+        cycle_id = str(authorization["cycle_id"])
+        async with db.execute(
+            """SELECT evidence_json FROM market_focus_cycle_recovery_audit
+               WHERE cycle_id=?""",
+            (cycle_id,),
+        ) as cursor:
+            audit_row = await cursor.fetchone()
+        if audit_row is not None:
+            try:
+                prior_evidence = json.loads(str(audit_row[0]))
+            except (TypeError, json.JSONDecodeError):
+                prior_evidence = {}
+            if prior_evidence.get("authorization_sha256") == authorization[
+                "authorization_sha256"
+            ]:
+                already_recovered += 1
+            else:
+                authorization_mismatches += 1
+                logger.warning(
+                    "Legacy market focus recovery authorization conflicts with "
+                    "existing audit (cycle_id=%s)",
+                    cycle_id,
+                )
+            continue
+        async with db.execute(
+            "SELECT * FROM market_focus_cycles WHERE cycle_id=?",
+            (cycle_id,),
+        ) as cursor:
+            columns = [str(column[0]) for column in cursor.description or ()]
+            cycle_row = await cursor.fetchone()
+        if cycle_row is None:
+            authorization_mismatches += 1
+            continue
+        cycle = dict(zip(columns, cycle_row, strict=True))
+        if not _legacy_market_focus_cycle_matches_authorization(cycle, authorization):
+            authorization_mismatches += 1
+            continue
+        async with db.execute(
+            """SELECT
+                 EXISTS(SELECT 1 FROM market_focus_cycles child
+                        WHERE child.retry_of_cycle_id=?),
+                 EXISTS(SELECT 1 FROM market_focus_cycle_archives archive
+                        WHERE archive.cycle_id=?)""",
+            (cycle_id, cycle_id),
+        ) as cursor:
+            related = await cursor.fetchone()
+        if related is None or int(related[0]) or int(related[1]):
+            authorization_mismatches += 1
+            continue
+        candidates.append((cycle, authorization))
 
     recovered_cycles = 0
     released_preparations = 0
     released_active_cycles = 0
     skipped_inconsistent_leases = 0
-    for cycle in candidates:
+    for cycle, authorization in candidates:
         cycle_id = str(cycle["cycle_id"])
         async with db.execute(
             """SELECT e.prepared_revision,e.event_group_id,e.event_group_version,
@@ -1541,11 +1618,18 @@ async def _recover_legacy_market_focus_rejections_v5(
         )
         evidence = {
             "evidence_version": "legacy-market-focus-cache-key-rejection-v1",
-            "evidence_source": "deterministic_legacy_request_shape_and_confirmed_provider_incident",
+            "evidence_source": "operator_supplied_per_cycle_authorization",
+            "authorization_sha256": authorization["authorization_sha256"],
+            "authorization": {
+                key: value
+                for key, value in authorization.items()
+                if key != "authorization_sha256"
+            },
             "provider": "openai",
-            "http_status": 400,
-            "provider_error_type": "string_above_max_length",
-            "provider_error_param": "prompt_cache_key",
+            "provider_base_url": authorization["provider_base_url"],
+            "http_status": authorization["http_status"],
+            "provider_error_type": authorization["error_type"],
+            "provider_error_param": authorization["error_param"],
             "provider_max_length": LEGACY_MARKET_FOCUS_PROVIDER_CACHE_KEY_LIMIT,
             "observed_prompt_cache_key_length": len(str(cycle["prompt_cache_key"])),
             "legacy_key_formula": (
@@ -1626,7 +1710,10 @@ async def _recover_legacy_market_focus_rejections_v5(
         released_active_cycles += int(active_cycle_released)
 
     return {
-        "candidates_scanned": len(candidates),
+        "authorizations_received": len(validated_authorizations),
+        "authorized_candidates_matched": len(candidates),
+        "authorization_mismatches": authorization_mismatches,
+        "already_recovered": already_recovered,
         "cycles_recovered": recovered_cycles,
         "preparations_released": released_preparations,
         "active_cycles_released": released_active_cycles,
@@ -1636,6 +1723,11 @@ async def _recover_legacy_market_focus_rejections_v5(
 
 async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
     """Apply additive, idempotent integration migrations without rebuilding legacy tables."""
+    from app.config import settings as app_settings
+
+    recovery_authorizations = list(
+        app_settings.market_focus_legacy_recovery_authorizations
+    )
     async with db.execute("PRAGMA user_version") as cursor:
         row = await cursor.fetchone()
     current_migration = int(row[0] if row else 0)
@@ -1894,18 +1986,35 @@ async def _init_catalyst_schema(db: aiosqlite.Connection) -> None:
             migration_stats["validation_revisions_backfilled"],
             migration_stats["invalid_impacts_removed"],
         )
-    if needs_v5_migration:
-        recovery_stats = await _recover_legacy_market_focus_rejections_v5(db)
+    if recovery_authorizations:
+        recovery_lock_held = migration_lock_held
+        if not recovery_lock_held:
+            # A v5 database may receive a later operator authorization. Serialize
+            # that repair across simultaneous web/worker startup processes.
+            await db.commit()
+            await db.execute("BEGIN IMMEDIATE")
+            recovery_lock_held = True
+        recovery_stats = await _recover_legacy_market_focus_rejections_v5(
+            db,
+            authorizations=recovery_authorizations,
+        )
         logger.info(
             "market_focus_legacy_recovery_v5_completed "
-            "candidates_scanned=%s cycles_recovered=%s preparations_released=%s "
-            "active_cycles_released=%s inconsistent_lease_graphs_skipped=%s",
-            recovery_stats["candidates_scanned"],
+            "authorizations_received=%s authorized_candidates_matched=%s "
+            "authorization_mismatches=%s already_recovered=%s cycles_recovered=%s "
+            "preparations_released=%s active_cycles_released=%s "
+            "inconsistent_lease_graphs_skipped=%s",
+            recovery_stats["authorizations_received"],
+            recovery_stats["authorized_candidates_matched"],
+            recovery_stats["authorization_mismatches"],
+            recovery_stats["already_recovered"],
             recovery_stats["cycles_recovered"],
             recovery_stats["preparations_released"],
             recovery_stats["active_cycles_released"],
             recovery_stats["inconsistent_lease_graphs_skipped"],
         )
+        if not migration_lock_held:
+            await db.commit()
 
     for statement in INDEXES:
         await db.execute(statement)

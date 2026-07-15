@@ -103,6 +103,16 @@ def test_setup_is_idempotent_preserves_special_values_and_future_keys(tmp_path: 
         "NEWS_LLM_DAILY_OUTPUT_TOKEN_LIMIT": "88000",
         "HOT_CYCLE_MAX_EVENTS": "3",
         "HOT_CYCLE_MAX_FOCUS_SYMBOLS": "5",
+        "MARKET_FOCUS_LEGACY_RECOVERY_AUTHORIZATIONS": (
+            '[{"cycle_id":"mfc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"input_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+            '"created_at":"2026-07-15T08:00:00+00:00",'
+            '"prompt_cache_key_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+            '"provider_base_url":"https://api.openai.com/v1","http_status":400,'
+            '"error_type":"string_above_max_length","error_param":"prompt_cache_key",'
+            '"authorized_at":"2026-07-15T09:00:00+00:00",'
+            '"evidence_reference":"incident-20260715-openai-400"}]'
+        ),
         "CALENDAR_LLM_MAX_QUEUED": "4",
         "CALENDAR_LLM_DAILY_JOB_LIMIT": "3",
         "CALENDAR_LLM_DAILY_OUTPUT_TOKEN_LIMIT": "44000",

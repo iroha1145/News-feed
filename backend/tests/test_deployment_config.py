@@ -58,6 +58,10 @@ def test_backend_and_worker_share_model_database_and_retention_environment():
         "ANALYSIS_WORKER_QUICK_CHECK_INTERVAL_SECONDS",
     ):
         assert f"  {key}: ${{{key}:-" in compose
+    assert (
+        '  MARKET_FOCUS_LEGACY_RECOVERY_AUTHORIZATIONS: '
+        '"${MARKET_FOCUS_LEGACY_RECOVERY_AUTHORIZATIONS:-[]}"'
+    ) in compose
 
 
 def test_data_init_can_traverse_legacy_and_migrated_data_directories():

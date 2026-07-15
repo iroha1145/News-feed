@@ -14,9 +14,30 @@
 
 v4 将股票关联身份与验证状态拆开：`news_ticker_mentions` 只保留自然键身份和当前状态缓存，`ticker_validation_revisions` 追加保存每次实际状态变化，`focus_validation_state` 保存有界重验证游标与统计。模型关联绑定产生它的 `analysis_revision_id`，新分析版本不会删除旧关联；`analysis_stock_impacts` 同时关联分析版本和 Mention。
 
-v5 只恢复一种已经证实不会产生远端任务的旧热点周期：状态为 `submission_outcome_unknown`，且密钥严格等于旧版完整生成公式、长度正好为 75 字符，超过远端 64 字符上限并对应已确认的 `400 string_above_max_length`。恢复还要求没有响应编号、只有一次提交、没有 Token 用量、没有重试或归档，并且周期事件与 `LEASED` 准备集合逐条完全对应。任一条件不符都维持结果未知，不释放租赁或预算。
+v5 迁移只创建审计表，不会根据旧密钥形状自动恢复周期。旧部署可能连接兼容端点，仅凭 `provider=openai` 和 75 字符密钥无法证明官方服务拒绝了请求。
 
-符合条件的周期改记为 `provider_request_rejected`，准备集合恢复为 `PREPARED`，对应活动周期指针才会清空。原状态摘要、校验和、事故证据、释放的准备版本和实际动作写入 `market_focus_cycle_recovery_audit`。单次最多检查 100 个候选；超过上限会回滚整个升级，不做部分修复。重复启动不会再次处理同一周期。
+`MARKET_FOCUS_LEGACY_RECOVERY_AUTHORIZATIONS` 默认必须为 `[]`。只有运维人员逐周期核对原始日志后，才能加入授权记录。每项必须同时提供 `cycle_id`、`input_hash`、数据库中原样复制的 `created_at`、`prompt_cache_key` 的 SHA-256、官方端点、HTTP 400、`string_above_max_length`、参数名、授权时间和证据编号：
+
+```json
+[
+  {
+    "cycle_id": "mfc_<32位小写十六进制>",
+    "input_hash": "<64位小写十六进制>",
+    "created_at": "<数据库原始时间>",
+    "prompt_cache_key_sha256": "<64位小写十六进制>",
+    "provider_base_url": "https://api.openai.com/v1",
+    "http_status": 400,
+    "error_type": "string_above_max_length",
+    "error_param": "prompt_cache_key",
+    "authorized_at": "<含时区的 ISO-8601 时间>",
+    "evidence_reference": "<事故或日志证据编号>"
+  }
+]
+```
+
+恢复程序不根据当前 `OPENAI_BASE_URL` 猜测历史端点。自定义端点授权、空清单或任一指纹不符时，周期继续保持 `submission_outcome_unknown`，租赁和预算均不释放。即使数据库已经是 v5，后续启动也会在清单非空时取得独占写锁并执行同一套核对。
+
+通过核对的周期才会改记为 `provider_request_rejected`，准备集合恢复为 `PREPARED`，对应活动周期指针才会清空。授权原文及其校验和、原状态摘要、事故证据、释放版本和实际动作写入 `market_focus_cycle_recovery_audit`。单次最多接受 100 项授权；重复启动只识别同一授权的既有审计记录，不会再次处理。核对审计记录后应把环境清单恢复为 `[]`。
 
 升级时按自然键合并旧 Mention：保留最早创建时间、最高置信度和最新检查状态。初始验证版本优先使用旧 `validated_at`；缺失时使用迁移时刻，绝不回填到新闻发布时间。此类记录标记为 `legacy_backfill`。迁移前没有保存下来的验证变化无法恢复，因此旧历史只能从保守基线开始；无法唯一对应分析版本的旧模型关联会保留为 `legacy association`，不会猜测归属。
 
