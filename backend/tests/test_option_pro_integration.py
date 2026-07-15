@@ -3225,8 +3225,20 @@ def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
     assert public["result"]["as_of"].tzinfo is not None
     assert public["result"]["as_of"].utcoffset() == timedelta(0)
 
+    offset = {**persisted, "as_of": "2026-07-15T18:20:47.333424+09:00"}
+    normalized = integration_router._public_cycle(
+        {
+            "cycle_id": cycle_id,
+            "result_json": json.dumps(offset, separators=(",", ":")),
+            "no_new_hot_events": 1,
+        }
+    )
+    assert normalized["result"]["as_of"] == datetime(
+        2026, 7, 15, 9, 20, 47, 333424, tzinfo=timezone.utc
+    )
+
     invalid = {**persisted, "unexpected_internal_field": "must remain rejected"}
-    with pytest.raises(ValidationError, match="extra_forbidden"):
+    with pytest.raises(IntegrationAPIError) as captured:
         integration_router._public_cycle(
             {
                 "cycle_id": cycle_id,
@@ -3234,6 +3246,20 @@ def test_public_cycle_replays_historical_result_json_without_relaxing_schema():
                 "no_new_hot_events": 1,
             }
         )
+    assert captured.value.status_code == 500
+    assert captured.value.code == "persisted_market_focus_result_invalid"
+    assert "unexpected_internal_field" not in captured.value.message
+
+    naive = {**persisted, "as_of": "2026-07-15T09:20:47.333424"}
+    with pytest.raises(IntegrationAPIError) as naive_error:
+        integration_router._public_cycle(
+            {
+                "cycle_id": cycle_id,
+                "result_json": json.dumps(naive, separators=(",", ":")),
+                "no_new_hot_events": 1,
+            }
+        )
+    assert naive_error.value.code == "persisted_market_focus_result_invalid"
 
 
 def test_completed_market_focus_cycle_latest_and_point_reads_persisted_result(
@@ -3287,6 +3313,51 @@ def test_completed_market_focus_cycle_latest_and_point_reads_persisted_result(
             ) == expected_as_of
             assert cycle["result"]["display_only"] is True
             assert "openai_response_id" not in response.text
+
+
+def test_invalid_persisted_market_focus_result_returns_safe_integration_error(
+    isolated_integration_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "option_pro_read_key_id", "read-key")
+    monkeypatch.setattr(settings, "option_pro_read_secret", "read-secret")
+    monkeypatch.setattr(settings, "option_pro_allowed_cidrs", "127.0.0.1/32")
+    monkeypatch.setattr(settings, "option_pro_allow_local_http", True)
+    cycle_id = "mfc_0123456789abcdef0123456789abcdef"
+
+    async def seed():
+        db = await database.get_db()
+        try:
+            await seed_completed_market_focus_cycle(db, cycle_id=cycle_id)
+            await db.execute(
+                "UPDATE market_focus_cycles SET result_json=? WHERE cycle_id=?",
+                ('{"private":"must-not-leak"}', cycle_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    run(seed())
+    app = _integration_app()
+    prefix = "/api/integrations/option-pro/v1"
+    targets = (
+        f"{prefix}/market-focus-cycles/latest",
+        f"{prefix}/market-focus-cycles/{cycle_id}",
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        for index, target in enumerate(targets, start=1):
+            headers = _signed_headers(
+                "GET",
+                target,
+                b"",
+                "read-key",
+                "read-secret",
+                f"nonce-invalid-cycle-read-{index}",
+            )
+            response = client.get(target, headers=headers)
+
+            assert response.status_code == 500
+            assert response.json()["code"] == "persisted_market_focus_result_invalid"
+            assert "must-not-leak" not in response.text
 
 
 def test_signed_integration_endpoints_match_committed_contract(isolated_integration_db, monkeypatch):

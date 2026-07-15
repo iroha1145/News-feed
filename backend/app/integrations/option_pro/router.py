@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from app.config import settings
 from app.integrations.option_pro.auth import (
@@ -572,13 +573,20 @@ def _public_cycle(row: dict) -> dict:
     ):
         result.pop(key, None)
     value = result.pop("result_json", None)
-    result["result"] = (
-        MarketFocusCyclePublicAnalysis.model_validate_json(value).model_dump(
-            mode="python"
+    try:
+        result["result"] = (
+            MarketFocusCyclePublicAnalysis.model_validate_json(value).model_dump(
+                mode="python"
+            )
+            if value
+            else None
         )
-        if value
-        else None
-    )
+    except ValidationError as exc:
+        raise IntegrationAPIError(
+            500,
+            "persisted_market_focus_result_invalid",
+            "The persisted market-focus result is invalid.",
+        ) from exc
     result["no_new_hot_events"] = bool(result["no_new_hot_events"])
     return result
 
