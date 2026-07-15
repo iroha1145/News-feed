@@ -834,12 +834,17 @@ async def run_calendar_worker_once(
         await db.commit()
         return True
     except Exception:
-        await db.execute(
-            "UPDATE analysis_worker_state SET heartbeat_at=?,status='failed',"
-            "error_code='calendar_worker_iteration_failed' WHERE worker_id=?",
-            (utc_text(), worker_id),
-        )
-        await db.commit()
+        await db.rollback()
+        try:
+            await db.execute(
+                "UPDATE analysis_worker_state SET heartbeat_at=?,status='failed',"
+                "error_code='calendar_worker_iteration_failed' WHERE worker_id=?",
+                (utc_text(), worker_id),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.warning("Calendar worker failure-state update was deferred")
         raise
     finally:
         await db.close()

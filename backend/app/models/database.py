@@ -121,25 +121,34 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_x_sentiments_analyzed_at ON x_sentiments(analyzed_at DESC)",
 ]
 
-SQLITE_BUSY_TIMEOUT_MS = 5_000
+# Production runs the scheduler and the analysis worker in separate processes.
+# Some bounded batch writes legitimately take longer than SQLite's short default
+# wait, so readers and heartbeat writes need enough time to let them commit.
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 DEFAULT_ANALYSIS_LEASE_SECONDS = 10 * 60
 MAX_ANALYSIS_ATTEMPTS = 3
 
 
 async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(DB_PATH)
+    db = await aiosqlite.connect(
+        DB_PATH,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1_000,
+    )
     db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA foreign_keys=ON")
     await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    await db.execute("PRAGMA foreign_keys=ON")
     return db
 
 
 async def init_db() -> None:
     logger.info("Initializing database tables...")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(
+        DB_PATH,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1_000,
+    ) as db:
+        await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA foreign_keys=ON")
-        await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         await db.execute(CREATE_NEWS_ITEMS)
         await db.execute(CREATE_ANALYSES)
         await db.execute(CREATE_X_SENTIMENTS)
