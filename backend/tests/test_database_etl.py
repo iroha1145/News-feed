@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -244,6 +246,167 @@ async def test_dedup_merges_only_source_native_tickers(clean_db):
     assert all(str(row["original_title"]) == "Chip demand rises" for row in observations)
     assert all(str(row["original_url"]).startswith("https://example.com/") for row in observations)
     assert all(str(row["observed_at"]).endswith("Z") for row in observations)
+
+
+@pytest.mark.asyncio
+async def test_exact_dedup_queries_the_full_5000_row_history(clean_db):
+    db = await database.get_db()
+    try:
+        target_ids: list[int] = []
+        for index in range(3):
+            target_title = (
+                "Historic semiconductor market demand outlook remains strong across major "
+                "global regions today"
+                if index == 0
+                else f"Historic exact target {index}"
+            )
+            target = _item(
+                target_title,
+                source=f"archive-{index}",
+                fetched_at="2020-01-01T00:01:00Z",
+            )
+            target["published_at"] = "2020-01-01T00:00:00Z"
+            news_id = await database.insert_news_item(db, target)
+            assert news_id is not None
+            target_ids.append(news_id)
+
+        filler_rows = []
+        for index in range(4_997):
+            title = f"Recent filler headline {index}"
+            filler_rows.append(
+                (
+                    "recent-archive",
+                    title,
+                    None,
+                    f"https://example.com/recent/{index}",
+                    None,
+                    "2026-07-15T12:00:00Z",
+                    "2026-07-15T12:01:00Z",
+                    hashlib.sha256(f"recent-{index}".encode()).hexdigest(),
+                    "[]",
+                    "2026-07-15T12:01:00Z",
+                )
+            )
+        await db.executemany(
+            """INSERT INTO news_items
+               (source,title,summary,url,image_url,published_at,fetched_at,content_hash,
+                source_tickers,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            filler_rows,
+        )
+        await db.commit()
+
+        placeholders = ",".join("?" for _ in target_ids)
+        async with db.execute(
+            f"SELECT id,title,url,content_hash FROM news_items WHERE id IN ({placeholders}) ORDER BY id",
+            target_ids,
+        ) as cursor:
+            targets = await cursor.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM news_changes") as cursor:
+            changes_before = int((await cursor.fetchone())[0])
+
+        content_duplicate = _item(
+            "Independent content-hash observation",
+            source="new-content-source",
+            fetched_at="2026-07-16T00:00:00Z",
+        )
+        content_duplicate["content_hash"] = str(targets[0]["content_hash"])
+        content_duplicate["legacy_content_hash"] = "incoming-legacy-content"
+
+        legacy_duplicate = _item(
+            "Independent legacy-hash observation",
+            source="new-legacy-source",
+            fetched_at="2026-07-16T00:00:00Z",
+        )
+        legacy_duplicate["content_hash"] = hashlib.sha256(b"new-current").hexdigest()
+        legacy_duplicate["legacy_content_hash"] = str(targets[1]["content_hash"])
+
+        url_duplicate = _item(
+            "Independent URL observation",
+            source="new-url-source",
+            fetched_at="2026-07-16T00:00:00Z",
+        )
+        url_duplicate["content_hash"] = hashlib.sha256(b"new-url-current").hexdigest()
+        url_duplicate["legacy_content_hash"] = hashlib.sha256(b"new-url-legacy").hexdigest()
+        url_duplicate["url"] = str(targets[2]["url"])
+
+        fuzzy_old = _item(
+            "Historic semiconductor market demand outlook remains strong across major "
+            "global regions today update",
+            source="fuzzy-old-source",
+            fetched_at="2020-01-01T00:02:00Z",
+        )
+        fuzzy_old["published_at"] = "2020-01-01T00:00:00Z"
+        assert database.similar_titles(
+            database.normalize_title(str(targets[0]["title"])),
+            database.normalize_title(fuzzy_old["title"]),
+        )
+
+        result = await database.insert_news_items_batch(
+            db,
+            [content_duplicate, legacy_duplicate, url_duplicate, fuzzy_old],
+        )
+
+        async with db.execute("SELECT COUNT(*) FROM news_items") as cursor:
+            canonical_count = int((await cursor.fetchone())[0])
+        async with db.execute("SELECT COUNT(*) FROM news_changes") as cursor:
+            changes_after = int((await cursor.fetchone())[0])
+        async with db.execute(
+            f"""SELECT canonical_news_id,COUNT(DISTINCT source) AS source_count
+                FROM news_source_observations
+                WHERE canonical_news_id IN ({placeholders})
+                GROUP BY canonical_news_id ORDER BY canonical_news_id""",
+            target_ids,
+        ) as cursor:
+            source_counts = [int(row["source_count"]) for row in await cursor.fetchall()]
+    finally:
+        await db.close()
+
+    assert result == {"inserted": 1, "duplicates": 3}
+    assert canonical_count == 5_001
+    assert source_counts == [2, 2, 2]
+    assert changes_after == changes_before + 4
+
+
+def test_exact_key_queries_are_chunked_below_sqlite_parameter_limits():
+    chunks = database._chunked_exact_keys({f"key-{index}" for index in range(1_001)})
+    assert sum(len(chunk) for chunk in chunks) == 1_001
+    assert all(1 <= len(chunk) <= 250 for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_batches_remain_idempotent_for_normalized_url(clean_db):
+    first = _item("First unrelated headline", source="source-one")
+    second = _item("Second completely different report", source="source-two")
+    shared_url = "https://example.com/shared/story?utm_source=test"
+    first["url"] = shared_url
+    second["url"] = shared_url
+
+    first_db = await database.get_db()
+    second_db = await database.get_db()
+    try:
+        results = await asyncio.gather(
+            database.insert_news_items_batch(first_db, [first]),
+            database.insert_news_items_batch(second_db, [second]),
+        )
+        async with first_db.execute("SELECT COUNT(*) FROM news_items") as cursor:
+            canonical_count = int((await cursor.fetchone())[0])
+        async with first_db.execute(
+            "SELECT COUNT(DISTINCT source) FROM news_source_observations"
+        ) as cursor:
+            source_count = int((await cursor.fetchone())[0])
+        async with first_db.execute("SELECT COUNT(*) FROM news_changes") as cursor:
+            change_count = int((await cursor.fetchone())[0])
+    finally:
+        await first_db.close()
+        await second_db.close()
+
+    assert sorted(results, key=lambda item: item["inserted"]) == [
+        {"inserted": 0, "duplicates": 1},
+        {"inserted": 1, "duplicates": 0},
+    ]
+    assert canonical_count == 1
+    assert source_count == 2
+    assert change_count == 2
 
 
 @pytest.mark.asyncio

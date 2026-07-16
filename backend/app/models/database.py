@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = settings.database_path
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 RETENTION_BATCH_SIZE = 500
+EXACT_KEY_QUERY_CHUNK_SIZE = 250
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -145,6 +146,7 @@ RAW_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_news_published_at ON news_items(published_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_news_effective_time ON news_items(COALESCE(published_at,fetched_at) DESC)",
     "CREATE INDEX IF NOT EXISTS idx_news_source_time ON news_items(source,COALESCE(published_at,fetched_at) DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_news_url ON news_items(url)",
     "CREATE INDEX IF NOT EXISTS idx_news_changes_window ON news_changes(available_at_us,change_sequence)",
     "CREATE INDEX IF NOT EXISTS idx_news_changes_item ON news_changes(news_id,available_at DESC,change_sequence DESC)",
     "CREATE INDEX IF NOT EXISTS idx_news_observations_item ON news_source_observations(canonical_news_id,observed_at_us,observation_id)",
@@ -621,6 +623,52 @@ async def _record_duplicate_news(
         )
 
 
+def _chunked_exact_keys(values: set[str]) -> list[tuple[str, ...]]:
+    ordered = sorted(value for value in values if value)
+    return [
+        tuple(ordered[offset : offset + EXACT_KEY_QUERY_CHUNK_SIZE])
+        for offset in range(0, len(ordered), EXACT_KEY_QUERY_CHUNK_SIZE)
+    ]
+
+
+async def _load_exact_news_ids(
+    db: aiosqlite.Connection,
+    items: list[dict[str, Any]],
+) -> tuple[dict[str, int], dict[str, int]]:
+    hashes = {
+        str(value)
+        for item in items
+        for value in (item.get("content_hash"), item.get("legacy_content_hash"))
+        if value
+    }
+    urls = {normalize_url(str(item.get("url") or "")) for item in items}
+    urls.discard("")
+    hashes_to_ids: dict[str, int] = {}
+    urls_to_ids: dict[str, int] = {}
+
+    for chunk in _chunked_exact_keys(hashes):
+        placeholders = ",".join("?" for _ in chunk)
+        async with db.execute(
+            f"""SELECT id,content_hash FROM news_items
+                WHERE content_hash IN ({placeholders}) ORDER BY id""",
+            chunk,
+        ) as cursor:
+            for row in await cursor.fetchall():
+                hashes_to_ids.setdefault(str(row["content_hash"]), int(row["id"]))
+
+    for chunk in _chunked_exact_keys(urls):
+        placeholders = ",".join("?" for _ in chunk)
+        async with db.execute(
+            f"SELECT id,url FROM news_items WHERE url IN ({placeholders}) ORDER BY id",
+            chunk,
+        ) as cursor:
+            for row in await cursor.fetchall():
+                normalized = normalize_url(str(row["url"] or ""))
+                if normalized:
+                    urls_to_ids.setdefault(normalized, int(row["id"]))
+    return hashes_to_ids, urls_to_ids
+
+
 async def insert_news_items_batch(
     db: aiosqlite.Connection,
     items: list[dict[str, Any]],
@@ -629,33 +677,33 @@ async def insert_news_items_batch(
         return {"inserted": 0, "duplicates": 0}
     prepared_items = [_prepare_news(item) for item in items]
 
-    async with db.execute(
-        """SELECT id,title,url,published_at,fetched_at,content_hash,source_tickers FROM news_items
-           ORDER BY COALESCE(published_at,fetched_at) DESC LIMIT 2000"""
-    ) as cursor:
-        existing = await cursor.fetchall()
-    titles_by_day: dict[str, list[tuple[str, int]]] = {}
-    hashes_to_ids: dict[str, int] = {}
-    urls_to_ids: dict[str, int] = {}
-    for row in existing:
-        news_id = int(row["id"])
-        title = normalize_title(str(row["title"] or ""))
-        if title:
-            bucket = publication_bucket(row["published_at"] or row["fetched_at"])
-            titles_by_day.setdefault(bucket, []).append((title, news_id))
-        hashes_to_ids[str(row["content_hash"])] = news_id
-        normalized_url = normalize_url(str(row["url"] or ""))
-        if normalized_url:
-            urls_to_ids[normalized_url] = news_id
-
     inserted = 0
     duplicates = 0
     try:
+        # Serialize the exact-key snapshot with inserts so concurrent batches
+        # cannot both create different hashes for one normalized URL.
+        await db.execute("BEGIN IMMEDIATE")
+        hashes_to_ids, urls_to_ids = await _load_exact_news_ids(db, prepared_items)
+        async with db.execute(
+            """SELECT id,title,url,published_at,fetched_at,content_hash,source_tickers
+               FROM news_items
+               ORDER BY COALESCE(published_at,fetched_at) DESC LIMIT 2000"""
+        ) as cursor:
+            existing = await cursor.fetchall()
+        titles_by_day: dict[str, list[tuple[str, int]]] = {}
+        for row in existing:
+            news_id = int(row["id"])
+            title = normalize_title(str(row["title"] or ""))
+            if title:
+                bucket = publication_bucket(row["published_at"] or row["fetched_at"])
+                titles_by_day.setdefault(bucket, []).append((title, news_id))
+
         for item in prepared_items:
+            normalized_url = normalize_url(str(item["url"]))
             duplicate_id = (
                 hashes_to_ids.get(item["content_hash"])
                 or hashes_to_ids.get(item["legacy_content_hash"])
-                or urls_to_ids.get(item["url"])
+                or urls_to_ids.get(normalized_url)
             )
             title = normalize_title(item["title"])
             bucket = publication_bucket(item["published_at"] or item["fetched_at"])
@@ -675,18 +723,19 @@ async def insert_news_items_batch(
             news_id = await _insert_prepared_news(db, item)
             if news_id is None:
                 duplicates += 1
-                async with db.execute(
-                    "SELECT id FROM news_items WHERE content_hash IN (?,?) ORDER BY id LIMIT 1",
-                    (item["content_hash"], item["legacy_content_hash"]),
-                ) as cursor:
-                    concurrent = await cursor.fetchone()
-                if concurrent is not None:
-                    await _record_duplicate_news(db, int(concurrent[0]), item)
+                concurrent_hashes, concurrent_urls = await _load_exact_news_ids(db, [item])
+                concurrent_id = (
+                    concurrent_hashes.get(item["content_hash"])
+                    or concurrent_hashes.get(item["legacy_content_hash"])
+                    or concurrent_urls.get(normalized_url)
+                )
+                if concurrent_id is not None:
+                    await _record_duplicate_news(db, concurrent_id, item)
             else:
                 inserted += 1
                 hashes_to_ids[item["content_hash"]] = news_id
                 hashes_to_ids[item["legacy_content_hash"]] = news_id
-                urls_to_ids[item["url"]] = news_id
+                urls_to_ids[normalized_url] = news_id
                 if title:
                     titles_by_day.setdefault(bucket, []).append((title, news_id))
         await db.commit()
@@ -917,6 +966,7 @@ async def upsert_source_health(
     inserted_count: int | None,
     duplicates_count: int | None,
     error_code: str | None,
+    commit: bool = True,
 ) -> None:
     await db.execute(
         """INSERT INTO source_health
@@ -945,7 +995,8 @@ async def upsert_source_health(
             utc_text(),
         ),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def get_source_health(db: aiosqlite.Connection) -> list[dict[str, Any]]:
@@ -977,6 +1028,7 @@ async def record_calendar_snapshot(
     stale: bool,
     observed_at: str,
     source: str = "faireconomy",
+    commit: bool = True,
 ) -> tuple[str, int]:
     fetched = utc_text(parse_utc(source_fetched_at, field="source_fetched_at"))
     observed = utc_text(max(parse_utc(observed_at, field="observed_at"), parse_utc(fetched)))
@@ -1040,7 +1092,8 @@ async def record_calendar_snapshot(
                 (token,),
             ) as query:
                 existing = await query.fetchone()
-            await db.commit()
+            if commit:
+                await db.commit()
             return token, int(existing[0])
         sequence = int(cursor.lastrowid)
         for ordinal, event in enumerate(normalized, 1):
@@ -1070,7 +1123,8 @@ async def record_calendar_snapshot(
                     event["content_hash"],
                 ),
             )
-        await db.commit()
+        if commit:
+            await db.commit()
         return token, sequence
     except Exception:
         await db.rollback()
