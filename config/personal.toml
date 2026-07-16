@@ -1,0 +1,42 @@
+[storage]
+database_path = "backend/data/macrolens.db"
+# Set to 0 to keep raw news indefinitely.
+news_retention_days = 365
+change_retention_days = 365
+calendar_snapshot_retention_days = 90
+retention_interval_seconds = 3600
+
+[calendar]
+interval_seconds = 600
+
+[sources.finnhub]
+enabled = true
+interval_seconds = 300
+api_key_env = "FINNHUB_API_KEY"
+
+[sources.massive]
+enabled = true
+interval_seconds = 3600
+api_key_env = "MASSIVE_API_KEY"
+
+[sources.google]
+enabled = true
+interval_seconds = 900
+
+[sources.seekingalpha_breaking]
+enabled = true
+interval_seconds = 300
+
+[sources.seekingalpha_daily]
+enabled = true
+interval_seconds = 21600
+
+[sources.newsapi]
+enabled = false
+interval_seconds = 1800
+api_key_env = "NEWSAPI_API_KEY"
+
+[sources.gnews]
+enabled = false
+interval_seconds = 1800
+api_key_env = "GNEWS_API_KEY"

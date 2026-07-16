@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import logging
-import time
-from datetime import date, datetime, timezone
-from typing import Optional, Sequence
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
@@ -14,18 +12,7 @@ from app.utils.news_text import clean_news_text
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://finnhub.io/api/v1"
-EASTERN = ZoneInfo("America/New_York")
-_last_focus_fetch_monotonic: Optional[float] = None
-
-
-def finnhub_company_news_date(now: datetime | None = None) -> date:
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        raise ValueError("finnhub_company_news_date_requires_timezone")
-    return current.astimezone(EASTERN).date()
-
-
-def _parse_item(item: dict, *, queried_ticker: str | None = None) -> Optional[dict]:
+def _parse_item(item: dict) -> Optional[dict]:
     """Normalize a Finnhub news item to our internal schema."""
     title = clean_news_text(item.get("headline"), empty="") or ""
     url = clean_news_text(item.get("url"), empty="") or ""
@@ -51,67 +38,11 @@ def _parse_item(item: dict, *, queried_ticker: str | None = None) -> Optional[di
         "image_url": item.get("image") or None,
         "published_at": published_at,
         "source_tickers": source_tickers[:100],
-        "ticker_association_method": "provider_tag",
     }
-    if queried_ticker:
-        ticker = queried_ticker.strip().upper().lstrip("$")
-        if ticker and ticker not in result["source_tickers"]:
-            result["source_tickers"].append(ticker)
-        result["ticker_association_method"] = "company_endpoint"
-        result["queried_ticker"] = ticker
     return result
 
 
-async def fetch_finnhub_company_news(
-    focus_symbols: Sequence[str],
-    date_from: str | date,
-    date_to: str | date,
-    *,
-    api_key: str,
-    client: httpx.AsyncClient | None = None,
-    request_limit: int | None = None,
-) -> list[dict]:
-    """Fetch a bounded, focus-driven company feed and preserve the query ticker."""
-
-    if not api_key:
-        return []
-    start = date_from.isoformat() if isinstance(date_from, date) else str(date_from)
-    end = date_to.isoformat() if isinstance(date_to, date) else str(date_to)
-    limit = request_limit or 20
-    symbols: list[str] = []
-    for value in focus_symbols:
-        symbol = str(value or "").strip().upper().lstrip("$")
-        if symbol and symbol not in symbols:
-            symbols.append(symbol)
-        if len(symbols) >= limit:
-            break
-    owned = client is None
-    client = client or httpx.AsyncClient(timeout=15)
-    headers = {"X-Finnhub-Token": api_key, "User-Agent": "MacroLens/1.0"}
-    results: list[dict] = []
-    try:
-        for symbol in symbols:
-            response = await client.get(
-                f"{BASE_URL}/company-news",
-                params={"symbol": symbol, "from": start, "to": end},
-                headers=headers,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, list):
-                raise ValueError("Finnhub returned an invalid company-news payload")
-            for item in payload[:10]:
-                parsed = _parse_item(item, queried_ticker=symbol)
-                if parsed:
-                    results.append(parsed)
-        return results
-    finally:
-        if owned:
-            await client.aclose()
-
-
 async def fetch_finnhub_news(api_key: str) -> list[dict]:
-    global _last_focus_fetch_monotonic
     if not api_key:
         logger.warning("Finnhub API key not set; skipping")
         return []
@@ -143,38 +74,6 @@ async def fetch_finnhub_news(api_key: str) -> list[dict]:
                 logger.info(f"Finnhub [{category}]: fetched {len(items)} items")
             except Exception as e:
                 errors.append(log_http_failure(logger, f"Finnhub [{category}]", e, endpoint=f"{BASE_URL}/news", secrets=(api_key,)))
-
-        # Company news is driven by the last successful option-pro focus
-        # snapshot; there is no hard-coded stock list.
-        today = finnhub_company_news_date().isoformat()
-        try:
-            from app.config import settings
-            from app.models.database import get_db
-            from app.services.focus_context import latest_focus_context
-
-            db = await get_db()
-            try:
-                snapshot = await latest_focus_context(db)
-            finally:
-                await db.close()
-            symbols = [
-                str(item.get("ticker") or "")
-                for item in ((snapshot or {}).get("payload") or {}).get("symbols", [])
-                if isinstance(item, dict)
-            ]
-            if (
-                _last_focus_fetch_monotonic is None
-                or time.monotonic() - _last_focus_fetch_monotonic >= settings.finnhub_focus_interval
-            ):
-                company_items = await fetch_finnhub_company_news(
-                    symbols, today, today, api_key=api_key, client=client,
-                    request_limit=settings.finnhub_focus_request_limit,
-                )
-                results.extend(company_items)
-                successful_requests += len(symbols[: settings.finnhub_focus_request_limit])
-                _last_focus_fetch_monotonic = time.monotonic()
-        except Exception as e:
-            errors.append(log_http_failure(logger, "Finnhub focus company news", e, endpoint=f"{BASE_URL}/company-news", secrets=(api_key,)))
 
         logger.info(f"Finnhub total: {len(results)} items")
 
