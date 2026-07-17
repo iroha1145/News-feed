@@ -503,20 +503,69 @@ async def test_news_pages_stay_below_five_megabytes_without_losing_rows(clean_db
     assert default_page.status_code == 200
     assert len(default_page.json()["items"]) == 50
     assert default_page.json()["has_more"] is True
-    assert len(default_page.content) <= 5 * 1024 * 1024
+    assert len(default_page.content) < 5 * 1024 * 1024
     assert bounded_page.status_code == 200
     assert 0 < len(bounded_payload["items"]) < 101
     assert bounded_payload["has_more"] is True
     assert bounded_payload["next_cursor"]
-    assert len(bounded_page.content) <= 5 * 1024 * 1024
+    assert len(bounded_page.content) < 5 * 1024 * 1024
     assert final_page.status_code == 200
     assert final_page.json()["has_more"] is False
     assert final_page.json()["next_cursor"] is None
-    assert len(final_page.content) <= 5 * 1024 * 1024
+    assert len(final_page.content) < 5 * 1024 * 1024
     sequences = [item["sequence"] for item in bounded_payload["items"]]
     sequences.extend(item["sequence"] for item in final_page.json()["items"])
     assert len(sequences) == 101
     assert sequences == sorted(set(sequences))
+
+
+@pytest.mark.asyncio
+async def test_single_oversized_news_change_fails_without_retry_loop(clean_db):
+    item = {
+        "source": "legacy-source",
+        "title": "Legacy headline",
+        "summary": "Summary",
+        "url": "https://example.com/legacy",
+        "image_url": None,
+        "published_at": "2026-07-15T00:00:00Z",
+        "fetched_at": "2026-07-15T00:01:00Z",
+        "source_tickers": [],
+    }
+    db = await database.get_db()
+    try:
+        result = await database.insert_news_items_batch(db, [item])
+        async with db.execute(
+            "SELECT MIN(change_sequence) FROM news_changes"
+        ) as cursor:
+            sequence = int((await cursor.fetchone())[0])
+        await db.execute(
+            "UPDATE news_changes SET summary=? WHERE change_sequence=?",
+            ("x" * (5 * 1024 * 1024), sequence),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    async with await _client() as client:
+        first = await client.get(
+            "/internal/v1/news/changes", headers=AUTH, params={"limit": 500}
+        )
+        repeated = await client.get(
+            "/internal/v1/news/changes", headers=AUTH, params={"limit": 500}
+        )
+
+    expected = {
+        "detail": {
+            "code": "news_item_exceeds_response_limit",
+            "sequence": sequence,
+        }
+    }
+    assert result == {"inserted": 1, "duplicates": 0}
+    assert first.status_code == 413
+    assert first.json() == expected
+    assert len(first.content) < 5 * 1024 * 1024
+    assert repeated.status_code == 413
+    assert repeated.json() == expected
 
 
 @pytest.mark.asyncio

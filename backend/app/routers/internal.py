@@ -180,7 +180,7 @@ def _bounded_news_changes_response(
         )
 
     response = build(len(items))
-    if len(response.body) <= _MAX_NEWS_RESPONSE_BYTES:
+    if len(response.body) < _MAX_NEWS_RESPONSE_BYTES:
         return response
 
     # Find the largest prefix whose fully encoded response fits the same
@@ -192,15 +192,18 @@ def _bounded_news_changes_response(
     while low <= high:
         item_count = (low + high) // 2
         candidate = build(item_count)
-        if len(candidate.body) <= _MAX_NEWS_RESPONSE_BYTES:
+        if len(candidate.body) < _MAX_NEWS_RESPONSE_BYTES:
             bounded = candidate
             low = item_count + 1
         else:
             high = item_count - 1
     if bounded is None:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "news_item_exceeds_response_limit"},
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "news_item_exceeds_response_limit",
+                "sequence": items[0]["sequence"],
+            },
         )
     return bounded
 
