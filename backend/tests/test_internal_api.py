@@ -114,6 +114,91 @@ async def test_internal_token_never_appears_in_http_responses(clean_db):
 
 
 @pytest.mark.asyncio
+async def test_news_changes_normalizes_legacy_naive_utc_timestamps(clean_db):
+    db = await database.get_db()
+    try:
+        news_ids = [
+            await database.insert_news_item(db, _item(1)),
+            await database.insert_news_item(db, _item(2)),
+        ]
+        assert all(news_id is not None for news_id in news_ids)
+        await db.executemany(
+            """UPDATE news_changes
+               SET published_at=?,fetched_at=?,updated_at=?
+               WHERE news_id=?""",
+            [
+                (
+                    f"2026-07-15T00:0{index}:00",
+                    f"2026-07-15T00:1{index}:00",
+                    f"2026-07-15T00:1{index}:00",
+                    news_id,
+                )
+                for index, news_id in enumerate(news_ids, start=1)
+            ],
+        )
+        await db.commit()
+        async with db.execute(
+            """SELECT payload_hash,content_hash FROM news_changes
+               ORDER BY change_sequence"""
+        ) as cursor:
+            hashes_before = [tuple(row) for row in await cursor.fetchall()]
+    finally:
+        await db.close()
+
+    async with await _client() as client:
+        first_response = await client.get(
+            "/internal/v1/news/changes", headers=AUTH, params={"after_sequence": 0, "limit": 1}
+        )
+        first_page = first_response.json()
+        second_response = await client.get(
+            "/internal/v1/news/changes",
+            headers=AUTH,
+            params={"cursor": first_page["next_cursor"], "limit": 1},
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    second_page = second_response.json()
+    assert first_page["has_more"] is True
+    assert first_page["next_cursor"]
+    assert first_page["next_updated_after"] is None
+    assert first_page["next_after_sequence"] is None
+    assert second_page["has_more"] is False
+    assert second_page["next_cursor"] is None
+    assert second_page["next_updated_after"] == second_page["watermark"]["as_of"]
+    assert second_page["next_after_sequence"] == second_page["watermark"]["sequence"]
+    assert first_page["watermark"] == second_page["watermark"]
+    changes = first_page["items"] + second_page["items"]
+    assert len(changes) == 2
+    for index, change in enumerate(changes, start=1):
+        assert change["changed_at"].endswith("Z")
+        assert change["available_at"] == change["changed_at"]
+        assert change["source_updated_at"] == f"2026-07-15T00:1{index}:00Z"
+        assert change["news"]["published_at"] == f"2026-07-15T00:0{index}:00Z"
+        assert change["news"]["fetched_at"] == f"2026-07-15T00:1{index}:00Z"
+        assert change["news"]["updated_at"] == f"2026-07-15T00:1{index}:00Z"
+
+    db = await database.get_db()
+    try:
+        async with db.execute(
+            """SELECT published_at,fetched_at,updated_at,payload_hash,content_hash
+               FROM news_changes ORDER BY change_sequence""",
+        ) as cursor:
+            stored_rows = [tuple(row) for row in await cursor.fetchall()]
+    finally:
+        await db.close()
+    assert [row[:3] for row in stored_rows] == [
+        (
+            f"2026-07-15T00:0{index}:00",
+            f"2026-07-15T00:1{index}:00",
+            f"2026-07-15T00:1{index}:00",
+        )
+        for index in (1, 2)
+    ]
+    assert [row[3:] for row in stored_rows] == hashes_before
+
+
+@pytest.mark.asyncio
 async def test_news_pages_keep_frozen_watermark_and_next_round_gets_new_item(clean_db):
     db = await database.get_db()
     try:
