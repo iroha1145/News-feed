@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 
 from app.deps.bearer import require_internal_bearer
 from app.models.database import (
@@ -26,6 +27,7 @@ from app.utils.scheduler import get_scheduler
 
 router = APIRouter(prefix="/internal/v1", dependencies=[Depends(require_internal_bearer)])
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MAX_NEWS_RESPONSE_BYTES = 5 * 1024 * 1024
 
 
 def _filter_digest(
@@ -120,6 +122,89 @@ def _frozen_window(
     return after, cutoff, frozen_sequence, payload
 
 
+def _news_changes_payload(
+    items: list[dict[str, Any]],
+    *,
+    has_more: bool,
+    updated_after: datetime,
+    as_of: datetime,
+    checkpoint: int | None,
+    watermark: int,
+) -> dict[str, Any]:
+    next_cursor = None
+    if has_more and items:
+        cursor_payload: dict[str, Any] = {
+            "v": 1,
+            "kind": "news_changes",
+            "updated_after": utc_text(updated_after),
+            "as_of": utc_text(as_of),
+            "filter": _filter_digest(
+                "news_changes", updated_after, as_of, checkpoint
+            ),
+            "watermark_sequence": watermark,
+            "last_sequence": items[-1]["sequence"],
+        }
+        if checkpoint is not None:
+            cursor_payload["after_sequence"] = checkpoint
+        next_cursor = _encode_cursor(cursor_payload)
+    return {
+        "items": items,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "watermark": {"sequence": watermark, "as_of": utc_text(as_of)},
+        "next_updated_after": None if has_more else utc_text(as_of),
+        "next_after_sequence": None if has_more else watermark,
+    }
+
+
+def _bounded_news_changes_response(
+    items: list[dict[str, Any]],
+    *,
+    has_more: bool,
+    updated_after: datetime,
+    as_of: datetime,
+    checkpoint: int | None,
+    watermark: int,
+) -> JSONResponse:
+    def build(item_count: int) -> JSONResponse:
+        page_has_more = has_more or item_count < len(items)
+        return JSONResponse(
+            content=_news_changes_payload(
+                items[:item_count],
+                has_more=page_has_more,
+                updated_after=updated_after,
+                as_of=as_of,
+                checkpoint=checkpoint,
+                watermark=watermark,
+            )
+        )
+
+    response = build(len(items))
+    if len(response.body) <= _MAX_NEWS_RESPONSE_BYTES:
+        return response
+
+    # Find the largest prefix whose fully encoded response fits the same
+    # five-megabyte envelope enforced by the Option Pro reader. The cursor is
+    # built from that prefix's last sequence, so omitted rows remain reachable.
+    low = 1
+    high = len(items) - 1
+    bounded: JSONResponse | None = None
+    while low <= high:
+        item_count = (low + high) // 2
+        candidate = build(item_count)
+        if len(candidate.body) <= _MAX_NEWS_RESPONSE_BYTES:
+            bounded = candidate
+            low = item_count + 1
+        else:
+            high = item_count - 1
+    if bounded is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "news_item_exceeds_response_limit"},
+        )
+    return bounded
+
+
 @router.get("/health")
 async def internal_health() -> dict[str, Any]:
     db = await get_db()
@@ -161,7 +246,7 @@ async def news_changes(
     cursor: str | None = Query(default=None, max_length=2_048),
     limit: int = Query(default=50, ge=1, le=500),
     as_of: str | None = Query(default=None),
-) -> dict[str, Any]:
+) -> JSONResponse:
     after, cutoff, checkpoint, payload = _frozen_window(
         kind="news_changes",
         cursor=cursor,
@@ -203,28 +288,14 @@ async def news_changes(
     finally:
         await db.close()
 
-    next_cursor = None
-    if has_more and items:
-        cursor_payload: dict[str, Any] = {
-            "v": 1,
-            "kind": "news_changes",
-            "updated_after": utc_text(after),
-            "as_of": utc_text(cutoff),
-            "filter": _filter_digest("news_changes", after, cutoff, checkpoint),
-            "watermark_sequence": watermark,
-            "last_sequence": items[-1]["sequence"],
-        }
-        if checkpoint is not None:
-            cursor_payload["after_sequence"] = checkpoint
-        next_cursor = _encode_cursor(cursor_payload)
-    return {
-        "items": items,
-        "has_more": has_more,
-        "next_cursor": next_cursor,
-        "watermark": {"sequence": watermark, "as_of": utc_text(cutoff)},
-        "next_updated_after": None if has_more else utc_text(cutoff),
-        "next_after_sequence": None if has_more else watermark,
-    }
+    return _bounded_news_changes_response(
+        items,
+        has_more=has_more,
+        updated_after=after,
+        as_of=cutoff,
+        checkpoint=checkpoint,
+        watermark=watermark,
+    )
 
 
 @router.get("/news/{news_id}")

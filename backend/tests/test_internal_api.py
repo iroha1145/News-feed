@@ -467,7 +467,7 @@ async def test_cross_source_duplicate_surfaces_corroborating_sources(clean_db):
 
 
 @pytest.mark.asyncio
-async def test_news_default_page_stays_below_five_megabytes(clean_db):
+async def test_news_pages_stay_below_five_megabytes_without_losing_rows(clean_db):
     items = [
         {
             "source": f"source-{number}",
@@ -479,7 +479,7 @@ async def test_news_default_page_stays_below_five_megabytes(clean_db):
             "fetched_at": "2026-07-15T00:01:00Z",
             "source_tickers": [f"T{number}"],
         }
-        for number in range(51)
+        for number in range(101)
     ]
     db = await database.get_db()
     try:
@@ -489,12 +489,34 @@ async def test_news_default_page_stays_below_five_megabytes(clean_db):
 
     async with await _client() as client:
         default_page = await client.get("/internal/v1/news/changes", headers=AUTH)
+        bounded_page = await client.get(
+            "/internal/v1/news/changes", headers=AUTH, params={"limit": 500}
+        )
+        bounded_payload = bounded_page.json()
+        final_page = await client.get(
+            "/internal/v1/news/changes",
+            headers=AUTH,
+            params={"cursor": bounded_payload["next_cursor"], "limit": 500},
+        )
 
-    assert result == {"inserted": 51, "duplicates": 0}
+    assert result == {"inserted": 101, "duplicates": 0}
     assert default_page.status_code == 200
     assert len(default_page.json()["items"]) == 50
     assert default_page.json()["has_more"] is True
-    assert len(default_page.content) < 5 * 1024 * 1024
+    assert len(default_page.content) <= 5 * 1024 * 1024
+    assert bounded_page.status_code == 200
+    assert 0 < len(bounded_payload["items"]) < 101
+    assert bounded_payload["has_more"] is True
+    assert bounded_payload["next_cursor"]
+    assert len(bounded_page.content) <= 5 * 1024 * 1024
+    assert final_page.status_code == 200
+    assert final_page.json()["has_more"] is False
+    assert final_page.json()["next_cursor"] is None
+    assert len(final_page.content) <= 5 * 1024 * 1024
+    sequences = [item["sequence"] for item in bounded_payload["items"]]
+    sequences.extend(item["sequence"] for item in final_page.json()["items"])
+    assert len(sequences) == 101
+    assert sequences == sorted(set(sequences))
 
 
 @pytest.mark.asyncio
