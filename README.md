@@ -53,7 +53,7 @@ Authorization: Bearer <INTERNAL_API_TOKEN>
 - `GET /internal/v1/news/{id}`
 - `GET /internal/v1/calendar`
 
-新闻增量和日历列表支持 `after_sequence`、`updated_after`、`cursor`、`limit`、`as_of`。首轮可用旧的时间水位兼容读取；此后应保存完整响应里的 `next_after_sequence`，并在下一轮首屏传回。序号是跨轮读取的主检查点，可以接住“首轮读取时尚未提交、随后才变为可见”的数据。游标已经冻结首屏条件，翻页时只发送 `cursor` 与 `limit`。新闻增量每页最多 50 条，日历每页最多 500 条。
+新闻增量和日历列表支持 `after_sequence`、`updated_after`、`cursor`、`limit`、`as_of`。首轮可用旧的时间水位兼容读取；此后应保存完整响应里的 `next_after_sequence`，并在下一轮首屏传回。序号是跨轮读取的主检查点，可以接住“首轮读取时尚未提交、随后才变为可见”的数据。游标已经冻结首屏条件，翻页时只发送 `cursor` 与 `limit`。新闻增量默认每页 50 条、最多 500 条；日历默认每页 200 条、最多 500 条。
 
 `published_at` 是格式合规的源站发布时间；源站若给出无法解析的日期，该字段会留空。`fetched_at` 是抓取时间，`updated_at` 保留原始记录时间，`available_at` 是本地可见时间。兼容时间窗口以 `available_at` 为准，新的跨轮读取则以持续递增的序号为准，因此迟到新闻和提交边界上的新闻都不会漏掉。
 

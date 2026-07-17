@@ -467,7 +467,7 @@ async def test_cross_source_duplicate_surfaces_corroborating_sources(clean_db):
 
 
 @pytest.mark.asyncio
-async def test_news_page_is_capped_at_fifty_and_stays_below_five_megabytes(clean_db):
+async def test_news_default_page_stays_below_five_megabytes(clean_db):
     items = [
         {
             "source": f"source-{number}",
@@ -489,15 +489,59 @@ async def test_news_page_is_capped_at_fifty_and_stays_below_five_megabytes(clean
 
     async with await _client() as client:
         default_page = await client.get("/internal/v1/news/changes", headers=AUTH)
-        too_large = await client.get(
-            "/internal/v1/news/changes", headers=AUTH, params={"limit": 51}
-        )
 
     assert result == {"inserted": 51, "duplicates": 0}
     assert default_page.status_code == 200
     assert len(default_page.json()["items"]) == 50
     assert default_page.json()["has_more"] is True
     assert len(default_page.content) < 5 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_news_explicit_batch_pages_at_five_hundred(clean_db):
+    items = [
+        {
+            "source": f"source-{number}",
+            "title": f"Headline {number}",
+            "summary": "Summary",
+            "url": f"https://example.com/{number}",
+            "image_url": None,
+            "published_at": "2026-07-15T00:00:00Z",
+            "fetched_at": "2026-07-15T00:01:00Z",
+            "source_tickers": [],
+        }
+        for number in range(501)
+    ]
+    db = await database.get_db()
+    try:
+        result = await database.insert_news_items_batch(db, items)
+    finally:
+        await db.close()
+
+    async with await _client() as client:
+        first_page = await client.get(
+            "/internal/v1/news/changes", headers=AUTH, params={"limit": 500}
+        )
+        first_payload = first_page.json()
+        second_page = await client.get(
+            "/internal/v1/news/changes",
+            headers=AUTH,
+            params={"cursor": first_payload["next_cursor"], "limit": 500},
+        )
+        too_large = await client.get(
+            "/internal/v1/news/changes", headers=AUTH, params={"limit": 501}
+        )
+
+    assert result == {"inserted": 501, "duplicates": 0}
+    assert first_page.status_code == 200
+    assert len(first_payload["items"]) == 500
+    assert first_payload["has_more"] is True
+    assert first_payload["next_cursor"]
+    assert len(first_page.content) < 5 * 1024 * 1024
+    assert second_page.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+    assert second_page.json()["has_more"] is False
+    assert second_page.json()["next_cursor"] is None
     assert too_large.status_code == 422
 
 

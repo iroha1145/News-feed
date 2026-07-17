@@ -159,7 +159,7 @@ async def news_changes(
     updated_after: str | None = Query(default=None),
     after_sequence: int | None = Query(default=None, ge=0),
     cursor: str | None = Query(default=None, max_length=2_048),
-    limit: int = Query(default=50, ge=1, le=50),
+    limit: int = Query(default=50, ge=1, le=500),
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
     after, cutoff, checkpoint, payload = _frozen_window(
