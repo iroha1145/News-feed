@@ -188,6 +188,34 @@ def parse_utc(value: str | datetime, *, field: str = "timestamp") -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _legacy_wire_utc_text(
+    value: Any,
+    *,
+    field: str,
+    optional: bool = False,
+) -> str | None:
+    """Canonicalize known legacy UTC values without weakening write validation.
+
+    Early MacroLens releases stored UTC ``datetime`` values without an offset.
+    Keep the database history unchanged, but restore the missing UTC marker when
+    those rows cross the current internal API boundary.
+    """
+
+    if value is None or not str(value).strip():
+        if optional:
+            return None
+        raise ValueError(f"{field} must be a timestamp")
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        if optional:
+            return None
+        raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return utc_text(parsed)
+
+
 def epoch_microseconds(value: str | datetime) -> int:
     parsed = parse_utc(value)
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -758,9 +786,11 @@ def _news_payload(
         "summary": row["summary"],
         "url": str(row["url"]),
         "image_url": row["image_url"],
-        "published_at": row["published_at"],
-        "fetched_at": str(row["fetched_at"]),
-        "updated_at": str(row["updated_at"]),
+        "published_at": _legacy_wire_utc_text(
+            row["published_at"], field="published_at", optional=True
+        ),
+        "fetched_at": _legacy_wire_utc_text(row["fetched_at"], field="fetched_at"),
+        "updated_at": _legacy_wire_utc_text(row["updated_at"], field="updated_at"),
         "source_tickers": _deserialize_tickers(row["source_tickers"]),
         "content_hash": str(row["content_hash"]),
         "sources": source_names,
@@ -907,7 +937,9 @@ async def query_news_changes(
                 "sequence": int(row["change_sequence"]),
                 "operation": str(row["operation"]),
                 "changed_at": str(row["available_at"]),
-                "source_updated_at": str(row["updated_at"]),
+                "source_updated_at": _legacy_wire_utc_text(
+                    row["updated_at"], field="source_updated_at"
+                ),
                 "available_at": str(row["available_at"]),
                 "news": (
                     _news_payload(

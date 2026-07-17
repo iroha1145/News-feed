@@ -114,6 +114,92 @@ async def test_legacy_analysis_table_is_preserved_and_not_migrated(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_legacy_naive_utc_timestamps_are_normalized_only_on_wire(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "legacy-naive-timestamps.db"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """CREATE TABLE news_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,title TEXT NOT NULL,
+                summary TEXT,url TEXT NOT NULL,image_url TEXT,published_at TEXT,
+                fetched_at TEXT NOT NULL,content_hash TEXT NOT NULL UNIQUE
+            )"""
+        )
+        await db.execute(
+            """INSERT INTO news_items
+               (source,title,summary,url,image_url,published_at,fetched_at,content_hash)
+               VALUES ('legacy','Naive UTC item','old','https://example.com/legacy-naive',NULL,
+                       '2025-01-01T00:00:00','2025-01-01T00:01:00','legacy-naive-hash')"""
+        )
+        await db.commit()
+
+    migration_time = datetime(2026, 7, 15, 12, 34, 56, 789, tzinfo=timezone.utc)
+    monkeypatch.setattr(database, "DB_PATH", path)
+    monkeypatch.setattr(database, "utc_now", lambda: migration_time)
+    await database.init_db()
+    db = await database.get_db()
+    try:
+        async with db.execute(
+            "SELECT published_at,fetched_at,updated_at FROM news_items WHERE id=1"
+        ) as cursor:
+            raw_timestamps = tuple(await cursor.fetchone())
+        watermark = await database.news_change_watermark(
+            db, as_of=migration_time + timedelta(seconds=1)
+        )
+        changes, has_more = await database.query_news_changes(
+            db,
+            updated_after=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            as_of=migration_time + timedelta(seconds=1),
+            after_sequence=0,
+            watermark_sequence=watermark,
+            limit=10,
+        )
+    finally:
+        await db.close()
+
+    assert raw_timestamps == (
+        "2025-01-01T00:00:00",
+        "2025-01-01T00:01:00",
+        "2025-01-01T00:01:00",
+    )
+    assert has_more is False
+    assert len(changes) == 1
+    change = changes[0]
+    assert change["changed_at"] == "2026-07-15T12:34:56.000789Z"
+    assert change["available_at"] == change["changed_at"]
+    assert change["source_updated_at"] == "2025-01-01T00:01:00Z"
+    assert change["news"]["published_at"] == "2025-01-01T00:00:00Z"
+    assert change["news"]["fetched_at"] == "2025-01-01T00:01:00Z"
+    assert change["news"]["updated_at"] == "2025-01-01T00:01:00Z"
+
+
+def test_legacy_wire_timestamp_keeps_offsets_and_omits_invalid_optional_values():
+    assert database._legacy_wire_utc_text(
+        "2025-01-01T09:00:00+09:00", field="timestamp"
+    ) == "2025-01-01T00:00:00Z"
+    assert (
+        database._legacy_wire_utc_text(
+            "not-a-timestamp", field="published_at", optional=True
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("field", ["fetched_at", "updated_at"])
+@pytest.mark.asyncio
+async def test_new_writes_still_reject_naive_required_timestamps(clean_db, field):
+    item = _item(f"Naive required timestamp {field}")
+    item[field] = "2026-07-15T00:01:00"
+    db = await database.get_db()
+    try:
+        with pytest.raises(ValueError, match=f"{field} must include a UTC offset"):
+            await database.insert_news_item(db, item)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_invalid_published_at_is_omitted_from_wire_data(clean_db):
     item = _item("Bad source date")
     item["published_at"] = "sometime yesterday"
